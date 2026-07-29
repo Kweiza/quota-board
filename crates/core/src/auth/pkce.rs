@@ -22,7 +22,17 @@ impl Default for AuthConfig {
             // configuration so we can switch the moment a real client_id
             // becomes available — docs/design.md §10.2.
             client_id: "9d1c250a-e61b-44d9-88ed-5944d1962f5e".into(),
-            scopes: vec!["user:profile".into(), "user:inference".into()],
+            // `user:inference` was dropped after measurement, not by guess: a
+            // live spike showed the server accepts `user:profile` alone at
+            // consent, issues a token scoped to it (does not silently re-add
+            // `user:inference`), and that token's `/api/oauth/usage` calls —
+            // both on the initial token and after a refresh — return 200.
+            // Claude Code's insistence on requesting both scopes is therefore
+            // a client-side gate, not a server requirement. A token that
+            // cannot run inference is the point, not an optimisation: it is
+            // the terms-of-service position this whole project is built
+            // around — docs/design.md §10.4, §5.2.
+            scopes: vec!["user:profile".into()],
         }
     }
 }
@@ -143,7 +153,7 @@ mod tests {
         assert_eq!(q.get("response_type").unwrap(), "code");
         assert_eq!(q.get("code_challenge_method").unwrap(), "S256");
         assert_eq!(q.get("redirect_uri").unwrap(), "http://localhost:54321/callback");
-        assert_eq!(q.get("scope").unwrap(), "user:profile user:inference");
+        assert_eq!(q.get("scope").unwrap(), "user:profile");
         assert!(q.contains_key("code_challenge"));
         assert!(q.contains_key("state"));
     }
@@ -171,6 +181,11 @@ mod tests {
             "user:sessions:claude_code",
             "user:mcp_servers",
             "user:file_upload",
+            // Dropped after measurement showed the server does not require it
+            // for the read-only usage call — see the comment on
+            // `AuthConfig::default()`. This is the line that stops a future
+            // edit from quietly re-adding it.
+            "user:inference",
         ] {
             assert!(!cfg.scopes.iter().any(|s| s == forbidden), "requesting {forbidden}");
         }
