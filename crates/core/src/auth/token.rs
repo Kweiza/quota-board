@@ -10,6 +10,21 @@ pub const ANTHROPIC_BETA: &str = "oauth-2025-04-20";
 /// reported expiry, so a request in flight never straddles the boundary.
 pub const EXPIRY_SKEW_SECS: i64 = 300;
 
+/// docs/design.md §10.6: `revoke` gets its own, shorter timeout than the
+/// 30-second default baked into `ReqwestHttp`'s client. Task 18's settings
+/// window awaits `revoke` directly when a user deletes an account; an
+/// unreachable revoke endpoint must not hold that deletion hostage for as
+/// long as an ordinary request is allowed to run. Keep this separate from
+/// the client-level timeout — do not "unify" the two.
+///
+/// Short in tests so the covering tests don't have to wait out the
+/// production value — same reasoning as `HEADER_READ_TIMEOUT` in
+/// `callback.rs`.
+#[cfg(not(test))]
+const REVOKE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+#[cfg(test)]
+const REVOKE_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(200);
+
 #[derive(Debug, thiserror::Error)]
 pub enum AuthError {
     #[error("state mismatch — the callback cannot be trusted")]
@@ -301,9 +316,10 @@ pub async fn refresh<H: TokenHttp>(
 }
 
 /// Revokes the server-side token, e.g. on account deletion. Best-effort:
-/// the result is discarded on purpose. A user deleting an account from this
-/// app must not be blocked by the revocation endpoint being unreachable —
-/// the local deletion proceeds either way.
+/// the result is discarded on purpose, and the whole call is bounded by
+/// [`REVOKE_TIMEOUT`]. A user deleting an account from this app must not be
+/// blocked by the revocation endpoint being unreachable or slow — the local
+/// deletion proceeds either way. docs/design.md §10.6.
 pub async fn revoke<H: TokenHttp>(http: &H, cfg: &AuthConfig, refresh_token: &str) {
     let url = format!("{}/revoke", cfg.token_url);
     let body = serde_json::json!({
@@ -311,7 +327,7 @@ pub async fn revoke<H: TokenHttp>(http: &H, cfg: &AuthConfig, refresh_token: &st
         "token_type_hint": "refresh_token",
         "client_id": cfg.client_id,
     });
-    let _: Result<serde_json::Value, _> = http.post_json(&url, &body).await;
+    let _ = tokio::time::timeout(REVOKE_TIMEOUT, http.post_json::<serde_json::Value>(&url, &body)).await;
 }
 
 #[cfg(test)]
@@ -657,5 +673,73 @@ mod tests {
         assert!(t.needs_refresh(), "inside the skew window still counts as needing a refresh");
         t.expires_at = Utc::now() + TimeDelta::seconds(EXPIRY_SKEW_SECS + 60);
         assert!(!t.needs_refresh());
+    }
+
+    /// docs/design.md §10.6: pins the URL suffix and all three body keys.
+    /// `revoke` swallows every outcome by design, so a wrong path or a
+    /// misspelled key would otherwise never surface — the mock only
+    /// matches the exact shape below, and `.expect(1)` fails the test if
+    /// that shape was never hit.
+    #[tokio::test]
+    async fn revoke_sends_the_expected_path_and_body() {
+        let server = MockServer::start().await;
+        let expected = serde_json::json!({
+            "token": "the-refresh-token",
+            "token_type_hint": "refresh_token",
+            "client_id": AuthConfig::default().client_id,
+        })
+        .to_string();
+
+        Mock::given(method("POST"))
+            .and(path("/v1/oauth/token/revoke"))
+            .and(body_json_string(expected))
+            .respond_with(ResponseTemplate::new(200))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let http = ReqwestHttp::new().unwrap();
+        revoke(&http, &cfg_for(&server).await, "the-refresh-token").await;
+    }
+
+    /// docs/design.md §10.6: a failing revoke must not propagate or block
+    /// the caller. If a future change let the error escape (e.g. swapping
+    /// the discarded `Result` for a `.unwrap()`), this would panic on the
+    /// 500 below instead of returning normally.
+    #[tokio::test]
+    async fn revoke_swallows_a_server_error_and_returns_normally() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(500))
+            .mount(&server)
+            .await;
+
+        let http = ReqwestHttp::new().unwrap();
+        // No `unwrap()` here on purpose: `revoke` returns `()` regardless
+        // of outcome, so simply reaching this line is the assertion.
+        revoke(&http, &cfg_for(&server).await, "rt").await;
+    }
+
+    /// docs/design.md §10.6: revoke must give up after its own timeout
+    /// rather than hang — Task 18's account deletion is waiting on this
+    /// call. If the `tokio::time::timeout` wrapper were removed, this test
+    /// would take as long as the mocked delay (10x the test's
+    /// `REVOKE_TIMEOUT`) instead of returning promptly.
+    #[tokio::test]
+    async fn revoke_gives_up_on_its_own_timeout_rather_than_hanging() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(200).set_delay(REVOKE_TIMEOUT * 10))
+            .mount(&server)
+            .await;
+
+        let http = ReqwestHttp::new().unwrap();
+        let start = std::time::Instant::now();
+        revoke(&http, &cfg_for(&server).await, "rt").await;
+        assert!(
+            start.elapsed() < REVOKE_TIMEOUT * 5,
+            "revoke did not respect its own timeout: took {:?}",
+            start.elapsed()
+        );
     }
 }
