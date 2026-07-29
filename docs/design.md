@@ -257,9 +257,21 @@ fields observed: `seven_day_cowork`, `seven_day_omelette`, `spend{}`,
 
 - Default interval **5 minutes**. Configurable, with a **floor of 180 seconds**
   (per account).
-- Apply **jitter** to each account's schedule.
 - **Stagger** accounts so no burst occurs at startup.
 - Global **concurrency of 1**.
+
+> **On jitter.** An earlier draft of this list called for jitter on each
+> account's schedule. It is deliberately not implemented, for two reasons that
+> hold only while the two bullets above do. Global concurrency of 1 makes a
+> burst impossible inside the app — `due()` yields at most one account per tick
+> — and each account's next poll is anchored to its own last fetch, so accounts
+> that start staggered stay de-synchronised without help. Adding jitter would
+> mean injecting a source of randomness beside the injected clock, and the
+> scheduler's testability rests on it being a pure function of that clock.
+>
+> **Revisit if global concurrency ever rises above 1**, or if scheduling stops
+> being anchored per account. Either change lets accounts re-synchronise, and
+> jitter starts earning its cost.
 
 ### 6.2 Interpreting Retry-After (two meanings)
 
@@ -268,7 +280,18 @@ fields observed: `seven_day_cowork`, `seven_day_omelette`, `spend{}`,
 | `Retry-After: 0` | Budget exhausted | Back off roughly 180 seconds (per §6.2.1) |
 | `Retry-After: N > 0` | Burst-rule hard block | Wait exactly N seconds. Probing does not extend it |
 
-Apply exponential backoff to repeated 429s.
+**Repeated 429s do not escalate the wait, and that is deliberate.** An earlier
+draft of this line called for exponential backoff on repeated 429s. The
+measurement in §6.2.1 landed afterwards: the sustainable rate after saturation
+is roughly one request per 120 seconds, in a near-perfect alternating pattern.
+The 180-second wait is therefore already above the rate the server will sustain,
+and escalating past it buys no measured headroom while making the widget staler
+the longer a throttle persists. The `N > 0` branch could not escalate in any
+case — §6.2 requires obeying `N` exactly.
+
+This is the same correction §6.2.1 applies to the "back off one full sliding
+window" draft: a plausible policy chosen before measurement, replaced by the
+measurement.
 
 ### 6.2.1 Measured behavior
 
