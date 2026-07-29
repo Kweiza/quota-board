@@ -369,3 +369,88 @@ under a per-`(account, client_id)` binding.
   rejection of a superseded token is not.
 - **The refresh-expiry anchor is undetermined.** It is fixed and is not extended by
   refreshing, but what instant it is measured from was not established.
+
+---
+
+# Spike D — is the 429 budget per account or per IP?
+
+Run date: 2026-07-30
+User-Agent: `quoata-board/0.1.0`
+Accounts: three, on one machine behind one IP, referred to as A, B and C.
+
+## Why the obvious method does not work
+
+The first method drafted for this was "poll all accounts every 30 seconds and see
+whether one account 429s or all of them do." That cannot distinguish the two
+hypotheses. Polling every account equally drains every account equally, so a
+per-account budget and a per-IP budget both produce the same observation: all
+accounts start failing at roughly the same time.
+
+Telling them apart requires **asymmetric load** — saturate one account while
+leaving the others strictly untouched, then probe the others once.
+
+## Method
+
+1. Baseline: one probe each of A, B and C. All three returned 200.
+2. Quiet for 150 s, so B and C sit at effectively full budget (measured recovery
+   is roughly one request per 120 s).
+3. Drive A alone at 10-second intervals. B and C are not touched.
+4. The instant A returns 429, probe B once and C once.
+5. Re-probe A, to distinguish a real throttle state from a single unlucky call.
+
+## Result
+
+```
+22:39:59  A => 200        (baseline)
+22:39:59  B => 200        (baseline)
+22:40:00  C => 200        (baseline)
+          ... 150 s quiet ...
+22:42:31  A#1 => 200
+   ...
+22:43:44  A#8 => 200
+22:43:55  A#9 => 429   Retry-After: 300
+22:43:55  B   => 200
+22:43:56  C   => 200
+22:43:56  A   => 429   Retry-After: 299
+```
+
+**The 429 budget is independent per account.** In the same second that A was
+throttled, B and C both returned 200. Under per-IP throttling all three would
+have failed together. The re-probe of A confirms A was genuinely blocked rather
+than momentarily unlucky.
+
+Consequence for the poll policy: the interval and floor do **not** need to scale
+with the number of accounts.
+
+## `Retry-After: N > 0` exists after all
+
+Spike B recorded 34 consecutive `Retry-After: 0` values and concluded the header
+carried no usable wait hint. This run produced **`Retry-After: 300`** on the
+first 429 and **`299`** on a probe one second later.
+
+Two things follow. First, both branches of the design's `Retry-After` table are
+live, and an `N > 0` value must be obeyed exactly — a client applying the
+`Retry-After: 0` policy of a ~180-second backoff would return while a
+300-second block is still in force. Second, the countdown moved by exactly the
+one second that elapsed, which confirms the previously untested claim that
+**probing does not extend the block**.
+
+Why the two runs differ is undetermined. Spike B polled a single account at
+60-second intervals; this run drove one account at 10-second intervals. A burst
+rule distinct from the sustained-rate budget is the obvious candidate, but
+nothing here establishes it.
+
+## Scope limits
+
+- **Three accounts, one machine, one IP, one run.** This establishes that the
+  *429 budget* is not shared across accounts. It does not bound how many
+  accounts one IP may poll before some other limit appears.
+- **The saturation count is not a clean measurement.** A reached 429 after nine
+  requests, against Spike B's 26. A had carried other traffic earlier in the
+  same session, so its budget was already partially drawn down when the run
+  started. Only the throttle-scope conclusion is graded from this run; the
+  bucket-depth question is untouched.
+- **The two accounts probed after saturation held tokens with different
+  scopes** — one `user:profile` + `user:inference`, one `user:profile` alone.
+  Both returned 200, which is weak evidence that the budget does not depend on
+  the token's scope set. It was not designed as a test of that.
