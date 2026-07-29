@@ -129,6 +129,13 @@ impl ReqwestHttp {
             .map_err(|e| AuthError::Transport(e.to_string()))?;
         Ok(Self { client })
     }
+
+    /// Exposes the underlying client for `usage::http`, which needs the
+    /// `Retry-After` header on a 429 — `get_json` decodes straight to `T` and
+    /// has nowhere to hand that header back.
+    pub fn raw_client(&self) -> &reqwest::Client {
+        &self.client
+    }
 }
 
 /// On a non-2xx response, read the body so the RFC 6749 error code and
