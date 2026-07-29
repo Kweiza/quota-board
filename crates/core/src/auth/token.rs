@@ -37,7 +37,11 @@ impl AuthError {
 }
 
 /// The token bundle that goes into storage. docs/design.md §9.3.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+///
+/// `Debug` is hand-written, not derived — see below. `Serialize`/`Deserialize`
+/// stay derived; the encrypted store (Task 10) needs the real values, only
+/// *printing* them is the hazard.
+#[derive(Clone, Serialize, Deserialize)]
 pub struct TokenSet {
     pub access_token: String,
     pub refresh_token: String,
@@ -45,6 +49,26 @@ pub struct TokenSet {
     pub refresh_token_expires_at: DateTime<Utc>,
     pub scopes: Vec<String>,
     pub client_id: String,
+}
+
+/// Redacts both token fields. A derived `Debug` would print `access_token`
+/// and `refresh_token` in full — into a `tracing::debug!(?tokens)`, an
+/// `assert_eq!` failure, an `unwrap_err()` on an `Ok` — any of which can land
+/// in a log file or CI output. This is the redaction shape the rest of this
+/// crate (Task 10's storage/refresh, Task 12's usage client) should copy for
+/// any type that carries a live credential: hand-write `Debug`, never derive
+/// it, print `"<redacted>"` for the sensitive fields.
+impl std::fmt::Debug for TokenSet {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("TokenSet")
+            .field("access_token", &"<redacted>")
+            .field("refresh_token", &"<redacted>")
+            .field("expires_at", &self.expires_at)
+            .field("refresh_token_expires_at", &self.refresh_token_expires_at)
+            .field("scopes", &self.scopes)
+            .field("client_id", &self.client_id)
+            .finish()
+    }
 }
 
 impl TokenSet {
@@ -224,8 +248,9 @@ pub async fn exchange_code<H: TokenHttp>(
 mod tests {
     use super::*;
     use crate::auth::pkce::{AuthConfig, PendingAuth};
-    use wiremock::matchers::{body_json_string, method, path};
-    use wiremock::{Mock, MockServer, ResponseTemplate};
+    use std::sync::{Arc, Mutex};
+    use wiremock::matchers::{body_json_string, header, method, path};
+    use wiremock::{Mock, MockServer, Request, ResponseTemplate};
 
     fn pending() -> PendingAuth {
         PendingAuth {
@@ -255,6 +280,12 @@ mod tests {
         Mock::given(method("POST"))
             .and(path("/v1/oauth/token"))
             .and(body_json_string(expected))
+            // Pins the wire user agent, not just the constant: if `ReqwestHttp`
+            // ever stopped sending `USER_AGENT` (or sent something else, e.g.
+            // "claude-code/1.0.0"), the mock would not match, the request
+            // would get wiremock's default 404, and this test would fail —
+            // unlike a test that only re-reads the constant back.
+            .and(header("user-agent", USER_AGENT))
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
                 "access_token": "at", "refresh_token": "rt",
                 "expires_in": 27000, "refresh_token_expires_in": 2592000,
@@ -328,6 +359,28 @@ mod tests {
         assert!((29..=30).contains(&days), "expected roughly 30 days, got {days}");
     }
 
+    /// A derived `Debug` would print both tokens verbatim into any
+    /// `{:?}`/`?tokens` tracing call, `assert_eq!` failure, or `unwrap_err()`
+    /// on an `Ok`. That is a wider aperture than the `Decode`-leak test below
+    /// guards, since it fires on the success path, not just a parse failure.
+    #[test]
+    fn tokenset_debug_redacts_both_tokens() {
+        let tokens = TokenSet {
+            access_token: "sk-ant-access-SENTINEL".into(),
+            refresh_token: "sk-ant-refresh-SENTINEL".into(),
+            expires_at: chrono::Utc::now(),
+            refresh_token_expires_at: chrono::Utc::now(),
+            scopes: vec!["user:profile".into()],
+            client_id: "client-1".into(),
+        };
+        let debug = format!("{tokens:?}");
+        assert!(!debug.contains("SENTINEL"), "Debug output leaked a token: {debug}");
+        assert!(debug.contains("<redacted>"), "expected the redaction marker, got: {debug}");
+        // Non-sensitive fields should still be visible — this is redaction,
+        // not a black box.
+        assert!(debug.contains("client-1"));
+    }
+
     /// `secrets` once had a parse-failure path whose error message embedded
     /// the secret value it failed to read. Guard against the same shape here:
     /// a 2xx response that fails to deserialize must not echo the token it
@@ -351,10 +404,60 @@ mod tests {
         assert!(!msg.contains("LEAKED-TOKEN"), "the decode error exposed the access token: {msg}");
     }
 
+    /// This only re-reads the constant, so on its own it is tautological: it
+    /// cannot see what actually went out on the wire, and would stay green
+    /// even if `ReqwestHttp::new` stopped applying `.user_agent(USER_AGENT)`
+    /// to the client. Kept as a cheap sanity check on the constant's shape;
+    /// `exchange_sends_a_json_body_not_a_form` and
+    /// `get_json_sends_the_oauth_beta_header_and_no_claude_identifying_header`
+    /// are what actually pin the wire behavior.
     #[tokio::test]
     async fn user_agent_is_ours_never_claude_code() {
         let http = ReqwestHttp::new().unwrap();
         assert!(http.user_agent().starts_with("quoata-board/"));
         assert!(!http.user_agent().contains("claude"));
+    }
+
+    #[derive(serde::Deserialize)]
+    struct Ping {
+        ok: bool,
+    }
+
+    /// `get_json` had no coverage at all before this. Captures the actual
+    /// request `get_json` sends and inspects every header on it — not just
+    /// the one this test happens to name — so a header added anywhere later
+    /// that leaks "claude" (product name, package name, anything) would be
+    /// caught here, not only a change to `user-agent` specifically.
+    #[tokio::test]
+    async fn get_json_sends_the_oauth_beta_header_and_no_claude_identifying_header() {
+        let server = MockServer::start().await;
+        let captured: Arc<Mutex<Option<Request>>> = Arc::new(Mutex::new(None));
+        let captured_clone = captured.clone();
+
+        Mock::given(method("GET"))
+            .and(path("/v1/ping"))
+            .respond_with(move |req: &Request| {
+                *captured_clone.lock().unwrap() = Some(req.clone());
+                ResponseTemplate::new(200).set_body_json(serde_json::json!({"ok": true}))
+            })
+            .mount(&server)
+            .await;
+
+        let http = ReqwestHttp::new().unwrap();
+        let resp: Ping = http
+            .get_json(&format!("{}/v1/ping", server.uri()), "bearer-token")
+            .await
+            .unwrap();
+        assert!(resp.ok);
+
+        let req = captured.lock().unwrap().take().expect("get_json never reached the mock");
+
+        let beta = req.headers.get("anthropic-beta").expect("anthropic-beta header missing");
+        assert_eq!(beta.to_str().unwrap(), ANTHROPIC_BETA);
+
+        for (name, value) in req.headers.iter() {
+            let v = value.to_str().unwrap_or_default().to_lowercase();
+            assert!(!v.contains("claude"), "header `{name}` leaked a Claude-identifying value: {v}");
+        }
     }
 }
