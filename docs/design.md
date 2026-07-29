@@ -607,15 +607,28 @@ and optionally `account:{uuid, email_address}` and `organization:{uuid}`.
 
 ### 10.4 Scopes
 
-**Request: `user:profile` + `user:inference`.**
+**Request: `user:profile` alone. `user:inference` is deliberately not
+requested.**
 
-Claude Code gates its own `/api/oauth/usage` call on both of these, but that is
-a **client-side** gate; whether the server requires `user:inference` for a
-read-only usage call is unconfirmed (§13).
+Claude Code gates its own `/api/oauth/usage` call on both `user:profile` and
+`user:inference`, but that is a **client-side** gate. A live spike against a
+real account measured the server side directly and established the full
+lifecycle works with `user:profile` alone: the consent screen accepted the
+narrowed scope (the authorize URL carried `scope=user%3Aprofile`), the token
+response came back scoped to `user:profile` with no silent widening, an
+initial `GET /api/oauth/usage` returned 200 with a complete response, a
+refresh with the narrowed stored scope succeeded and kept `user:profile`
+rather than the server re-adding `user:inference`, and a usage query after
+that refresh also returned 200. Claude Code's requirement of both scopes is
+therefore confirmed to be a client-side gate only, not a server one (§13).
 
-**If `user:profile` alone passes, drop `user:inference`.** A token that cannot
-run inference is a materially better terms-of-service position for a monitoring
-tool.
+A token that cannot run inference is not an optimisation — it is the
+terms-of-service position this whole project is built around (§5.2). What we
+did **not** verify, and will not: that the resulting token is actually
+incapable of inference. Confirming that would mean calling
+`POST /v1/messages`, which this project forbids outright. What is recorded
+here is narrower and honest about that limit: we requested a narrower scope,
+and the server issued it.
 
 We do not request `org:create_api_key`, `user:sessions:claude_code`,
 `user:mcp_servers`, or `user:file_upload` — they are not needed.
@@ -878,7 +891,7 @@ What has been measured, and how, is recorded in
 | The refresh chain's expiry is absolute and is **not** extended by refreshing | **confirmed** |
 | A single account reports **different window sets** across accounts | **confirmed** |
 | Whether our refresh disturbs a Claude Code session (§10.7) | **confirmed** — chains are per grant; it does not |
-| Whether `user:profile` alone passes server-side (§10.4) | open |
+| Whether `user:profile` alone passes server-side (§10.4) | **confirmed** — it does; `user:inference` dropped |
 | Whether 429 budgets are independent per account (§12.8) | open |
 
 ## 14. Test strategy

@@ -23,7 +23,10 @@ sync, a central server — into one desktop app.
 
 It calls `GET https://api.anthropic.com/api/oauth/usage`, the same endpoint
 behind Claude Code's `/usage` command, which costs no inference. It never sends
-an inference request, so it never consumes the limits it reports.
+an inference request, so it never consumes the limits it reports. The OAuth
+token it holds backs that up structurally, not just by convention: it is
+requested with the `user:profile` scope only, so it never carries
+`user:inference`.
 
 Full architecture and rationale: [`docs/design.md`](docs/design.md).
 Measured behavior of that endpoint, including its throttling:
