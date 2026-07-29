@@ -29,12 +29,12 @@ const SERVICE: &str = "quoata-board";
 fn open_store() -> Box<dyn SecretStore> {
     match KeychainStore::probe(SERVICE) {
         Ok(s) => {
-            eprintln!("저장소: {}", s.describe());
+            eprintln!("store: {}", s.describe());
             Box::new(s)
         }
         Err(e) => {
-            eprintln!("키체인 사용 불가 ({e}).");
-            eprintln!("CLI에서는 폴백을 쓰지 않는다 — Task 6의 EncryptedFileStore는 GUI에서만 쓴다.");
+            eprintln!("keychain unavailable ({e}).");
+            eprintln!("the CLI does not use the fallback store — EncryptedFileStore is for the GUI only.");
             std::process::exit(1);
         }
     }
@@ -45,16 +45,16 @@ async fn cmd_login() -> Result<(), Box<dyn std::error::Error>> {
     let cb = Callback::bind().await?;
     let (pending, url) = begin(&cfg, &cb.redirect_uri())?;
 
-    println!("브라우저에서 아래 주소를 여세요:\n\n{url}\n");
-    println!("(동의 화면에 'Claude Code'로 표시됩니다 — client_id를 재사용하기 때문입니다.)");
+    println!("Open this URL in your browser:\n\n{url}\n");
+    println!("(The consent screen will say 'Claude Code' — we reuse its public client_id.)");
 
     let params = cb.wait_for_code(success_redirect(), &pending.state).await?;
-    let code = params.get("code").ok_or("콜백에 code가 없음")?;
-    let state = params.get("state").ok_or("콜백에 state가 없음")?;
+    let code = params.get("code").ok_or("the callback carried no code")?;
+    let state = params.get("state").ok_or("the callback carried no state")?;
 
     let http = ReqwestHttp::new()?;
     let (tokens, identity) = exchange_code(&http, &cfg, &pending, code, state).await?;
-    let identity = identity.ok_or("토큰 응답에 account 블록이 없음 — uuid를 얻을 수 없다")?;
+    let identity = identity.ok_or("the token response carried no account block — there is no uuid to key by")?;
 
     // The token key format belongs to Task 10b's `auth::stored` — not
     // re-derived here, `token_key` above is the only place it is built.
@@ -71,8 +71,8 @@ async fn cmd_login() -> Result<(), Box<dyn std::error::Error>> {
         sort_order: 0,
     })?;
 
-    println!("추가됨: {}", identity.uuid);
-    println!("스코프: {}", tokens.scopes.join(" "));
+    println!("added: {}", identity.uuid);
+    println!("scopes: {}", tokens.scopes.join(" "));
     Ok(())
 }
 
@@ -105,14 +105,14 @@ async fn cmd_show(only: Option<&str>) -> Result<(), Box<dyn std::error::Error>> 
             }
         };
         if let Err(e) = &fresh.persisted {
-            eprintln!("{}: 토큰은 갱신됐지만 저장에 실패했다 ({e}) — 다음 실행은 이 값을 못 본다", a.display_label);
+            eprintln!("{}: the token was rotated but could not be stored ({e}) — the next run will not see it", a.display_label);
         }
 
         match fetch_usage(&http, &fresh.tokens.access_token).await {
             Ok(windows) => {
                 println!("{}:", a.display_label);
                 for w in windows {
-                    println!("  {:<16} {:>5.1}%  리셋 {}", w.label, w.percent, w.resets_at);
+                    println!("  {:<16} {:>5.1}%  resets {}", w.label, w.percent, w.resets_at);
                 }
             }
             Err(e) => println!("{}: {e}", a.display_label),
@@ -129,13 +129,13 @@ async fn cmd_show(only: Option<&str>) -> Result<(), Box<dyn std::error::Error>> 
 /// is a one-shot smoke command, not a concurrent path, so it needs no lock.
 async fn cmd_refresh(uuid: &str) -> Result<(), Box<dyn std::error::Error>> {
     let store = open_store();
-    let raw = store.get(&token_key(uuid))?.ok_or("해당 uuid의 토큰 없음")?;
+    let raw = store.get(&token_key(uuid))?.ok_or("no token is stored for that uuid")?;
     let tokens: TokenSet = serde_json::from_slice(&raw)?;
     let http = ReqwestHttp::new()?;
     let new = refresh(&http, &AuthConfig::default(), &tokens).await?;
     store.put(&token_key(uuid), &serde_json::to_vec(&new)?)?;
-    println!("갱신됨. 새 만료: {}", new.expires_at);
-    println!("스코프: {}", new.scopes.join(" "));
+    println!("refreshed. new expiry: {}", new.expires_at);
+    println!("scopes: {}", new.scopes.join(" "));
     Ok(())
 }
 
@@ -145,9 +145,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     match args.get(1).map(String::as_str) {
         Some("login") => cmd_login().await,
         Some("show") => cmd_show(args.get(2).map(String::as_str)).await,
-        Some("refresh") => cmd_refresh(args.get(2).ok_or("uuid 필요")?).await,
+        Some("refresh") => cmd_refresh(args.get(2).ok_or("a uuid is required")?).await,
         _ => {
-            eprintln!("사용법: quoata-cli [login|show|refresh <uuid>]");
+            eprintln!("usage: quoata-cli [login|show|refresh <uuid>]");
             std::process::exit(2);
         }
     }
