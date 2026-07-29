@@ -16,6 +16,31 @@ pub struct UsageWindow {
     pub scope: Option<String>,
 }
 
+/// Spec §7.1. All of these are user-visible states.
+///
+/// **The serialized form must match the `AccountState` union in
+/// `src/lib/types.ts` exactly.** `tag = "kind"` plus snake_case is that
+/// contract.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum AccountState {
+    /// Right after the account is added, before the first fetch.
+    Loading,
+    Ok { windows: Vec<UsageWindow>, fetched_at: DateTime<Utc> },
+    /// Automatic polling failed but the last known value is kept. **Never
+    /// render without its age.**
+    Stale { windows: Vec<UsageWindow>, fetched_at: DateTime<Utc> },
+    Throttled { until: DateTime<Utc> },
+    /// Access token expired, refresh in progress.
+    AuthExpired,
+    /// invalid_grant. Only re-login fixes this.
+    AuthDead,
+    SecretsLocked,
+    /// The response could not be parsed. **Not 0%.**
+    UnknownShape,
+    Network,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Severity {
     Green,
