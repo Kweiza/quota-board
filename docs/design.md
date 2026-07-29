@@ -277,10 +277,23 @@ minutes of 60-second polling on a single account with an honest User-Agent:
 
 - 26 consecutive successes, then the first 429; after six consecutive 429s, a
   near-perfect alternating pattern.
-- **All 34 observed `Retry-After` values were `0`.** `N > 0` never appeared, so
-  the header gives no usable wait hint and the client must rely on its own
-  fixed policy.
+- All 34 `Retry-After` values observed **in that run** were `0`. See the
+  correction immediately below — this is no longer the whole picture.
 - Sustainable rate after saturation: roughly **1 request per 120 seconds**.
+
+> **Correction (2026-07-30). `N > 0` has now been observed.** A later run at
+> 10-second intervals produced `Retry-After: 300` on the first 429, and `299` on
+> a probe one second later. Both branches of §6.2's table are therefore live,
+> and the earlier "the header gives no usable wait hint" no longer holds: when
+> `N > 0` arrives it is a real countdown and must be obeyed exactly.
+>
+> That same pair of observations also confirms the table's previously untested
+> claim that **probing does not extend the block** — the deadline moved by
+> exactly the one second that elapsed, not by the probe.
+>
+> The saturation count in that run (9 requests) is **not** a clean measurement
+> of bucket depth; that account had carried other traffic earlier in the
+> session. Only the throttle-scope conclusion (§12.8) is graded from it.
 
 Two mechanisms (a continuous token bucket refilling every ~120s, and an hourly
 quota of ~30) fit the data equally well and the measurement cannot separate
@@ -293,8 +306,11 @@ them. The practical conclusion is identical under both.
   an hour means one 429 leaves the widget stale for that hour.
 - **The 180-second floor in §6.1 is safe by measurement** (comfortably above the
   120-second minimum).
-- The `N > 0` branch was not observed but is retained — the server may adopt
-  that form at any time, and handling it costs nothing.
+- The `N > 0` branch was retained despite not appearing in the first
+  measurement, on the reasoning that the server might adopt that form at any
+  time and that handling it cost nothing. **It has since appeared** (see the
+  correction above). Deleting an unobserved-but-cheap branch would have left the
+  client applying a 180-second backoff to a 300-second block.
 
 ### 6.3 Visibility gating
 
@@ -867,13 +883,25 @@ degradation.**
 See §9.3. Keying on anything other than `account.uuid`, or failing to
 fingerprint caches with the token, reproduces these bugs by default.
 
-### 12.8 The per-account assumption is unverified for N>1
+### 12.8 The per-account assumption — measured for N=3
 
 The design rests on "limits are per-account, so one session per account
-suffices." Nothing contradicts this, but **it has not been measured whether N
-accounts polling from one process/IP receive N independent 429 budgets or are
-collapsed into per-IP throttling.** Until that is known, the polling constants
-should be treated as provisional for multi-account setups.
+suffices." The open part was whether N accounts polling from one process and IP
+receive N independent 429 budgets or are collapsed into per-IP throttling.
+
+**Measured: the budgets are independent per account.** Three accounts were
+signed in from one machine. One was driven to a 429; in the same second, the
+other two returned 200, and a re-probe of the throttled account confirmed it was
+still blocked rather than momentarily unlucky. Under per-IP throttling all three
+would have failed together.
+
+The polling constants in §6.1 therefore do **not** need to scale with account
+count. A per-IP result would have forced the interval to be multiplied by the
+number of accounts, and the 180-second floor with it.
+
+Scope limit: three accounts on one machine, one run. Nothing here bounds how
+many accounts a single IP can poll before some other limit appears; the
+conclusion is that the *429 budget* is not the shared thing.
 
 ## 13. Verification status
 
@@ -885,14 +913,15 @@ What has been measured, and how, is recorded in
 | `/api/oauth/usage` returns 200 with an honest User-Agent | **confirmed** |
 | The response's top-level key set and schema | **confirmed** |
 | `seven_day` null with weekly data only in `limits[]` | **confirmed** |
-| The 429 boundary and `Retry-After` semantics | **confirmed** |
+| The 429 boundary and `Retry-After: 0` semantics | **confirmed** |
+| `Retry-After: N > 0` also occurs, and is a real countdown a probe does not extend | **confirmed** (§6.2.1) |
 | Access-token lifetime: **8 hours** (28,799 s, twice) | **confirmed** |
 | Refresh rotates both tokens on every call | **confirmed** |
 | The refresh chain's expiry is absolute and is **not** extended by refreshing | **confirmed** |
 | A single account reports **different window sets** across accounts | **confirmed** |
 | Whether our refresh disturbs a Claude Code session (§10.7) | **confirmed** — chains are per grant; it does not |
 | Whether `user:profile` alone passes server-side (§10.4) | **confirmed** — it does; `user:inference` dropped |
-| Whether 429 budgets are independent per account (§12.8) | open |
+| Whether 429 budgets are independent per account (§12.8) | **confirmed** — independent, for N=3 on one IP |
 
 ## 14. Test strategy
 
