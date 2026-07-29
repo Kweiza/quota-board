@@ -65,13 +65,19 @@ pub fn success_redirect() -> &'static str {
 /// leading non-standard `code=true` is what makes the server render a
 /// pasteable `code#state` page — the only switch that makes the manual
 /// fallback possible, so it stays first.
-pub fn begin(cfg: &AuthConfig, redirect_uri: &str) -> (PendingAuth, String) {
+pub fn begin(
+    cfg: &AuthConfig,
+    redirect_uri: &str,
+) -> Result<(PendingAuth, String), url::ParseError> {
     let verifier = random_urlsafe(32);
     let state = random_urlsafe(32);
     let challenge = code_challenge_s256(&verifier);
     let scope = cfg.scopes.join(" ");
 
-    let mut url = url::Url::parse(&cfg.authorize_url).expect("authorize_url must be valid");
+    // `authorize_url` is user-overridable (docs/design.md §10.2), so a bad
+    // config value or environment variable must surface as an error here
+    // rather than crash a login flow in progress.
+    let mut url = url::Url::parse(&cfg.authorize_url)?;
     {
         let mut q = url.query_pairs_mut();
         q.append_pair("code", "true");
@@ -89,7 +95,7 @@ pub fn begin(cfg: &AuthConfig, redirect_uri: &str) -> (PendingAuth, String) {
         state,
         redirect_uri: redirect_uri.to_string(),
     };
-    (pending, url.to_string())
+    Ok((pending, url.to_string()))
 }
 
 #[cfg(test)]
@@ -114,7 +120,7 @@ mod tests {
     }
 
     #[test]
-    fn verifier_and_state_differ_every_time() {
+    fn random_urlsafe_is_not_constant() {
         let a = random_urlsafe(32);
         let b = random_urlsafe(32);
         assert_ne!(a, b);
@@ -126,7 +132,7 @@ mod tests {
     #[test]
     fn authorize_url_has_code_true_first_and_all_required_params() {
         let cfg = AuthConfig::default();
-        let (_pending, url) = begin(&cfg, "http://localhost:54321/callback");
+        let (_pending, url) = begin(&cfg, "http://localhost:54321/callback").unwrap();
 
         let query = url.split_once('?').unwrap().1;
         assert!(query.starts_with("code=true&"), "code=true must be first: {query}");
@@ -145,11 +151,15 @@ mod tests {
     #[test]
     fn authorize_url_challenge_matches_the_returned_verifier() {
         let cfg = AuthConfig::default();
-        let (pending, url) = begin(&cfg, "http://localhost:1/callback");
+        let (pending, url) = begin(&cfg, "http://localhost:1/callback").unwrap();
         let parsed = url::Url::parse(&url).unwrap();
         let q: std::collections::HashMap<_, _> = parsed.query_pairs().into_owned().collect();
         assert_eq!(q.get("code_challenge").unwrap(), &code_challenge_s256(&pending.verifier));
         assert_eq!(q.get("state").unwrap(), &pending.state);
+        // `state` must be independent randomness, not derived from the
+        // verifier — a state equal to the verifier would publish the
+        // code_verifier in the authorize URL and in query logs, defeating PKCE.
+        assert_ne!(pending.verifier, pending.state);
     }
 
     /// docs/design.md §10.4: do not ask for scopes this app has no use for.
