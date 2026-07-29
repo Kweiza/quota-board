@@ -87,10 +87,16 @@ impl RefreshLocks {
 
 pub struct Fresh {
     pub tokens: TokenSet,
-    /// False when the rotation succeeded over HTTP but the store write did not.
+    /// `Err` when the rotation succeeded over HTTP but the store write did not.
     /// The tokens are live and usable for this cycle; only the next process
     /// start will fail to see them.
-    pub persisted: bool,
+    ///
+    /// The error is carried rather than reduced to a boolean because §9.2 and
+    /// §9.3 make two of its cases first-class and they need different
+    /// responses: a `Locked` keychain must ask the user to unlock, while a
+    /// `TooLong` blob will never fit — every future rotation fails identically
+    /// and the account silently demands a re-login on every restart.
+    pub persisted: Result<(), SecretError>,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -137,7 +143,7 @@ let _held = guard.lock().await;              // serialize per account
 for _ in 0..2 {
     let current = load(store, uuid)?;         // MUST be read inside the lock
     if !current.needs_refresh() {
-        return Ok(Fresh { tokens: current, persisted: true });
+        return Ok(Fresh { tokens: current, persisted: Ok(()) });
     }
 
     let witness = current.refresh_token.clone();
@@ -150,12 +156,9 @@ for _ in 0..2 {
         Err(e)                    => return Err(e),
     }
 
-    return match save(store, uuid, &new) {
-        Ok(())   => Ok(Fresh { tokens: new, persisted: true }),
-        Err(_)   => Ok(Fresh { tokens: new, persisted: false }),
-    };
+    return Ok(Fresh { tokens: new, persisted: save(store, uuid, &new) });
 }
-return Ok(Fresh { tokens: load(store, uuid)?, persisted: true });
+return Ok(Fresh { tokens: load(store, uuid)?, persisted: Ok(()) });
 ```
 
 Four properties, each of which was a defect in an earlier draft of this design:
@@ -187,8 +190,10 @@ to an account the user has just deleted.
 **A failed store write does not discard a live token.** After a successful
 rotation the server has moved to the new refresh token and the old one is dead.
 Returning `Err` there would throw away the only live credential, leave the dead
-one on disk, and waste the cycle. `persisted: false` reports the durability
-failure while keeping the token usable.
+the cycle. `persisted: Err(e)` reports the durability failure — and which one
+it was — while keeping the token usable. Note that the store retains the dead
+pre-rotation token either way; the branch chosen only decides whether the live
+one reaches the caller.
 
 ### 4.3 Blocking behaviour
 
@@ -242,7 +247,7 @@ that nothing in the product would ever produce.
 | `Auth(e)` where `e.is_dead_grant()` | `AUTH_DEAD` | §10.5 one-strike quarantine |
 | `Auth(Transport(_))` | `NETWORK` | a transport failure is not an auth failure; §7.1 treats `NETWORK` as `STALE`, keeping the last value with its age |
 | other `Auth(_)` | `AUTH_EXPIRED` | §7.1 |
-| `Ok(Fresh { persisted: false, .. })` | no state change, warn | the token is live; only durability failed |
+| `Ok(Fresh { persisted: Err(e), .. })` | no state change, warn with `e` | the token is live; only durability failed. The three cases differ: `Locked` recovers on unlock, `Backend` is usually transient, and **`TooLong` is permanent** — that blob will never fit, so every restart will demand a re-login |
 
 No `StoredTokenError` variant carries a credential. `AuthError::Decode`
 deliberately omits the response body, and `SecretError::Backend` is scrubbed on
@@ -269,7 +274,7 @@ require.
 | 2 | CAS adopts: responder writes a foreign `TokenSet` (different refresh token) into the store before responding → the call returns the foreign set and the store still holds it | remove the witness comparison → the store holds ours |
 | 3 | CAS does not resurrect: responder deletes the key → `Err(Missing)` and the key is still absent | replace the arms with `_ => {}` → the key reappears |
 | 4 | No-op path: a fresh token → zero POSTs and zero writes | — |
-| 5 | Write failure after a successful rotation → `persisted: false`, tokens are the new ones | — |
+| 5 | Write failure after a successful rotation → `persisted` carries the actual `SecretError` (matched, not merely `is_err()`), tokens are the new ones | reduce it to a boolean → the `matches!` assertion fails |
 | 6 | `Fresh`'s `Debug` redacts both tokens while keeping `persisted` visible | derive `Debug` on `TokenSet` → the sentinel appears |
 | 7 | A corrupt stored blob yields `Corrupt` without folding its contents into the error | carry the serde message → the sentinel appears |
 
