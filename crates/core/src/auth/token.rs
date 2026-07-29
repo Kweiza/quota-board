@@ -244,6 +244,76 @@ pub async fn exchange_code<H: TokenHttp>(
     Ok((tokens, identity))
 }
 
+fn refresh_body(cfg: &AuthConfig, tokens: &TokenSet) -> serde_json::Value {
+    serde_json::json!({
+        "grant_type": "refresh_token",
+        "refresh_token": tokens.refresh_token,
+        "client_id": cfg.client_id,
+        // Send the stored scopes back verbatim. Falling back to a
+        // hardcoded list here would silently narrow the scopes on every
+        // refresh, and the narrowing is cumulative and invisible until
+        // something that needed the dropped scope stops working.
+        "scope": tokens.scopes.join(" "),
+    })
+}
+
+/// refresh_token -> a new TokenSet. docs/design.md §10.5.
+pub async fn refresh<H: TokenHttp>(
+    http: &H,
+    cfg: &AuthConfig,
+    tokens: &TokenSet,
+) -> Result<TokenSet, AuthError> {
+    let body = refresh_body(cfg, tokens);
+    let r: TokenResponse = match http.post_json(&cfg.token_url, &body).await {
+        Ok(r) => r,
+        Err(e) if e.is_invalid_scope() => {
+            // Retry exactly once with the identical body. This covers a
+            // transient scope rejection from the server, not an attempt to
+            // change the scopes — sending anything else here would defeat
+            // the verbatim rule above.
+            http.post_json(&cfg.token_url, &body).await?
+        }
+        Err(e) => return Err(e),
+    };
+
+    let scopes = r
+        .scope
+        .as_deref()
+        .map(|s| s.split_whitespace().map(str::to_string).collect())
+        .unwrap_or_else(|| tokens.scopes.clone());
+
+    Ok(TokenSet {
+        access_token: r.access_token,
+        refresh_token: r.refresh_token,
+        expires_at: Utc::now() + TimeDelta::seconds(r.expires_in),
+        // When absent, keep the previous value — do not fall back to 30
+        // days. That fallback belongs only to the initial exchange
+        // (see `exchange_code` above); reapplying it here would push the
+        // expiry back on every refresh and the refresh token would never
+        // actually expire.
+        refresh_token_expires_at: match r.refresh_token_expires_in {
+            Some(secs) => Utc::now() + TimeDelta::seconds(secs),
+            None => tokens.refresh_token_expires_at,
+        },
+        scopes,
+        client_id: cfg.client_id.clone(),
+    })
+}
+
+/// Revokes the server-side token, e.g. on account deletion. Best-effort:
+/// the result is discarded on purpose. A user deleting an account from this
+/// app must not be blocked by the revocation endpoint being unreachable —
+/// the local deletion proceeds either way.
+pub async fn revoke<H: TokenHttp>(http: &H, cfg: &AuthConfig, refresh_token: &str) {
+    let url = format!("{}/revoke", cfg.token_url);
+    let body = serde_json::json!({
+        "token": refresh_token,
+        "token_type_hint": "refresh_token",
+        "client_id": cfg.client_id,
+    });
+    let _: Result<serde_json::Value, _> = http.post_json(&url, &body).await;
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -459,5 +529,133 @@ mod tests {
             let v = value.to_str().unwrap_or_default().to_lowercase();
             assert!(!v.contains("claude"), "header `{name}` leaked a Claude-identifying value: {v}");
         }
+    }
+
+    fn tokens_with(scopes: &[&str]) -> TokenSet {
+        TokenSet {
+            access_token: "old-at".into(),
+            refresh_token: "old-rt".into(),
+            expires_at: Utc::now() - TimeDelta::seconds(1),
+            refresh_token_expires_at: Utc::now() + TimeDelta::days(30),
+            scopes: scopes.iter().map(|s| s.to_string()).collect(),
+            client_id: AuthConfig::default().client_id,
+        }
+    }
+
+    /// The single most important rule in docs/design.md §10.5: refresh must
+    /// send back the scopes exactly as stored, not a hardcoded list.
+    #[tokio::test]
+    async fn refresh_sends_the_stored_scopes_verbatim() {
+        let server = MockServer::start().await;
+        let stored = ["user:profile", "user:inference", "user:mcp_servers"];
+        let expected = serde_json::json!({
+            "grant_type": "refresh_token",
+            "refresh_token": "old-rt",
+            "client_id": AuthConfig::default().client_id,
+            "scope": "user:profile user:inference user:mcp_servers"
+        })
+        .to_string();
+
+        Mock::given(method("POST"))
+            .and(body_json_string(expected))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "access_token": "new-at", "refresh_token": "new-rt",
+                "expires_in": 27000,
+                "scope": "user:profile user:inference user:mcp_servers"
+            })))
+            .mount(&server)
+            .await;
+
+        let http = ReqwestHttp::new().unwrap();
+        let out = refresh(&http, &cfg_for(&server).await, &tokens_with(&stored))
+            .await
+            .unwrap();
+        assert_eq!(out.access_token, "new-at");
+        assert_eq!(out.scopes, stored);
+    }
+
+    /// When the refresh response omits `refresh_token_expires_in`, keep the
+    /// previous value. Falling back to 30 days here would push the expiry
+    /// back on every refresh, so the refresh token would never actually
+    /// expire.
+    #[tokio::test]
+    async fn refresh_keeps_the_previous_refresh_expiry_when_absent() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "access_token": "new-at", "refresh_token": "new-rt",
+                "expires_in": 27000, "scope": "user:profile"
+            })))
+            .mount(&server)
+            .await;
+
+        let before = tokens_with(&["user:profile"]);
+        let http = ReqwestHttp::new().unwrap();
+        let after = refresh(&http, &cfg_for(&server).await, &before).await.unwrap();
+        assert_eq!(after.refresh_token_expires_at, before.refresh_token_expires_at);
+    }
+
+    /// docs/design.md §10.5: `invalid_scope` gets exactly one retry, using
+    /// the stored scopes verbatim.
+    #[tokio::test]
+    async fn invalid_scope_is_retried_exactly_once() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(400).set_body_json(serde_json::json!({
+                "error": "invalid_scope"
+            })))
+            .up_to_n_times(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "access_token": "second-try", "refresh_token": "rt2",
+                "expires_in": 27000, "scope": "user:profile"
+            })))
+            // Capped to one use, not just eventually asserted: a stray extra
+            // retry would land here again and produce the same success body,
+            // so the final `access_token` alone cannot tell "retried once"
+            // apart from "retried twice". Capping turns a surplus retry into
+            // an observable failure (the third call falls through to no
+            // mock at all) instead of a silently identical success.
+            .up_to_n_times(1)
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let http = ReqwestHttp::new().unwrap();
+        let out = refresh(&http, &cfg_for(&server).await, &tokens_with(&["user:profile"]))
+            .await
+            .unwrap();
+        assert_eq!(out.access_token, "second-try");
+    }
+
+    /// docs/design.md §10.5: `invalid_grant` is not retried — every retry
+    /// would only burn a fresh 401/429, not recover the chain.
+    #[tokio::test]
+    async fn invalid_grant_fails_immediately_and_is_flagged_dead() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(400).set_body_json(serde_json::json!({
+                "error": "invalid_grant"
+            })))
+            .expect(1) // must be called exactly once — no retry
+            .mount(&server)
+            .await;
+
+        let http = ReqwestHttp::new().unwrap();
+        let err = refresh(&http, &cfg_for(&server).await, &tokens_with(&["user:profile"]))
+            .await
+            .unwrap_err();
+        assert!(err.is_dead_grant());
+    }
+
+    #[test]
+    fn needs_refresh_respects_the_five_minute_skew() {
+        let mut t = tokens_with(&["user:profile"]);
+        t.expires_at = Utc::now() + TimeDelta::seconds(EXPIRY_SKEW_SECS - 10);
+        assert!(t.needs_refresh(), "inside the skew window still counts as needing a refresh");
+        t.expires_at = Utc::now() + TimeDelta::seconds(EXPIRY_SKEW_SECS + 60);
+        assert!(!t.needs_refresh());
     }
 }
