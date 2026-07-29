@@ -207,7 +207,8 @@ a plain `cargo build`. Neither project gate catches it.
 
 ## 5. Scheduler gate (added to Task 11)
 
-`Entry` gains `in_flight_since: Option<Instant>`, and the scheduler gains
+`Entry` gains `in_flight_since: Option<DateTime<Utc>>` — the scheduler's injected
+clock type, not `Instant`, so the reclaim below stays testable — and it gains
 `begin_poll(uuid) -> bool` and `end_poll(uuid)`. `due()` skips accounts already
 in flight.
 
@@ -215,7 +216,7 @@ This is what actually establishes §6.1's **"Global concurrency of 1"**, which
 the plan currently violates: `refresh_account` calls the wiring's `poll_one`
 directly, bypassing `due()` and its `.take(1)`.
 
-The field is an `Option<Instant>` rather than a `bool` because a panic or an
+The field is an `Option<DateTime<Utc>>` rather than a `bool` because a panic or an
 early return that skips `end_poll` would otherwise freeze that account forever.
 `due()` reclaims an entry that has been in flight longer than
 `IN_FLIGHT_RECLAIM`, a Task 11 constant set to **90 seconds**: comfortably above
@@ -239,7 +240,8 @@ that nothing in the product would ever produce.
 | `Missing`, `Corrupt` | `AUTH_DEAD` | §9.2 line 479: "`NOT_FOUND` → treat that account as `AUTH_DEAD` (re-login required)". Routing these to `AUTH_EXPIRED` renders a permanent spinner instead of a clickable re-login |
 | `Secrets(Locked)` | `SECRETS_LOCKED` | §9.2 line 477 |
 | `Auth(e)` where `e.is_dead_grant()` | `AUTH_DEAD` | §10.5 one-strike quarantine |
-| other `Auth(_)` | `STALE` / `NETWORK` | §7.1 |
+| `Auth(Transport(_))` | `NETWORK` | a transport failure is not an auth failure; §7.1 treats `NETWORK` as `STALE`, keeping the last value with its age |
+| other `Auth(_)` | `AUTH_EXPIRED` | §7.1 |
 | `Ok(Fresh { persisted: false, .. })` | no state change, warn | the token is live; only durability failed |
 
 No `StoredTokenError` variant carries a credential. `AuthError::Decode`
@@ -268,7 +270,8 @@ require.
 | 3 | CAS does not resurrect: responder deletes the key → `Err(Missing)` and the key is still absent | replace the arms with `_ => {}` → the key reappears |
 | 4 | No-op path: a fresh token → zero POSTs and zero writes | — |
 | 5 | Write failure after a successful rotation → `persisted: false`, tokens are the new ones | — |
-| 6 | No leakage: `{:?}` and `to_string()` of every variant contain no sentinel token | — |
+| 6 | `Fresh`'s `Debug` redacts both tokens while keeping `persisted` visible | derive `Debug` on `TokenSet` → the sentinel appears |
+| 7 | A corrupt stored blob yields `Corrupt` without folding its contents into the error | carry the serde message → the sentinel appears |
 
 Test 1 asserts a **POST count**, not non-overlapping timestamps, and the mock
 must yield unconditionally. Two rigs that look plausible do not work: a
@@ -317,9 +320,13 @@ gap. They are accepted, not oversights.
   `poll_one` in `begin_poll`/`end_poll`, apply §6's error mapping, and correct
   the concurrency comment to say that the ticker upholds concurrency of 1 while
   `refresh_account` does not.
-- **Task 12**: replace the CLI's two inline refresh blocks with `ensure_fresh`.
-  The CLI is a single-shot Phase 1 binary, so it gains code reuse and the
-  compare-and-swap, not serialization.
+- **Task 12**: replace `cmd_show`'s inline refresh block with `ensure_fresh` and
+  drop the CLI's local `token_key`. The CLI is a single-shot Phase 1 binary, so
+  it gains code reuse and the compare-and-swap, not serialization. **`cmd_refresh`
+  deliberately keeps its direct `refresh` call**: `ensure_fresh` returns early
+  when the token is still fresh, and that command exists to *force* a rotation —
+  it is how spike 7 (whether our refresh disturbs a running Claude Code session)
+  gets observed at all.
 - **Task 18**: use `stored::token_key` in the login and account-deletion paths.
 - **Task 10**: correct the stale note that Task 11 calls `refresh`; Task 10b is
   the sole caller.
