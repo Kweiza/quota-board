@@ -1,3 +1,4 @@
+pub mod encrypted_file;
 pub mod keychain;
 
 use std::collections::HashMap;
