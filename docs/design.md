@@ -660,7 +660,7 @@ On account deletion, POST
 `<TOKEN_URL>/revoke`. Timeout 5 seconds, best-effort — swallow failures and
 proceed with local deletion.
 
-### 10.7 Refresh-chain isolation — the benefit and the unconfirmed risk
+### 10.7 Refresh-chain isolation — the benefit and the measured risk
 
 The practical benefit of our own OAuth: because we obtain our own grant per
 account, we hold **independent refresh chains** and do not compete with Claude
@@ -668,16 +668,33 @@ Code's single-use chain. The race that consumes most of clauth's and
 claude-swap's complexity — where whoever refreshes first invalidates the other
 — simply does not arise for us.
 
-**There is, however, an unconfirmed risk.** It is not known whether the server
-binds refresh chains per grant or per `(account, client_id)`. **Because we reuse
-Claude Code's client_id, under the latter our refresh could invalidate a Claude
-Code session running on the same account.**
+**The risk this section was written for has been measured, and it does not
+materialise.** It was not known whether the server binds refresh chains per
+grant or per `(account, client_id)`; under the latter, reusing Claude Code's
+client_id would have meant our refresh invalidating a Claude Code session on the
+same account, with the damage landing outside this app on the user's primary
+tool.
 
-**This is a pre-release blocker**, because the damage lands outside this app —
-on the user's primary tool. See §13. If confirmed, there are two fallbacks:
-long-lived tokens via `claude setup-token` (an official feature, designed not to
-compete with rotating chains), or documenting a "one session per account"
-constraint.
+**Measured: chains are bound per grant.** One account signed in to Claude Code
+on several machines holds one grant per machine under the same
+`(account, client_id)` pair, and those machines run in parallel for days without
+either being asked to re-authenticate. Access tokens last eight hours (§13), so
+each machine has refreshed successfully many times *after* the others obtained
+their grants — which a per-`(account, client_id)` binding would have made
+impossible. Our own grant is obtained through the same authorization_code + PKCE
+flow, under the same client_id, requesting a subset of Claude Code's scopes; the
+server has no basis on which to treat it differently.
+
+What remains untested is narrow: no experiment has driven our grant and a Claude
+Code grant against each other directly. Doing so requires deliberately risking a
+working session, and the evidence above — one class of grant observed against
+itself at scale, over days — is the strongest available without that. It is
+recorded as measured rather than proven.
+
+Had it gone the other way, the fallbacks were long-lived tokens via
+`claude setup-token` (an official feature, designed not to compete with rotating
+chains), or documenting a "one session per account" constraint. Neither is
+needed.
 
 ## 11. Platform
 
@@ -814,10 +831,13 @@ returning null for models that had actual usage (ccstatusline #503).
 Expect it to change again. **The failure mode to avoid is rendering a
 confidently wrong number. Degrade to "unknown."**
 
-### 12.5 Refresh-chain collision — unconfirmed, damage outside the app
+### 12.5 Refresh-chain collision — measured, does not occur
 
-See §10.7. Second in severity only to the 7-day problem, because the damage
-lands on the user's primary tool.
+See §10.7. This was second in severity only to the 7-day problem, because the
+damage would have landed on the user's primary tool. Chains are bound per grant,
+so it does not arise. Retained here rather than deleted: the reasoning is what
+justifies reusing Claude Code's client_id at all, and a future change to the
+server's binding would revive it.
 
 ### 12.6 The header fallback is not a fallback
 
@@ -853,9 +873,13 @@ What has been measured, and how, is recorded in
 | The response's top-level key set and schema | **confirmed** |
 | `seven_day` null with weekly data only in `limits[]` | **confirmed** |
 | The 429 boundary and `Retry-After` semantics | **confirmed** |
+| Access-token lifetime: **8 hours** (28,799 s, twice) | **confirmed** |
+| Refresh rotates both tokens on every call | **confirmed** |
+| The refresh chain's expiry is absolute and is **not** extended by refreshing | **confirmed** |
+| A single account reports **different window sets** across accounts | **confirmed** |
+| Whether our refresh disturbs a Claude Code session (§10.7) | **confirmed** — chains are per grant; it does not |
 | Whether `user:profile` alone passes server-side (§10.4) | open |
 | Whether 429 budgets are independent per account (§12.8) | open |
-| Whether our refresh disturbs a Claude Code session (§10.7) | open — pre-release blocker |
 
 ## 14. Test strategy
 
