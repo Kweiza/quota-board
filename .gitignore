@@ -1,0 +1,13 @@
+# Build output
+/target
+/dist
+/node_modules
+/src-tauri/gen
+
+# Private working artifacts: implementation plans, session handoffs, raw
+# research logs. Never published. See CLAUDE.md.
+/.local/
+
+# Agent session scratch
+/.superpowers/
+/.claude/
