@@ -66,6 +66,12 @@ impl PollPolicy {
     /// 429 would leave the widget showing a stale value for an hour. Set to
     /// 180s to leave margin over the measured recovery time.
     pub const SATURATED_BACKOFF_SECS: i64 = 180;
+    /// Upper bound on a server-supplied `Retry-After`. That header is
+    /// externally controlled input reaching time arithmetic that panics on
+    /// overflow, and past `i64::MAX` it wraps negative and defeats the throttle
+    /// entirely — see `record_throttle`. An hour is far beyond any legitimate
+    /// value; the largest ever observed is 300.
+    pub const MAX_RETRY_AFTER_SECS: u64 = 3600;
 
     pub fn with_interval_secs(secs: i64) -> Self {
         Self {
@@ -101,6 +107,12 @@ struct Entry {
     /// be polled again. Judged against the injected clock, so the reclaim is
     /// itself testable without waiting.
     in_flight_since: Option<DateTime<Utc>>,
+    /// When a poll was last *started* for this account, success or not. Only
+    /// `set_visible` reads it, to keep the visibility path from polling inside
+    /// the §6.1 floor. `last_fetched_at` cannot serve here: it is set on
+    /// success only, so an account that keeps failing would have no floor at
+    /// all on the very path most likely to be triggered repeatedly.
+    last_attempt_at: Option<DateTime<Utc>>,
 }
 
 impl Entry {
@@ -140,6 +152,7 @@ impl<C: Clock> Scheduler<C> {
                 throttled_until: None,
                 quarantined: false,
                 in_flight_since: None,
+                last_attempt_at: None,
             },
         );
         self.order.push(uuid.to_string());
@@ -157,9 +170,19 @@ impl<C: Clock> Scheduler<C> {
         self.visible = visible;
         if becoming_visible {
             let now = self.clock.now();
+            let floor = TimeDelta::seconds(PollPolicy::MIN_INTERVAL_SECS);
             for e in self.entries.values_mut() {
                 if !e.quarantined && e.throttled_until.is_none_or(|t| t <= now) {
-                    e.next_due_at = now;
+                    // Pull the poll forward, but never inside §6.1's per-account
+                    // floor. Setting this to `now` unconditionally let a widget
+                    // that is hidden and shown every five seconds poll every
+                    // five seconds — the floor simply was not enforced on this
+                    // path — and it reset the failure backoff on every flip.
+                    // Focus changes and workspace switches are not rare
+                    // deliberate acts. `min` keeps §6.3's "refresh the moment it
+                    // becomes visible" intact for any realistic hidden duration.
+                    let earliest = e.last_attempt_at.map_or(now, |t| t + floor);
+                    e.next_due_at = e.next_due_at.min(now.max(earliest));
                 }
             }
         }
@@ -200,6 +223,7 @@ impl<C: Clock> Scheduler<C> {
         match self.entries.get_mut(uuid) {
             Some(e) if !e.is_in_flight(now) => {
                 e.in_flight_since = Some(now);
+                e.last_attempt_at = Some(now);
                 true
             }
             _ => false,
@@ -248,10 +272,22 @@ impl<C: Clock> Scheduler<C> {
     /// Spec §6.2. `retry_after_secs == 0` means budget exhausted — sit out an
     /// entire window. `u64`, not `i64`, to line up with `UsageError::Throttled`
     /// — Task 12 made that field `u64` so a negative `Retry-After` cannot parse
-    /// at all. The non-negative contract therefore holds by construction and
-    /// there is nothing to clamp here.
+    /// at all.
+    ///
+    /// **That settles the sign, not the magnitude, and the magnitude is the
+    /// dangerous half.** The header is parsed with no upper bound, so a server
+    /// (or anything able to answer as one) can send a value that:
+    ///   - overflows `TimeDelta::seconds`, which panics;
+    ///   - or overflows `now + wait`, which also panics;
+    ///   - or, past `i64::MAX`, wraps negative through `as i64` and lands
+    ///     `throttled_until` in the **past** — so the client immediately
+    ///     re-polls a server that just told it to back off, silently defeating
+    ///     the one mechanism this module exists to provide.
+    ///
+    /// Cap it. An hour is far beyond any legitimate value.
     pub fn record_throttle(&mut self, uuid: &str, retry_after_secs: u64) {
         let now = self.clock.now();
+        let retry_after_secs = retry_after_secs.min(PollPolicy::MAX_RETRY_AFTER_SECS);
         let wait = if retry_after_secs > 0 {
             // `Retry-After: N > 0` is a real countdown and must be obeyed
             // exactly (§6.2). Measured 2026-07-30: 300, then 299 one second
@@ -350,13 +386,24 @@ mod tests {
     }
 
     /// Spec §6.1: stagger accounts to avoid a startup burst.
+    ///
+    /// **`due()` cannot verify the stagger.** `due()` ends in `.take(1)`, so it
+    /// returns only the first account even when stagger is zero — an earlier
+    /// version written that way still passed with the offset in `add()`
+    /// deleted entirely. The schedule itself has to be inspected.
     #[test]
     fn accounts_are_staggered_so_startup_never_bursts() {
         let (mut s, _c) = sched();
         s.add("a");
         s.add("b");
         s.add("c");
-        assert_eq!(s.due(), vec!["a"], "only one on the first tick");
+
+        let stagger = PollPolicy::default().stagger;
+        assert!(stagger > TimeDelta::zero(), "a zero stagger would make this test catch nothing");
+
+        let a = s.next_wake("a").unwrap();
+        assert_eq!(s.next_wake("b").unwrap() - a, stagger, "the second account is one stagger behind");
+        assert_eq!(s.next_wake("c").unwrap() - a, stagger * 2, "the third is two staggers behind");
     }
 
     /// Spec §6.1: global concurrency of 1.
@@ -548,5 +595,49 @@ mod tests {
         assert!(!s.begin_poll("a"), "still claimed just before the deadline");
         c.advance_secs(2);
         assert!(s.begin_poll("a"), "reclaimed once the deadline passes");
+    }
+
+    /// The server-supplied `Retry-After` is external input with no upper
+    /// bound. `u64::MAX` wraps negative through `as i64` and lands
+    /// `throttled_until` in the **past** — immediately re-hitting a server
+    /// that just told us to back off. Values below that panic in
+    /// `TimeDelta::seconds` or in `now + wait`.
+    #[test]
+    fn an_absurd_retry_after_is_capped_and_never_lands_in_the_past() {
+        let (mut s, c) = sched();
+        s.add("a");
+        let now = c.now();
+
+        s.record_throttle("a", u64::MAX);
+        let until = s.next_wake("a").unwrap();
+        assert!(until > now, "throttled_until landed in the past — the throttle is defeated");
+        assert_eq!(
+            until - now,
+            TimeDelta::seconds(PollPolicy::MAX_RETRY_AFTER_SECS as i64),
+            "must be clamped to the cap"
+        );
+        assert!(s.due().is_empty(), "must not become due right after being capped");
+    }
+
+    /// Spec §6.1's floor applies to the visibility path too. Repeatedly
+    /// hiding and showing the widget must not bypass it — a focus change or a
+    /// workspace switch alone can trigger that.
+    #[test]
+    fn becoming_visible_never_polls_inside_the_floor() {
+        let (mut s, c) = sched();
+        s.add("a");
+        assert!(s.begin_poll("a"), "poll once");
+        s.end_poll("a");
+        s.record_success("a", win(10.0));
+
+        c.advance_secs(5);
+        s.set_visible(false);
+        s.set_visible(true);
+        assert!(s.due().is_empty(), "hide/show cycling bypassed the floor");
+
+        c.advance_secs(PollPolicy::MIN_INTERVAL_SECS);
+        s.set_visible(false);
+        s.set_visible(true);
+        assert_eq!(s.due(), vec!["a"], "once the floor has passed, becoming visible must make it due");
     }
 }
