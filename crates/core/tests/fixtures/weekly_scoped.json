@@ -1,0 +1,13 @@
+{
+  "five_hour": { "utilization": 28, "resets_at": "2026-07-29T15:00:00Z" },
+  "seven_day": null,
+  "seven_day_opus": null,
+  "limits": [
+    { "kind": "weekly_scoped", "group": "weekly", "percent": 31,
+      "resets_at": "2026-08-02T00:00:00Z",
+      "scope": { "model": { "display_name": "Opus" } } },
+    { "kind": "weekly_scoped", "group": "weekly", "percent": 12,
+      "resets_at": "2026-08-02T00:00:00Z",
+      "scope": { "model": { "display_name": "Sonnet" } } }
+  ]
+}
