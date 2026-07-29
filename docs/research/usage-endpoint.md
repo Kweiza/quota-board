@@ -252,3 +252,120 @@ This figure matches almost exactly the "28–30 per hour" estimate carried in th
 
 - **One account, one process only.** This measurement used a single account in a single process. Whether this throttle is independent per account, or a shared budget per IP/process/application, when several accounts are polled concurrently from one process is **entirely unknown from this measurement.** It remains an open question for a separate task.
 - **Aliasing cannot be ruled out, because the polling period and the derived period stand in an exact 2:1 relationship.** This measurement polled at 60-second intervals, and the period derived above is exactly twice that, 120 seconds. A near-perfect 200/429 alternation is also the classic aliasing pattern produced by exactly such an integer relationship — measuring at a different interval (40 or 90 seconds, say) might have produced a different apparent pattern (one failure in three, or a more complex rhythm). The true minimum period should therefore be read as **bounded** near that value rather than pinned to exactly 120 seconds. The 61-second interval at seq 49–50 (see "Shape after saturation") can be read alongside this as weak evidence in the same direction — that the bound may not be perfectly fixed.
+
+---
+
+# Spike C — refresh behaviour and per-account window sets
+
+Run date: 2026-07-30
+User-Agent: `quoata-board/0.1.0`
+Accounts: three, referred to below as A, B and C. Identifiers are not reproduced.
+
+## Method
+
+Three accounts were signed in through this project's own OAuth (authorization_code +
+PKCE, loopback redirect, Claude Code's public client_id). The machine is headless, so the
+consent redirects were received over an SSH tunnel to the loopback listener.
+
+For the refresh measurements, `quoata-cli refresh` was temporarily instrumented to print a
+truncated, non-reversible SHA-256 of each credential before and after the call, alongside
+the stored expiry timestamps. The instrument was reverted before commit; no credential was
+ever printed, only a hash prefix.
+
+## Refresh rotates both tokens
+
+Two forced refreshes of account A, 36 seconds apart. On **both** calls the refresh-token
+fingerprint and the access-token fingerprint changed. The server rotates both credentials
+on every refresh.
+
+This matters beyond bookkeeping: §10.5 and the `auth::stored` compare-and-swap are written
+around a "single-use rotating chain" premise, and until this run that premise was an
+assumption with nothing measuring it. The rotating half is now measured. The single-use
+half — whether the superseded refresh token is actually rejected — is **not** measured
+here, because the CLI keeps no copy of a rotated-away token.
+
+## Access-token lifetime: 8 hours
+
+`expires_in` was 28,799 s on both calls — eight hours less one second. §10.5's
+five-minute skew is therefore about 1% of the lifetime, which is comfortable.
+
+Note for anyone reading older internal notes: a figure of 7.6 hours appears in earlier
+private working material. The measured value is 8 hours.
+
+## The refresh chain's expiry is absolute, and refreshing does not extend it
+
+Across all three samples the stored `refresh_token_expires_at` resolved to the same
+absolute instant, drifting only by the sub-second gap between the two calls:
+
+```
+before refresh #1   2026-08-26 08:03:28.027
+after  refresh #1   2026-08-26 08:03:28.304
+after  refresh #2   2026-08-26 08:03:28.450
+```
+
+The client computes this field as `now + refresh_token_expires_in` whenever the server
+sends it, and preserves the previous value byte-for-byte when it does not. The sub-second
+drift proves the server **did** send it, and the stable absolute result proves the value is
+*remaining seconds to a fixed deadline* rather than a fresh duration.
+
+**Consequence: a refresh chain cannot be kept alive indefinitely by refreshing it.** It
+expires at a fixed instant roughly a month after the grant, and the user must sign in
+again. A widget left running will reach `AUTH_DEAD` on that date with no warning unless
+the UI anticipates it. What the deadline is anchored to is undetermined — it is not
+exactly 28 days after our grant.
+
+## Window sets differ per account, and an absent window is not zero
+
+Queried within one minute of each other:
+
+| Account | `5h` | `7d` | `weekly (Fable)` |
+|---|---|---|---|
+| A | absent | 100.0% | 75.0% |
+| B | 26.0% | absent | 59.0% |
+| C | 0.0% | 96.0% | 100.0% |
+
+Three accounts, three different shapes; no account returned every window. This is §12.1's
+risk observed directly, and it is why the renderer must handle a variable bar count rather
+than assume a fixed pair.
+
+**C's `5h 0.0%` is not a true zero.** A deliberate one-token prompt was run on C shortly
+before the query, so the value is a small non-zero utilisation rounded to one decimal. It
+is therefore consistent with — not evidence against — the reading that windows with no
+usage are omitted entirely.
+
+**Why an absent window must still degrade to "unknown" rather than 0%.** B reports `5h` at
+26% but no `7d` at all. Five-hour usage is a subset of seven-day usage, so B's missing
+`7d` cannot be an omitted zero; something other than "no usage" removes it. A is the
+opposite case, and looks like an omitted zero. The same absence therefore carries two
+different meanings, and the response gives no way to tell them apart. Rendering either as
+"0% used" would state a fact the data does not support — for B, it would claim a
+seven-day limit that may not exist.
+
+Three candidate explanations for B's missing `7d` were considered and **none is
+established**: the account's plan may not carry that limit; the window may be omitted for
+zero usage; or the account was created and subscribed the same day and has no seven-day
+history. The third is weakened by B carrying a `weekly (Fable)` window, which is also
+week-scoped. Re-measuring B after several days would separate them.
+
+## Chain binding is per grant (resolves §10.7)
+
+Not measured by an experiment run here, but by long-standing everyday use: one account
+signed in to Claude Code on several machines holds one grant per machine under the same
+`(account, client_id)` pair, and those machines run in parallel for days with neither
+being asked to re-authenticate. Access tokens last eight hours, so every machine has
+refreshed successfully many times after the others obtained their grants — impossible
+under a per-`(account, client_id)` binding.
+
+## Scope limits
+
+- **Three accounts, one machine, one run.** The window-set observations are three samples
+  taken within a minute; nothing here establishes how window sets vary over time.
+- **The per-grant binding evidence is observational, not a controlled experiment.** No run
+  drove one of this project's grants and a Claude Code grant against each other directly;
+  doing so requires deliberately risking a working session. One class of grant was
+  observed against itself, at scale and over days, which is the strongest evidence
+  available short of that.
+- **The single-use half of the rotation premise is untested.** Rotation is measured;
+  rejection of a superseded token is not.
+- **The refresh-expiry anchor is undetermined.** It is fixed and is not extended by
+  refreshing, but what instant it is measured from was not established.
