@@ -10,7 +10,7 @@ pub enum UsageError {
     #[error("access token was rejected")]
     Unauthorized,
     #[error("throttled (retry_after={retry_after_secs}s)")]
-    Throttled { retry_after_secs: i64 },
+    Throttled { retry_after_secs: u64 },
     #[error("response shape not recognized")]
     UnknownShape,
     #[error("HTTP {0}")]
@@ -47,12 +47,18 @@ pub async fn fetch_usage_at(
 
     if status == 429 {
         // Absence of Retry-After is interpreted as 0 (budget exhausted) — the
-        // more conservative reading.
+        // more conservative reading. Parsed as `u64`, not `i64`: a malformed
+        // or hostile `Retry-After: -5` must not produce a negative value that
+        // falls outside §6.2's two-value contract (0, or a positive count of
+        // seconds) — parsing as unsigned makes a negative reading fail to
+        // parse and fall through to the same 0 as an absent header, rather
+        // than reaching a `Duration::from_secs` cast in the poller as a
+        // multi-billion-year sleep.
         let retry_after_secs = resp
             .headers()
             .get("retry-after")
             .and_then(|v| v.to_str().ok())
-            .and_then(|s| s.trim().parse::<i64>().ok())
+            .and_then(|s| s.trim().parse::<u64>().ok())
             .unwrap_or(0);
         return Err(UsageError::Throttled { retry_after_secs });
     }
@@ -68,9 +74,10 @@ pub async fn fetch_usage_at(
         .await
         .map_err(|e| UsageError::Transport(e.to_string()))?;
 
-    // Task 4 split ParseError into two variants (UnknownShape,
-    // UnreadableSource). The single-variant irrefutable pattern
-    // (`|ParseError::UnknownShape|`) no longer compiles, so this must be a match.
+    // Written as an exhaustive match, not `.map_err(|_| UsageError::UnknownShape)`:
+    // if `ParseError` ever gains a third variant, this fails to compile until
+    // that variant is given an explicit mapping here, instead of silently
+    // inheriting `UnknownShape` for a case nobody has thought through yet.
     parse_usage(&body).map_err(|e| match e {
         ParseError::UnknownShape => UsageError::UnknownShape,
         // A window existed but could not be read — surface it rather than
@@ -82,21 +89,33 @@ pub async fn fetch_usage_at(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::auth::token::ReqwestHttp;
+    use crate::auth::token::{ReqwestHttp, ANTHROPIC_BETA, USER_AGENT};
+    use std::sync::{Arc, Mutex};
     use wiremock::matchers::{header, method, path};
-    use wiremock::{Mock, MockServer, ResponseTemplate};
+    use wiremock::{Mock, MockServer, Request, ResponseTemplate};
 
     #[tokio::test]
     async fn sends_our_own_user_agent_and_only_the_oauth_beta_header() {
         let server = MockServer::start().await;
+        let captured: Arc<Mutex<Option<Request>>> = Arc::new(Mutex::new(None));
+        let captured_clone = captured.clone();
+
         Mock::given(method("GET"))
             .and(path("/api/oauth/usage"))
-            .and(header("anthropic-beta", "oauth-2025-04-20"))
+            .and(header("anthropic-beta", ANTHROPIC_BETA))
             .and(header("authorization", "Bearer tok"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-                "five_hour": { "utilization": 28, "resets_at": "2026-07-29T15:00:00Z" },
-                "seven_day": null, "limits": []
-            })))
+            // Pins the wire user agent, not the constant. If `raw_client()` ever
+            // stopped applying `USER_AGENT` — or sent something else, e.g.
+            // "claude-code/1.0.0" — the request would miss this mock, take
+            // wiremock's 404, and the `unwrap()` below would fail the test.
+            .and(header("user-agent", USER_AGENT))
+            .respond_with(move |req: &Request| {
+                *captured_clone.lock().unwrap() = Some(req.clone());
+                ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "five_hour": { "utilization": 28, "resets_at": "2026-07-29T15:00:00Z" },
+                    "seven_day": null, "limits": []
+                }))
+            })
             .mount(&server)
             .await;
 
@@ -106,6 +125,18 @@ mod tests {
             .unwrap();
         assert_eq!(w.len(), 1);
         assert_eq!(w[0].percent, 28.0);
+
+        // The "only the oauth beta header" half. wiremock matchers are
+        // positive-only, so without this sweep the test passes happily while a
+        // dozen Claude-identifying headers ride along beside the ones matched
+        // above. Same shape as
+        // `get_json_sends_the_oauth_beta_header_and_no_claude_identifying_header`
+        // in `auth/token.rs`, and it catches headers this test does not name.
+        let req = captured.lock().unwrap().take().expect("the request never reached the mock");
+        for (name, value) in req.headers.iter() {
+            let v = value.to_str().unwrap_or_default().to_lowercase();
+            assert!(!v.contains("claude"), "header `{name}` leaked a Claude-identifying value: {v}");
+        }
     }
 
     #[tokio::test]
@@ -146,6 +177,28 @@ mod tests {
         Mock::given(method("GET"))
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
                 "message": "maintenance"
+            })))
+            .mount(&server)
+            .await;
+
+        let http = ReqwestHttp::new().unwrap();
+        let err = fetch_usage_at(&http, &format!("{}/api/oauth/usage", server.uri()), "tok")
+            .await
+            .unwrap_err();
+        assert!(matches!(err, UsageError::UnknownShape));
+    }
+
+    /// The other half of "never demote to 0%": `five_hour` is present but its
+    /// `utilization` is not a number, so `parse_usage` reports
+    /// `ParseError::UnreadableSource` rather than `UnknownShape` — and that
+    /// must map to `UnknownShape` here too, not fall through to a fabricated
+    /// empty success.
+    #[tokio::test]
+    async fn an_unreadable_source_is_unknown_shape_not_zero() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "five_hour": { "utilization": "n/a" }
             })))
             .mount(&server)
             .await;
