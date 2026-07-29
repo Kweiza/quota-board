@@ -101,10 +101,17 @@ impl RefreshLocks {
 #[derive(Debug)]
 pub struct Fresh {
     pub tokens: TokenSet,
-    /// False when the rotation succeeded over HTTP but the store write did not.
+    /// `Err` when the rotation succeeded over HTTP but the store write did not.
     /// The tokens are live and usable for this cycle; only the next process
     /// start will fail to see them.
-    pub persisted: bool,
+    ///
+    /// The error is carried rather than reduced to a flag because §9.2 and §9.3
+    /// make two of its cases first-class and they need different responses: a
+    /// `Locked` keychain must ask the user to unlock, while a `TooLong` blob
+    /// will never fit — every future rotation fails identically, and the
+    /// account silently demands a re-login on every restart until someone is
+    /// told why.
+    pub persisted: Result<(), SecretError>,
 }
 
 fn load(store: &dyn SecretStore, uuid: &str) -> Result<TokenSet, StoredTokenError> {
@@ -112,10 +119,14 @@ fn load(store: &dyn SecretStore, uuid: &str) -> Result<TokenSet, StoredTokenErro
     serde_json::from_slice(&raw).map_err(|_| StoredTokenError::Corrupt)
 }
 
-fn save(store: &dyn SecretStore, uuid: &str, tokens: &TokenSet) -> Result<(), StoredTokenError> {
-    let blob = serde_json::to_vec(tokens).map_err(|_| StoredTokenError::Corrupt)?;
-    store.put(&token_key(uuid), &blob)?;
-    Ok(())
+fn save(store: &dyn SecretStore, uuid: &str, tokens: &TokenSet) -> Result<(), SecretError> {
+    // `TokenSet` is plain data, so serializing it cannot fail in practice.
+    // Report it as a store error rather than as `Corrupt`: nothing was parsed
+    // and nothing was stored, and the caller's useful response is identical to
+    // any other failed write — the value did not reach the store.
+    let blob = serde_json::to_vec(tokens)
+        .map_err(|_| SecretError::Backend("failed to serialize the token set".into()))?;
+    store.put(&token_key(uuid), &blob)
 }
 
 /// Returns a token set that is fresh by §10.5's five-minute skew, refreshing
@@ -144,8 +155,9 @@ pub async fn ensure_fresh<H: TokenHttp>(
         let current = load(store, uuid)?;
         if !current.needs_refresh() {
             // The double check. A caller that waited on the lock lands here and
-            // returns what the winner stored, with no second request.
-            return Ok(Fresh { tokens: current, persisted: true });
+            // returns what the winner stored, with no second request. Nothing
+            // was written on this path, so there is no write to have failed.
+            return Ok(Fresh { tokens: current, persisted: Ok(()) });
         }
 
         let witness = current.refresh_token.clone();
@@ -174,20 +186,18 @@ pub async fn ensure_fresh<H: TokenHttp>(
             Err(e) => return Err(e),
         }
 
-        return Ok(match save(store, uuid, &new) {
-            Ok(()) => Fresh { tokens: new, persisted: true },
-            // The rotation already happened server-side, so the old refresh
-            // token is dead and `new` is the only live credential. Returning
-            // `Err` here would discard it, leave the dead one on disk, and
-            // waste the poll cycle as well.
-            Err(_) => Fresh { tokens: new, persisted: false },
-        });
+        // The rotation already happened server-side, so the old refresh token
+        // is dead and `new` is the only live credential. A failed write is
+        // reported, never propagated: returning `Err` here would discard the
+        // live token and waste the poll cycle on top of the durability loss.
+        let persisted = save(store, uuid, &new);
+        return Ok(Fresh { tokens: new, persisted });
     }
 
     // Two adoptions in a row means some third writer keeps storing already
     // stale token sets. Hand back what is actually stored and let the next poll
     // cycle re-evaluate, rather than refreshing in a loop.
-    Ok(Fresh { tokens: load(store, uuid)?, persisted: true })
+    Ok(Fresh { tokens: load(store, uuid)?, persisted: Ok(()) })
 }
 
 #[cfg(test)]
@@ -414,7 +424,7 @@ mod tests {
         .unwrap();
 
         assert_eq!(out.tokens.refresh_token, "rt-0");
-        assert!(out.persisted);
+        assert!(out.persisted.is_ok());
         assert_eq!(store.puts.load(Ordering::SeqCst), 0, "a fresh token was re-written");
     }
 
@@ -448,15 +458,22 @@ mod tests {
         .unwrap();
 
         assert_eq!(out.tokens.refresh_token, "rt-1", "the live rotated token was discarded");
-        assert!(!out.persisted, "a failed write must be reported to the caller");
+        // Pins the error itself, not just that one occurred: reducing this to a
+        // boolean is what §9.2/§9.3 forbid, and asserting `is_err()` alone
+        // would keep passing if it were.
+        assert!(
+            matches!(out.persisted, Err(SecretError::Locked(_))),
+            "the store error must reach the caller, got {:?}",
+            out.persisted
+        );
     }
 
-    /// `Fresh` carries a live credential, so it gets the same treatment as
-    /// `TokenSet`: a derived `Debug` would print both tokens into any
-    /// `tracing::debug!(?fresh)` or `assert_eq!` failure.
+    /// `Fresh` carries a live credential. Its `Debug` is derived, and that is
+    /// safe only because it delegates to `TokenSet`'s hand-written redacting
+    /// `Debug` — this test is what holds that dependency in place.
     #[test]
     fn fresh_debug_redacts_the_tokens() {
-        let fresh = Fresh { tokens: expired_tokens("sk-ant-SENTINEL"), persisted: true };
+        let fresh = Fresh { tokens: expired_tokens("sk-ant-SENTINEL"), persisted: Ok(()) };
         let printed = format!("{fresh:?}");
         assert!(!printed.contains("SENTINEL"), "Fresh leaked a token: {printed}");
         assert!(printed.contains("<redacted>"));
