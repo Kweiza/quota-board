@@ -4,65 +4,18 @@ import { getCurrentWindow, LogicalSize } from '@tauri-apps/api/window'
 // own window; dropping it silently widens the document past 280px.
 import './app.css'
 import Widget from './widget/Widget.svelte'
-import { isSettingsWindow, openSettings } from './lib/ipc'
-import type { AccountView } from './lib/types'
+import {
+  inTauri,
+  isSettingsWindow,
+  listAccounts,
+  onUsageUpdated,
+  openSettings,
+  setWidgetVisible,
+} from './lib/ipc'
+import { widgetProps } from './lib/props.svelte'
 
 /** docs/design.md §8.1: "Fixed width of about 280px; height follows content." */
 const WIDGET_WIDTH = 280
-
-/**
- * Placeholder state until Task 17 streams the real thing from the core. It
- * mirrors the §8.1 mockup on purpose — two windows, then three, then a stale
- * account with no weekly window — so the layout can be checked against it.
- */
-function fixture(): AccountView[] {
-  const now = Date.now()
-  const inMinutes = (mins: number) => new Date(now + mins * 60_000).toISOString()
-  const window_ = (id: string, label: string, percent: number, mins: number) => ({
-    window_id: id,
-    label,
-    percent,
-    resets_at: inMinutes(mins),
-    scope: null,
-  })
-
-  return [
-    {
-      uuid: '00000000-0000-4000-8000-000000000001',
-      label: 'work@example.com',
-      state: {
-        kind: 'ok',
-        fetched_at: new Date(now).toISOString(),
-        windows: [
-          window_('five_hour', '5h', 72, 83),
-          window_('seven_day', '7d', 41, 6480),
-        ],
-      },
-    },
-    {
-      uuid: '00000000-0000-4000-8000-000000000002',
-      label: 'personal@example.com',
-      state: {
-        kind: 'ok',
-        fetched_at: new Date(now).toISOString(),
-        windows: [
-          window_('five_hour', '5h', 18, 125),
-          window_('weekly:Opus', 'weekly (Opus)', 91, 4560),
-          window_('weekly:Sonnet', 'weekly (Sonnet)', 27, 4560),
-        ],
-      },
-    },
-    {
-      uuid: '00000000-0000-4000-8000-000000000003',
-      label: 'side@example.com',
-      state: {
-        kind: 'stale',
-        fetched_at: new Date(now - 12 * 60_000).toISOString(),
-        windows: [window_('five_hour', '5h', 38, 47)],
-      },
-    },
-  ]
-}
 
 /**
  * The window cannot measure the DOM, so the view measures itself and pushes
@@ -86,8 +39,12 @@ function followContentHeight(root: HTMLElement): void {
 
 /**
  * A click on a remedy must not vanish silently while its owner task is
- * outstanding. Task 17 owns the OAuth restart and the unlock prompt, because
- * both need credentials this layer has no access to.
+ * outstanding. **Neither remedy is Task 17's.** Re-login is Task 18's
+ * `begin_login`, and Task 18 also owns the unlock prompt — it is the only task
+ * with a settings surface to put a passphrase field on (§9.2 asks for one on
+ * every run of the fallback store). If Task 18 does not take the unlock prompt,
+ * the button must be removed rather than left dead: §7.1 makes that click the
+ * only remedy `SECRETS_LOCKED` carries.
  */
 function pending(what: string): void {
   console.warn(`quoata-board: ${what} is not wired up yet`)
@@ -103,17 +60,43 @@ if (isSettingsWindow()) {
   // routed and visibly identifiable, so the gear can be verified end to end.
   target.textContent = 'Settings (Task 18)'
 } else {
-  mount(Widget, {
-    target,
-    props: {
-      accounts: fixture(),
-      // The gear is the only route into the settings window (§8.4), so this
-      // wiring is what makes that window reachable at all.
-      onOpenSettings: () => void openSettings(),
-      onRelogin: (uuid: string) => pending(`re-login for account ${uuid} (Task 17)`),
-      onUnlock: (uuid: string) => pending(`unlocking the token store for account ${uuid} (Task 17)`),
-    },
-  })
+  // The gear is the only route into the settings window (§8.4), so this
+  // wiring is what makes that window reachable at all.
+  widgetProps.onOpenSettings = () => void openSettings()
+  widgetProps.onRelogin = (uuid: string) => pending(`re-login for account ${uuid} (Task 18)`)
+  widgetProps.onUnlock = (uuid: string) =>
+    pending(`unlocking the token store for account ${uuid} (Task 18)`)
+
+  // `props: widgetProps`, never `{ ...widgetProps }`: a spread copies the
+  // values out of the `$state` proxy and the widget stops reacting to any
+  // later assignment.
+  mount(Widget, { target, props: widgetProps })
 
   followContentHeight(target)
+
+  async function pull(): Promise<void> {
+    try {
+      widgetProps.accounts = await listAccounts()
+    } catch (e) {
+      // A failed command is not a reason to blank the widget: the last list
+      // stays on screen. Never demote to an empty or zero state.
+      console.error('quoata-board: list_accounts failed', e)
+    }
+  }
+
+  if (inTauri()) {
+    void pull()
+    void onUsageUpdated(() => void pull())
+
+    // §6.3. Registered inside the widget branch only. Both windows load
+    // index.html (tauri.conf.json), so a listener at module scope would report
+    // the *settings* window's visibility into the widget's single gate — and
+    // src-tauri/src/main.rs makes hiding the settings window its normal
+    // condition, so closing settings would stop the widget polling.
+    const report = () => void setWidgetVisible(document.visibilityState === 'visible')
+    document.addEventListener('visibilitychange', report)
+    // The initial state too, not only the transitions: the widget starts with
+    // `visible: false` in tauri.conf.json and is shown from setup().
+    report()
+  }
 }

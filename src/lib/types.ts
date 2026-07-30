@@ -27,5 +27,7 @@ export type AccountState =
 export interface AccountView {
   uuid: string
   label: string
+  /** Display only. **Never used as a key** (§9.3) — the key is `uuid`. */
+  email: string
   state: AccountState
 }

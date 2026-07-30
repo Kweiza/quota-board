@@ -10,21 +10,9 @@ use quoata_core::auth::callback::Callback;
 use quoata_core::auth::pkce::{begin, success_redirect, AuthConfig};
 use quoata_core::auth::stored::{ensure_fresh, token_key, RefreshLocks};
 use quoata_core::auth::token::{exchange_code, refresh, ReqwestHttp, TokenSet};
-use quoata_core::secrets::{keychain::KeychainStore, SecretStore};
+use quoata_core::paths::accounts_file;
+use quoata_core::secrets::{keychain::KeychainStore, SecretStore, SERVICE};
 use quoata_core::usage::http::fetch_usage;
-
-fn config_dir() -> std::path::PathBuf {
-    let base = std::env::var("XDG_CONFIG_HOME")
-        .map(std::path::PathBuf::from)
-        .unwrap_or_else(|_| {
-            let mut p = std::path::PathBuf::from(std::env::var("HOME").unwrap());
-            p.push(".config");
-            p
-        });
-    base.join("quoata-board")
-}
-
-const SERVICE: &str = "quoata-board";
 
 fn open_store() -> Box<dyn SecretStore> {
     match KeychainStore::probe(SERVICE) {
@@ -60,7 +48,7 @@ async fn cmd_login() -> Result<(), Box<dyn std::error::Error>> {
     // re-derived here, `token_key` above is the only place it is built.
     open_store().put(&token_key(&identity.uuid), &serde_json::to_vec(&tokens)?)?;
 
-    let mut accounts = AccountStore::load(&config_dir().join("accounts.json"))?;
+    let mut accounts = AccountStore::load(&accounts_file())?;
     accounts.upsert(Account {
         uuid: identity.uuid.clone(),
         display_label: identity.email.clone(),
@@ -86,7 +74,7 @@ async fn cmd_login() -> Result<(), Box<dyn std::error::Error>> {
 /// separates the two — see docs/research/usage-endpoint.md, Spike D.
 async fn cmd_show(only: Option<&str>) -> Result<(), Box<dyn std::error::Error>> {
     let store = open_store();
-    let accounts = AccountStore::load(&config_dir().join("accounts.json"))?;
+    let accounts = AccountStore::load(&accounts_file())?;
     let http = ReqwestHttp::new()?;
     let cfg = AuthConfig::default();
 
