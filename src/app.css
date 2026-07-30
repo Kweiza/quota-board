@@ -1,6 +1,14 @@
 /*
- * Deliberately empty. Task 15 owns the widget's styling.
+ * Do not reintroduce an opaque background on :root, html or body: the widget
+ * window is transparent, and a painted canvas would silently defeat that. The
+ * widget's own background lives on `.widget` in src/widget/Widget.svelte.
  *
- * Do not reintroduce an opaque background on :root or body: the widget window
- * is transparent, and a painted canvas would silently defeat that.
+ * The reset below is not cosmetic. The default 8px body margin made the
+ * document 8px wider than the 280px non-resizable widget window, which pushed
+ * the reset-time column off the right edge.
  */
+html,
+body {
+  margin: 0;
+  padding: 0;
+}

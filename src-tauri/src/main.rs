@@ -17,7 +17,15 @@ fn main() {
                 // The default is all(), which is harmful for the widget:
                 // DECORATIONS would override decorations:false, and VISIBLE
                 // would resurrect a window we deliberately start hidden.
-                .with_state_flags(StateFlags::POSITION | StateFlags::SIZE)
+                //
+                // SIZE is off as well. docs/design.md §8.1 makes the height a
+                // derived value — the view measures its content and calls
+                // setSize (src/main.ts) — so a persisted size is not the
+                // user's choice to restore. Left on, the plugin restores the
+                // previous height on launch and the view immediately corrects
+                // it, and the same restore would override any height set in
+                // tauri.conf.json.
+                .with_state_flags(StateFlags::POSITION)
                 .skip_initial_state("settings")
                 .build(),
         )
