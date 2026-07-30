@@ -71,6 +71,13 @@ pub enum StoredTokenError {
 /// One async mutex per account. Entries are created on first use and never
 /// evicted — the map is bounded by the account count, so eviction would be more
 /// machinery than it saves.
+///
+/// **A `RefreshLocks` serializes only against itself.** Two instances covering
+/// the same account serialize nothing at all: each hands out its own mutex, and
+/// two `ensure_fresh` calls holding different mutexes both proceed. The caller
+/// must therefore hold exactly one instance for the process and pass it to
+/// every call — one in the application state, not one per task, per command
+/// handler, or per poll.
 #[derive(Default)]
 pub struct RefreshLocks {
     inner: Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
@@ -102,8 +109,14 @@ impl RefreshLocks {
 pub struct Fresh {
     pub tokens: TokenSet,
     /// `Err` when the rotation succeeded over HTTP but the store write did not.
-    /// The tokens are live and usable for this cycle; only the next process
-    /// start will fail to see them.
+    /// The tokens are live and usable for this cycle.
+    ///
+    /// **What the next process start sees is worse than "not these tokens".**
+    /// The store still holds the pre-rotation token, and the server has already
+    /// moved past it — so the next start loads a dead credential, its first
+    /// refresh returns `invalid_grant`, and §10.5 quarantines the account on
+    /// that one strike. The user-visible outcome is `AUTH_DEAD` and a forced
+    /// re-login, not a missed rotation.
     ///
     /// The error is carried rather than reduced to a flag because §9.2 and §9.3
     /// make two of its cases first-class and they need different responses: a
@@ -129,8 +142,16 @@ fn save(store: &dyn SecretStore, uuid: &str, tokens: &TokenSet) -> Result<(), Se
     store.put(&token_key(uuid), &blob)
 }
 
-/// Returns a token set that is fresh by §10.5's five-minute skew, refreshing
-/// and persisting it if it is not. Refreshes are serialized per account.
+/// Refreshes the stored token set if §10.5's five-minute skew says it is due,
+/// persists the result, and returns it. Refreshes are serialized per account.
+///
+/// **The returned token is not guaranteed fresh.** The `MAX_ATTEMPTS` loop
+/// below falls through after two adoptions and hands back whatever the store
+/// currently holds, which may still be expired. That is deliberate — the
+/// alternative is refreshing in a loop against a third writer that keeps
+/// storing stale sets — but it means the caller must be prepared for the usage
+/// fetch to answer 401, and must treat that as `AUTH_EXPIRED` (a refresh is
+/// still the remedy) rather than as a dead account.
 ///
 /// **Takes a uuid, never a pre-loaded `TokenSet`.** Re-reading the store inside
 /// the lock is the whole of this function's correctness: the caller that waited
@@ -180,9 +201,15 @@ pub async fn ensure_fresh<H: TokenHttp>(
             // longer exists, with no UI path left to delete it. Dropping the
             // rotated token is correct — it belongs to a deleted account.
             Err(StoredTokenError::Missing) => return Err(StoredTokenError::Missing),
-            // A keychain that locked mid-refresh (§9.2 makes `LOCKED` a
-            // first-class state). The comparison could not be performed at all,
-            // and a compare-and-swap that cannot compare must not swap.
+            // The comparison could not be performed at all, and a
+            // compare-and-swap that cannot compare must not swap. Two cases
+            // reach here and both are covered by that rule: a keychain that
+            // locked mid-refresh (§9.2 makes `LOCKED` first-class), and a
+            // `Corrupt` blob. Refusing to overwrite an unparseable blob is
+            // deliberate, not incidental — the likeliest way one appears is a
+            // re-login writing a new bundle while we read, so it may well be a
+            // half-written *newer* credential, and overwriting it would destroy
+            // the chain the user just created.
             Err(e) => return Err(e),
         }
 
@@ -479,6 +506,49 @@ mod tests {
         assert!(printed.contains("<redacted>"));
         // Redaction, not a black box — the durability flag must stay visible.
         assert!(printed.contains("persisted"));
+    }
+
+    /// docs/design.md §14 names the one-strike `invalid_grant` quarantine as a
+    /// required `auth` test target, and `ensure_fresh` is the only path in the
+    /// application that can reach it — nothing else calls `refresh`.
+    ///
+    /// `token.rs` already tests `is_dead_grant` on a bare `AuthError`. This
+    /// tests the seam: that the flag survives the `StoredTokenError::Auth`
+    /// wrapper, which is the form every caller actually receives. If that
+    /// breaks, a permanently dead grant is silently retried on every poll and
+    /// `AUTH_DEAD` never appears — the account shows a spinner or a dimmed
+    /// stale value forever and the user is never told to sign in again.
+    #[tokio::test]
+    async fn a_dead_grant_is_still_recognisable_through_the_stored_wrapper() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(400).set_body_json(serde_json::json!({
+                "error": "invalid_grant"
+            })))
+            .expect(1) // exactly once — §10.5 forbids retrying a dead grant
+            .mount(&server)
+            .await;
+
+        let store = MemoryStore::default();
+        store
+            .put(&token_key(UUID), &serde_json::to_vec(&expired_tokens("rt-0")).unwrap())
+            .unwrap();
+
+        let http = ReqwestHttp::new().unwrap();
+        let err = ensure_fresh(
+            &http,
+            &cfg_for(&server).await,
+            &store,
+            &RefreshLocks::default(),
+            UUID,
+        )
+        .await
+        .unwrap_err();
+
+        assert!(
+            matches!(err, StoredTokenError::Auth(ref e) if e.is_dead_grant()),
+            "the dead-grant flag did not survive the wrapper, got {err:?}"
+        );
     }
 
     /// The stored blob is the token bundle verbatim, so a parse failure must

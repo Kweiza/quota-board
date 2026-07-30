@@ -1,4 +1,8 @@
+use crate::auth::stored::StoredTokenError;
+use crate::auth::token::AuthError;
 use crate::model::{AccountState, UsageWindow};
+use crate::secrets::SecretError;
+use crate::usage::http::UsageError;
 use chrono::{DateTime, TimeDelta, Utc};
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
@@ -46,11 +50,88 @@ pub enum FailureKind {
     SecretsLocked,
 }
 
+/// The classification of the two error types a poll can produce lives here, in
+/// one place, because docs/design.md §4.1 gives `scheduler` "failure
+/// classification" and because the alternative is every caller re-deriving it.
+/// The wiring that joins `auth::stored`, `usage::http` and this module is the
+/// first such caller, and there is no reason for it to invent these semantics.
+///
+/// **Both matches are written exhaustively, arm by arm.** A `_ =>` catch-all
+/// would give any error variant added later a silent, probably wrong
+/// classification; as written, adding one is a compile error here first.
+impl FailureKind {
+    /// `None` means "this is not a `record_failure`". `Throttled` carries a
+    /// wait, so it routes to `record_throttle` instead — folding it in here
+    /// would discard the `Retry-After` that §6.2 makes the entire input to the
+    /// throttle policy.
+    pub fn from_usage_error(err: &UsageError) -> Option<Self> {
+        match err {
+            UsageError::Throttled { .. } => None,
+            // The access token was rejected. §7.1's `AUTH_EXPIRED` — a refresh
+            // is the remedy, and `auth::stored` performs it on the next poll.
+            UsageError::Unauthorized => Some(FailureKind::AuthExpired),
+            UsageError::UnknownShape => Some(FailureKind::UnknownShape),
+            UsageError::Transport(_) => Some(FailureKind::Network),
+            // **A 5xx is not a network error, and calling it one is a
+            // deliberate simplification, not an oversight.** §7.1 defines
+            // `NETWORK` by how it renders — "treated the same as `STALE`" — and
+            // keeping the last value with its age is the correct rendering for
+            // any fetch that failed without telling us the credential is bad.
+            // The honest alternative would be a sixth state whose display is
+            // identical to two existing ones.
+            UsageError::Status(_) => Some(FailureKind::Network),
+        }
+    }
+
+    /// Total, unlike the usage mapping: every stored-token failure is a
+    /// `record_failure`.
+    pub fn from_stored_token_error(err: &StoredTokenError) -> Self {
+        match err {
+            // §9.2: `NOT_FOUND` means the account needs a re-login, not a
+            // retry. `Corrupt` lands here too — an unreadable blob is not a
+            // credential we can refresh our way out of, and routing either to
+            // `AUTH_EXPIRED` renders a permanent spinner where §7.1 promises a
+            // clickable "re-login required".
+            StoredTokenError::Missing | StoredTokenError::Corrupt => FailureKind::AuthDead,
+            StoredTokenError::Secrets(e) => match e {
+                // §9.2 makes `LOCKED` first-class: the only remedy it carries
+                // is the "unlock" affordance.
+                SecretError::Locked(_) => FailureKind::SecretsLocked,
+                // `NO_BACKEND` is handled by falling back to the encrypted file
+                // store and is not supposed to reach an account state at all;
+                // `Backend` is usually transient; `TooLong` is permanent but
+                // has no state of its own. All three render as "the last value
+                // with its age", which is `NETWORK`.
+                SecretError::NoBackend(_) | SecretError::Backend(_) | SecretError::TooLong { .. } => {
+                    FailureKind::Network
+                }
+            },
+            StoredTokenError::Auth(e) => match e {
+                // §10.5: one strike, then quarantine.
+                AuthError::OAuth { .. } if e.is_dead_grant() => FailureKind::AuthDead,
+                // A transport failure is not an auth failure. Classifying it as
+                // one would eventually quarantine an account over a flaky link.
+                AuthError::Transport(_) => FailureKind::Network,
+                AuthError::OAuth { .. } | AuthError::StateMismatch | AuthError::Decode(_) => {
+                    FailureKind::AuthExpired
+                }
+            },
+        }
+    }
+}
+
+/// Constructed only through [`PollPolicy::with_interval_secs`].
+///
+/// **The fields are private on purpose.** While they were public,
+/// `PollPolicy { interval: TimeDelta::seconds(5), .. }` compiled, and the
+/// 180-second floor — which is §5.2's throttle position expressed as a number,
+/// not a tuning parameter — was advisory. A constructor that clamps is not a
+/// floor if the struct can be built around it.
 #[derive(Debug, Clone)]
 pub struct PollPolicy {
-    pub interval: TimeDelta,
+    interval: TimeDelta,
     /// Stagger between accounts. Prevents a simultaneous burst at startup.
-    pub stagger: TimeDelta,
+    stagger: TimeDelta,
 }
 
 impl PollPolicy {
@@ -73,11 +154,21 @@ impl PollPolicy {
     /// value; the largest ever observed is 300.
     pub const MAX_RETRY_AFTER_SECS: u64 = 3600;
 
+    /// The only way to set the interval, and it clamps to
+    /// [`PollPolicy::MIN_INTERVAL_SECS`].
     pub fn with_interval_secs(secs: i64) -> Self {
         Self {
             interval: TimeDelta::seconds(secs.max(Self::MIN_INTERVAL_SECS)),
             stagger: TimeDelta::seconds(15),
         }
+    }
+
+    pub fn interval(&self) -> TimeDelta {
+        self.interval
+    }
+
+    pub fn stagger(&self) -> TimeDelta {
+        self.stagger
     }
 }
 
@@ -87,11 +178,38 @@ impl Default for PollPolicy {
     }
 }
 
-/// How long an in-flight claim survives without `end_poll`. Comfortably above
-/// the worst legitimate case (a 30-second refresh followed by a 30-second usage
-/// fetch) and comfortably below the 180-second polling floor, so a reclaim can
-/// never race the next scheduled poll for the same account.
-pub const IN_FLIGHT_RECLAIM_SECS: i64 = 90;
+/// How long an in-flight claim survives without `end_poll`.
+///
+/// The worst legitimate poll is **150 seconds**, and every term comes from a
+/// different module:
+///
+/// ```text
+///   30s   one token request        (auth::token's 30-second timeout)
+/// x  2    one invalid_scope retry  (auth::token::refresh, §10.5)
+/// x  2    the CAS retry loop       (auth::stored::MAX_ATTEMPTS)
+/// = 120s  worst-case refresh
+/// + 30s   the usage fetch
+/// = 150s
+/// ```
+///
+/// An earlier value of 90 seconds was derived from "a 30-second refresh
+/// followed by a 30-second usage fetch" — true of `auth::token::refresh` alone,
+/// but wrong once `auth::stored` wraps it in a retry loop. **No review of any
+/// single module could see that**, because no single module contains two of the
+/// three multipliers; it is visible only with all of `auth::token`,
+/// `auth::stored` and this file open at once. At 90 seconds the reclaim fires
+/// while a first poll is still legitimately running and a second poll starts
+/// for the same account, defeating §6.1's concurrency of 1 precisely when the
+/// network is slow — the case the claim exists for.
+///
+/// 170 is above that 150-second worst case and still below the 180-second
+/// polling floor, so a reclaim can never race the next scheduled poll.
+pub const IN_FLIGHT_RECLAIM_SECS: i64 = 170;
+
+/// Caps `record_failure`'s exponential backoff at 64x the polling interval.
+/// Bounded rather than open-ended so the shift below stays inside `i32` and the
+/// multiplication has a chance of being representable.
+const MAX_BACKOFF_LEVEL: u32 = 6;
 
 struct Entry {
     next_due_at: DateTime<Utc>,
@@ -107,11 +225,11 @@ struct Entry {
     /// be polled again. Judged against the injected clock, so the reclaim is
     /// itself testable without waiting.
     in_flight_since: Option<DateTime<Utc>>,
-    /// When a poll was last *started* for this account, success or not. Only
-    /// `set_visible` reads it, to keep the visibility path from polling inside
-    /// the §6.1 floor. `last_fetched_at` cannot serve here: it is set on
-    /// success only, so an account that keeps failing would have no floor at
-    /// all on the very path most likely to be triggered repeatedly.
+    /// When a poll was last *started* for this account, success or not. Read by
+    /// `set_visible` and by `due()`, so that neither path can poll inside the
+    /// §6.1 floor. `last_fetched_at` cannot serve here: it is set on success
+    /// only, so an account that keeps failing would have no floor at all on the
+    /// very paths most likely to be triggered repeatedly.
     last_attempt_at: Option<DateTime<Utc>>,
 }
 
@@ -195,6 +313,7 @@ impl<C: Clock> Scheduler<C> {
             return Vec::new();
         }
         let now = self.clock.now();
+        let floor = TimeDelta::seconds(PollPolicy::MIN_INTERVAL_SECS);
         self.order
             .iter()
             .filter(|id| {
@@ -203,6 +322,16 @@ impl<C: Clock> Scheduler<C> {
                         && e.throttled_until.is_none_or(|t| t <= now)
                         && e.next_due_at <= now
                         && !e.is_in_flight(now)
+                        // §6.1's floor, made structural rather than a driver
+                        // obligation. `next_due_at` only ever moves in
+                        // `record_success`/`record_failure`/`record_throttle`,
+                        // so a driver that calls `begin_poll`, hits an error and
+                        // calls `end_poll` without recording an outcome leaves
+                        // the account immediately due again — a continuous
+                        // hammer on the usage endpoint at loop speed. That is
+                        // an easy path for a caller to take, so the floor is
+                        // enforced here instead of being asked for.
+                        && e.last_attempt_at.is_none_or(|t| now >= t + floor)
                 })
             })
             .take(1)
@@ -263,9 +392,37 @@ impl<C: Clock> Scheduler<C> {
                 e.quarantined = true;
                 return;
             }
-            e.backoff_level = (e.backoff_level + 1).min(6);
+            e.backoff_level = (e.backoff_level + 1).min(MAX_BACKOFF_LEVEL);
             let factor = 1i32 << e.backoff_level; // 2, 4, 8, ... up to 64x
-            e.next_due_at = now + interval * factor;
+            // `TimeDelta`'s `Mul` and `DateTime`'s `Add` both **panic** on
+            // overflow, and the interval is caller-supplied. Saturating is the
+            // right answer rather than a cap chosen out of the air: a wait that
+            // cannot be represented is already unreachably far away, and a
+            // panic in the polling loop takes the whole widget down.
+            e.next_due_at = interval
+                .checked_mul(factor)
+                .and_then(|wait| now.checked_add_signed(wait))
+                .unwrap_or(DateTime::<Utc>::MAX_UTC);
+        }
+    }
+
+    /// Restores a snapshot cached to disk **with the age it actually has**.
+    ///
+    /// docs/design.md §7.4 requires the cached snapshot to be shown as `STALE`
+    /// after a restart, and §7.1 forbids rendering a stale value without its
+    /// age. `record_success` cannot serve: it stamps `last_fetched_at` from the
+    /// clock, so restoring through it would render a real value with a
+    /// fabricated zero-second age — the confidently-wrong-number failure this
+    /// project treats as its worst, applied to the age instead of the
+    /// percentage. §4.1 assigns "snapshot retention" to this module, so the
+    /// entry point belongs here rather than in the wiring.
+    ///
+    /// Deliberately does **not** touch `next_due_at`. Restoring a cache is not
+    /// a poll and must neither delay the first one nor pull it forward.
+    pub fn seed(&mut self, uuid: &str, windows: Vec<UsageWindow>, fetched_at: DateTime<Utc>) {
+        if let Some(e) = self.entries.get_mut(uuid) {
+            e.last_windows = Some(windows);
+            e.last_fetched_at = Some(fetched_at);
         }
     }
 
@@ -314,6 +471,24 @@ impl<C: Clock> Scheduler<C> {
         if let Some(until) = e.throttled_until.filter(|t| *t > now) {
             return Some(AccountState::Throttled { until });
         }
+        // `SECRETS_LOCKED` wins over `STALE`, the way `THROTTLED` and
+        // `AUTH_DEAD` above already do. Without this it became unreachable the
+        // moment an account succeeded once: every later failure rendered
+        // `Stale`, so a keychain locking while the app runs — a screen lock,
+        // which is the normal case, not an edge one — showed a dimmed old value
+        // forever and never offered §7.1's "unlock" affordance, the only remedy
+        // that state carries.
+        //
+        // The three kinds that remain shadowed stay that way on purpose. §7.1
+        // makes `NETWORK` explicitly equivalent to `STALE`; `UNKNOWN_SHAPE`
+        // means this fetch was unreadable, which is exactly when the last
+        // readable value is worth keeping; and `AUTH_EXPIRED` is transient and
+        // resolves itself on the next refresh. `AUTH_DEAD` is not in that list
+        // because it is not shadowed at all — it already wins above, through
+        // `quarantined`.
+        if e.last_failure == Some(FailureKind::SecretsLocked) {
+            return Some(AccountState::SecretsLocked);
+        }
 
         match (&e.last_windows, e.last_fetched_at) {
             (Some(w), Some(at)) => {
@@ -359,10 +534,82 @@ mod tests {
         (s, clock)
     }
 
+    /// §6.1's floor is §5.2's throttle position written as a number, so it has
+    /// to be unreachable rather than merely defaulted around. `PollPolicy`'s
+    /// fields are private and `with_interval_secs` is the only way in; this
+    /// pins that the only way in clamps.
     #[test]
     fn interval_below_the_floor_is_clamped() {
         let p = PollPolicy::with_interval_secs(30);
-        assert_eq!(p.interval.num_seconds(), PollPolicy::MIN_INTERVAL_SECS);
+        assert_eq!(p.interval().num_seconds(), PollPolicy::MIN_INTERVAL_SECS);
+        let p = PollPolicy::with_interval_secs(600);
+        assert_eq!(p.interval().num_seconds(), 600, "a legitimate value must pass through unchanged");
+    }
+
+    /// The one exhaustive mapping from `usage`'s error type to a failure kind.
+    /// Task 17 is its first caller; hand-derived copies of this table at every
+    /// call site are what it exists to prevent.
+    #[test]
+    fn usage_errors_map_to_one_failure_kind_each() {
+        fn kind(e: UsageError) -> Option<FailureKind> {
+            FailureKind::from_usage_error(&e)
+        }
+        assert_eq!(
+            kind(UsageError::Throttled { retry_after_secs: 42 }),
+            None,
+            "Throttled carries a wait and must route to record_throttle instead"
+        );
+        assert_eq!(kind(UsageError::Unauthorized), Some(FailureKind::AuthExpired));
+        assert_eq!(kind(UsageError::UnknownShape), Some(FailureKind::UnknownShape));
+        assert_eq!(kind(UsageError::Transport("boom".into())), Some(FailureKind::Network));
+        // Not because a 5xx is a network error, but because §7.1 defines
+        // NETWORK by its rendering and "last value with its age" is right here.
+        assert_eq!(kind(UsageError::Status(503)), Some(FailureKind::Network));
+    }
+
+    /// The same, for `auth::stored`. `Missing`/`Corrupt` reaching `AUTH_DEAD`
+    /// rather than `AUTH_EXPIRED` is the load-bearing row: §9.2 says re-login,
+    /// and `AUTH_EXPIRED` would render a spinner that never resolves.
+    #[test]
+    fn stored_token_errors_map_to_one_failure_kind_each() {
+        fn kind(e: StoredTokenError) -> FailureKind {
+            FailureKind::from_stored_token_error(&e)
+        }
+        fn oauth(code: &str) -> AuthError {
+            AuthError::OAuth { status: 400, code: Some(code.into()), description: None }
+        }
+        assert_eq!(kind(StoredTokenError::Missing), FailureKind::AuthDead);
+        assert_eq!(kind(StoredTokenError::Corrupt), FailureKind::AuthDead);
+
+        assert_eq!(
+            kind(StoredTokenError::Secrets(SecretError::Locked("x".into()))),
+            FailureKind::SecretsLocked
+        );
+        assert_eq!(
+            kind(StoredTokenError::Secrets(SecretError::NoBackend("x".into()))),
+            FailureKind::Network
+        );
+        assert_eq!(
+            kind(StoredTokenError::Secrets(SecretError::Backend("x".into()))),
+            FailureKind::Network
+        );
+        assert_eq!(
+            kind(StoredTokenError::Secrets(SecretError::TooLong { limit: 2560 })),
+            FailureKind::Network
+        );
+
+        assert!(oauth("invalid_grant").is_dead_grant(), "the guard below would be vacuous");
+        assert_eq!(kind(StoredTokenError::Auth(oauth("invalid_grant"))), FailureKind::AuthDead);
+        assert_eq!(
+            kind(StoredTokenError::Auth(AuthError::Transport("boom".into()))),
+            FailureKind::Network
+        );
+        assert_eq!(kind(StoredTokenError::Auth(oauth("invalid_scope"))), FailureKind::AuthExpired);
+        assert_eq!(kind(StoredTokenError::Auth(AuthError::StateMismatch)), FailureKind::AuthExpired);
+        assert_eq!(
+            kind(StoredTokenError::Auth(AuthError::Decode("x".into()))),
+            FailureKind::AuthExpired
+        );
     }
 
     #[test]
@@ -398,7 +645,7 @@ mod tests {
         s.add("b");
         s.add("c");
 
-        let stagger = PollPolicy::default().stagger;
+        let stagger = PollPolicy::default().stagger();
         assert!(stagger > TimeDelta::zero(), "a zero stagger would make this test catch nothing");
 
         let a = s.next_wake("a").unwrap();
@@ -484,6 +731,12 @@ mod tests {
         assert_eq!(s.due(), vec!["a"]);
     }
 
+    /// Neither the clock nor `due()` appears between the iterations below, and
+    /// that is deliberate. `record_failure` computes the next wake from the
+    /// clock at the instant it is called, so advancing time changes nothing
+    /// this asserts; and `due()` takes `&self` and mutates nothing, so calling
+    /// it here only implied a state transition that does not exist. Both were
+    /// present in an earlier version of this test.
     #[test]
     fn repeated_failures_back_off_exponentially_and_reset_on_success() {
         let (mut s, c) = sched();
@@ -491,17 +744,13 @@ mod tests {
         s.record_success("a", win(1.0));
         let mut waits = vec![];
         for _ in 0..3 {
-            c.advance_secs(10_000);
-            s.due();
             s.record_failure("a", FailureKind::Network);
             waits.push(s.next_wake("a").unwrap() - c.now());
         }
         assert!(waits[1] > waits[0] && waits[2] > waits[1], "intervals must grow: {waits:?}");
-        c.advance_secs(10_000);
-        s.due();
         s.record_success("a", win(1.0));
         let after = s.next_wake("a").unwrap() - c.now();
-        assert!(after <= PollPolicy::default().interval, "success resets the backoff");
+        assert!(after <= PollPolicy::default().interval(), "success resets the backoff");
     }
 
     /// Spec §6.3: no polling while not visible.
@@ -617,6 +866,94 @@ mod tests {
             "must be clamped to the cap"
         );
         assert!(s.due().is_empty(), "must not become due right after being capped");
+    }
+
+    /// Spec §7.4: after a restart the disk-cached snapshot is shown as `STALE`
+    /// rather than an empty screen — and §7.1 forbids rendering a stale value
+    /// without its age, so the age has to be the real one. Restoring through
+    /// `record_success` would stamp the restart time and claim a value fetched
+    /// an hour ago was fetched now.
+    #[test]
+    fn a_seeded_snapshot_renders_stale_with_the_age_it_really_has() {
+        let (mut s, c) = sched();
+        s.add("a");
+        let cached_at = c.now() - TimeDelta::seconds(3600);
+        s.seed("a", win(63.0), cached_at);
+
+        match s.state("a").unwrap() {
+            AccountState::Stale { windows, fetched_at } => {
+                assert_eq!(windows[0].percent, 63.0);
+                assert_eq!(fetched_at, cached_at, "the cached snapshot was stamped with the restart time");
+                assert_eq!(
+                    c.now() - fetched_at,
+                    TimeDelta::seconds(3600),
+                    "a stale value rendered with a fabricated age is worse than no value"
+                );
+            }
+            other => panic!("expected Stale, got {other:?}"),
+        }
+    }
+
+    /// Restoring a cache is not a poll. It must not pull the schedule forward,
+    /// or every restart would fire a request outside §6.1's floor.
+    #[test]
+    fn seeding_does_not_make_an_account_due_earlier_than_its_schedule() {
+        let (mut s, c) = sched();
+        s.add("a");
+        s.record_success("a", win(10.0));
+        let scheduled = s.next_wake("a").unwrap();
+
+        s.seed("a", win(63.0), c.now() - TimeDelta::seconds(3600));
+
+        assert_eq!(s.next_wake("a").unwrap(), scheduled, "seed moved the schedule");
+        assert!(s.due().is_empty(), "seed made the account due");
+    }
+
+    /// §6.1's floor must not depend on the driver remembering to record an
+    /// outcome. A poll that begins, fails in a way the caller handles itself,
+    /// and ends without any `record_*` call leaves `next_due_at` where it was —
+    /// so without a floor of its own `due()` hands the same account back on the
+    /// very next tick, hammering the usage endpoint at loop speed.
+    #[test]
+    fn a_poll_that_records_no_outcome_still_respects_the_floor() {
+        let (mut s, c) = sched();
+        s.add("a");
+        assert!(s.begin_poll("a"));
+        s.end_poll("a");
+
+        assert!(s.due().is_empty(), "immediately due again after a poll that recorded nothing");
+        c.advance_secs(PollPolicy::MIN_INTERVAL_SECS - 1);
+        assert!(s.due().is_empty(), "still inside the floor");
+        c.advance_secs(2);
+        assert_eq!(s.due(), vec!["a"], "due again once the floor has passed");
+    }
+
+    /// §7.1's `SECRETS_LOCKED` carries an "unlock" affordance, and that is the
+    /// only remedy the state has. Letting `Stale` shadow it made it unreachable
+    /// after the first success — so a keychain locking mid-session (a screen
+    /// lock: the normal case) showed a dimmed old value forever with nothing to
+    /// click.
+    #[test]
+    fn a_locked_store_wins_over_stale_even_after_a_success() {
+        let (mut s, c) = sched();
+        s.add("a");
+        s.record_success("a", win(42.0));
+        c.advance_secs(10);
+        s.record_failure("a", FailureKind::SecretsLocked);
+        assert_eq!(
+            s.state("a"),
+            Some(AccountState::SecretsLocked),
+            "a locked store must offer the unlock affordance, not a dimmed value"
+        );
+
+        // The shadowing §7.1 does ask for is unchanged: NETWORK is defined as
+        // "treated the same as STALE".
+        s.record_success("a", win(42.0));
+        s.record_failure("a", FailureKind::Network);
+        assert!(
+            matches!(s.state("a"), Some(AccountState::Stale { .. })),
+            "NETWORK must stay equivalent to STALE"
+        );
     }
 
     /// Spec §6.1's floor applies to the visibility path too. Repeatedly

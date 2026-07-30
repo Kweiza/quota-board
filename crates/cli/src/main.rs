@@ -2,8 +2,8 @@
 //!
 //! Usage:
 //!   quoata-cli login          — add one account via browser OAuth
-//!   quoata-cli show [uuid]    — print usage. With a uuid, only that account (spike 6)
-//!   quoata-cli refresh <uuid> — force-refresh that account's token (spike C)
+//!   quoata-cli show [uuid]    — print usage. With a uuid, only that account
+//!   quoata-cli refresh <uuid> — force-refresh that account's token
 
 use quoata_core::accounts::{Account, AccountStore};
 use quoata_core::auth::callback::Callback;
@@ -78,11 +78,12 @@ async fn cmd_login() -> Result<(), Box<dyn std::error::Error>> {
 
 /// With `only` given, queries just that one uuid.
 ///
-/// Telling spike 6 apart (is the 429 budget per-account or per-IP?) needs
-/// **asymmetric load**. Hitting every account equally makes both hypotheses
-/// produce **the same observation** — a per-account budget exhausts both at
-/// once just as a per-IP one does. Only saturating one and then probing the
-/// other distinguishes them.
+/// **That narrowing is why the flag exists**, not a convenience. Any question
+/// about how the 429 budget is *scoped* needs asymmetric load: hitting every
+/// account equally drains every account equally, so a per-account budget and a
+/// per-IP budget produce the same observation. Saturating one account while
+/// leaving the others untouched, then probing them, is the only shape that
+/// separates the two — see docs/research/usage-endpoint.md, Spike D.
 async fn cmd_show(only: Option<&str>) -> Result<(), Box<dyn std::error::Error>> {
     let store = open_store();
     let accounts = AccountStore::load(&config_dir().join("accounts.json"))?;
@@ -122,11 +123,12 @@ async fn cmd_show(only: Option<&str>) -> Result<(), Box<dyn std::error::Error>> 
 }
 
 /// **Deliberately does not use `ensure_fresh` here.** `ensure_fresh` returns
-/// immediately without a request when the token is already fresh, but this
-/// command's whole reason to exist is a **forced** refresh — spike 7 (does
-/// our refresh kill a running Claude Code session?) is observed through this
-/// command specifically. Only the key format is borrowed from Task 10b. This
-/// is a one-shot smoke command, not a concurrent path, so it needs no lock.
+/// immediately without a request when the token is already fresh, and this
+/// command exists to **force** a rotation: it is how refresh behaviour is
+/// observed on a real account at all — what the server rotates, what expiry it
+/// returns, and whether a chain elsewhere is disturbed. Only the key format is
+/// borrowed from `auth::stored`. This is a one-shot smoke command, not a
+/// concurrent path, so it needs no lock.
 async fn cmd_refresh(uuid: &str) -> Result<(), Box<dyn std::error::Error>> {
     let store = open_store();
     let raw = store.get(&token_key(uuid))?.ok_or("no token is stored for that uuid")?;
