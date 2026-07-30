@@ -11,7 +11,7 @@ use quoata_core::auth::pkce::AuthConfig;
 use quoata_core::auth::stored::{token_key, RefreshLocks};
 use quoata_core::auth::token::{ReqwestHttp, TokenSet};
 use quoata_core::scheduler::{register_accounts, PollPolicy, Scheduler, SystemClock};
-use quoata_core::secrets::{keychain::KeychainStore, SecretStore, SERVICE};
+use quoata_core::secrets::{keychain::KeychainStore, timeout::TimeoutStore, SecretStore, SERVICE};
 use quoata_core::snapshots::fingerprint;
 use state::{poll_loop, AppState, LockedStore};
 use std::sync::atomic::AtomicBool;
@@ -53,7 +53,21 @@ fn main() {
             // store, so the error carrying the real cause is produced only on
             // the first call and every later one yields a context-free
             // `NoDefaultStore` (secrets/keychain.rs:13-21).
-            let secrets: Arc<dyn SecretStore> = match KeychainStore::probe(SERVICE) {
+            //
+            // **Wrapped in `TimeoutStore`, and the wrapper is what makes both
+            // this line and the polling loop safe.** Every `SecretStore` method
+            // is synchronous, and the keychain backend can block without bound
+            // waiting on a SecurityAgent prompt that may never be answerable
+            // (measured on macOS 15.6 — see `secrets/timeout.rs`). Unwrapped,
+            // this call hangs `setup()` before `widget.show()` and the window
+            // never appears; the same call inside `ensure_fresh` hangs the task
+            // that drives the polling loop, and nothing is left running to
+            // reclaim it.
+            let opened = TimeoutStore::spawn(
+                std::time::Duration::from_secs(quoata_core::secrets::timeout::DEFAULT_TIMEOUT_SECS),
+                || KeychainStore::probe(SERVICE).map(|s| Box::new(s) as Box<dyn SecretStore>),
+            );
+            let secrets: Arc<dyn SecretStore> = match opened {
                 Ok(s) => {
                     eprintln!("token store: {}", s.describe());
                     Arc::new(s)

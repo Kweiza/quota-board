@@ -18,6 +18,14 @@ import { widgetProps } from './lib/props.svelte'
 const WIDGET_WIDTH = 280
 
 /**
+ * How often the widget re-reports its visibility (§6.3). The Rust side cannot
+ * recover from a lost "visible" report on its own, so this bounds that failure
+ * to one interval instead of forever. Well inside §6.1's 180-second polling
+ * floor, so recovering costs at most one skipped cycle.
+ */
+const VISIBILITY_HEARTBEAT_MS = 30_000
+
+/**
  * The window cannot measure the DOM, so the view measures itself and pushes
  * the height back. `StateFlags::SIZE` is deliberately off in
  * `src-tauri/src/main.rs`: a restored height would fight this on every launch.
@@ -93,8 +101,26 @@ if (isSettingsWindow()) {
     // the *settings* window's visibility into the widget's single gate — and
     // src-tauri/src/main.rs makes hiding the settings window its normal
     // condition, so closing settings would stop the widget polling.
-    const report = () => void setWidgetVisible(document.visibilityState === 'visible')
+    //
+    // **A heartbeat, not just edges, and this is load-bearing.** The Rust side
+    // ANDs this report with the window's own state, and nothing over there can
+    // clear a stale `false` — showing the window does not undo it. So a single
+    // dropped or rejected invoke would pin polling off permanently and
+    // silently, leaving the widget displaying its last values forever. Re-
+    // reporting on an interval bounds that to one interval. The failure is also
+    // logged rather than swallowed: `void` on a rejected promise is exactly how
+    // this would have gone unnoticed.
+    const report = () =>
+      setWidgetVisible(document.visibilityState === 'visible').catch((e: unknown) =>
+        console.error('quoata-board: set_widget_visible failed', e),
+      )
     document.addEventListener('visibilitychange', report)
+    // `pageshow` covers a restore from the back/forward cache, where
+    // `visibilitychange` may not fire.
+    window.addEventListener('pageshow', report)
+    // Well under the 180-second polling floor, so a recovered report costs at
+    // most one skipped cycle.
+    setInterval(report, VISIBILITY_HEARTBEAT_MS)
     // The initial state too, not only the transitions: the widget starts with
     // `visible: false` in tauri.conf.json and is shown from setup().
     report()
