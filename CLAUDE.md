@@ -105,3 +105,10 @@ Both the test suite and clippy must be clean before any commit.
   frequently cite the concrete failure the code prevents. Keep that.
 - **Do not widen scope.** If you spot a real problem outside your task, report it
   rather than fixing it inline.
+- **Never replace a shipped file with a snippet.** A plan or task description
+  that shows "the contents" of a file describes it as of the day that text was
+  written. If the file already exists, read the snippet as a diff and change
+  only the lines it actually intends to change. Three separate defects here came
+  from transcribing a whole-file snippet over a file later work had grown:
+  a workspace member silently dropped, a component that mounted nothing, and a
+  109-line entry point overwritten by seven lines.

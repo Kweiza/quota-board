@@ -11,3 +11,4 @@
 # Agent session scratch
 /.superpowers/
 /.claude/
+/.playwright-mcp/
