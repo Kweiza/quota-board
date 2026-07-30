@@ -115,7 +115,7 @@ webview pushes).
 | `accounts` | Account metadata CRUD. JSON file. **Contains no tokens** | filesystem |
 | `secrets` | Token store abstraction. Keychain first, encrypted file as fallback | `keyring`, filesystem |
 | `auth` | PKCE OAuth flow, token refresh and revocation | `secrets`, HTTP |
-| `usage` | One valid token → a list of usage windows. **The only module that knows the Anthropic API** | HTTP |
+| `usage` | One valid token → a list of usage windows. **The only module that knows the Anthropic API** | `auth` (for its HTTP client), HTTP |
 | `scheduler` | Polling, manual refresh, visibility gating, throttle management, snapshot retention, failure classification | the four above |
 | webview | Widget rendering, settings forms | Tauri IPC |
 
@@ -123,15 +123,22 @@ webview pushes).
 
 ```
 scheduler ──token request──▶ auth ──▶ secrets
-    │                         │
-    │◀────────token───────────┘
-    │
-    └──token──▶ usage ──window list──▶ scheduler ──event──▶ webview
+    │                         │ ▲
+    │◀────────token───────────┘ │
+    │                           │ HTTP client (§4.3)
+    └──token──▶ usage ──────────┘
+                 │
+                 └──window list──▶ scheduler ──event──▶ webview
 ```
 
-The flow is one-directional. The webview receives state and draws it; user
-actions (manual refresh, adding an account) are requests to the core via
-commands.
+The flow of *state* is one-directional. The webview receives state and draws
+it; user actions (manual refresh, adding an account) are requests to the core
+via commands.
+
+The one edge that is not part of that flow is `usage → auth`: `usage` borrows
+`auth`'s configured HTTP client rather than building a second one, so that the
+User-Agent and header policy of §5.2 has exactly one implementation. §4.3
+records why that edge exists in place of an HTTP trait.
 
 ### 4.3 Intent behind the module boundaries
 
@@ -140,8 +147,24 @@ part of this design — the response schema of an undocumented endpoint — is
 confined to this one module. When the schema changes (and per §12.4 it already
 changed once), only this module is touched.
 
-`secrets`' store access and `usage`' HTTP access each sit behind a trait, so
-tests can substitute in-memory or fixture implementations.
+`secrets`' store access sits behind a trait, so tests substitute an in-memory
+implementation.
+
+**`usage`'s HTTP access does not. Its seam is URL injection.** `fetch_usage_at`
+takes the endpoint URL, and tests point it at a wiremock server on loopback;
+the production entry point is the same function with §5.1's URL. `usage`
+therefore takes `auth`'s concrete HTTP client — the dependency edge in §4.1 and
+§4.2 — rather than a trait of its own.
+
+The reason is `Retry-After`. `auth`'s HTTP trait (`TokenHttp::get_json`) returns
+only a deserialized body and discards the response headers, so it cannot carry
+that header at all — and §6.2 makes `Retry-After` the input to the entire
+throttle policy. A second HTTP trait, shaped to carry headers and used by
+exactly one caller, would buy nothing that injecting the URL does not.
+
+**The property the trait was there for is unchanged**: every `usage` test runs
+against a loopback mock, and no test touches the network or consumes throttle
+budget (§14).
 
 ## 5. Usage retrieval (the `usage` module)
 
@@ -280,6 +303,16 @@ fields observed: `seven_day_cowork`, `seven_day_omelette`, `spend{}`,
 | `Retry-After: 0` | Budget exhausted | Back off roughly 180 seconds (per §6.2.1) |
 | `Retry-After: N > 0` | Burst-rule hard block | Wait exactly N seconds. Probing does not extend it |
 
+**Both branches are bounded above at one hour.** "Wait exactly N seconds" means
+exactly N up to that bound and no further. `Retry-After` is externally supplied
+input that reaches time arithmetic which *panics* on overflow, and past
+`i64::MAX` a cast wraps it negative — landing the "throttled until" instant in
+the **past**, so the client immediately re-hits a server that had just told it
+to back off, silently defeating the one mechanism this section exists to
+provide. An hour is far beyond any legitimate value; the largest ever observed
+is 300 (§6.2.1). The bound is a safety limit on hostile or malformed input, not
+a policy about how long to wait.
+
 **Repeated 429s do not escalate the wait, and that is deliberate.** An earlier
 draft of this line called for exponential backoff on repeated 429s. The
 measurement in §6.2.1 landed afterwards: the sustainable rate after saturation
@@ -365,6 +398,47 @@ affect another account's display.
 | `NETWORK` | Network error | treated the same as `STALE` |
 
 **A stale value is never rendered without its age.**
+
+**Which failure produces which state.** There is one mapping, in the core, and
+every caller uses it rather than deriving its own — hand-derived copies at each
+call site are how two paths come to disagree about what an error means. The
+rows that are decisions rather than mechanics:
+
+- A token missing from the store, or a stored blob that will not parse →
+  `AUTH_DEAD`. §9.2 says `NOT_FOUND` means the account needs a re-login;
+  routing either to `AUTH_EXPIRED` renders a spinner that never resolves where
+  the user needs a clickable re-login.
+- A locked store → `SECRETS_LOCKED` (§9.2), and **that state wins over
+  `STALE`.** Left to shadow, it becomes unreachable the moment an account
+  succeeds once: a keychain that locks while the app runs — a screen lock, the
+  ordinary case — would show a dimmed old value forever and never offer the
+  unlock affordance, which is the only remedy the state carries.
+- Any other store failure → `NETWORK`. `NO_BACKEND` is answered by falling back
+  to the encrypted file (§9.2) and is not meant to reach an account state at
+  all; a backend failure is usually transient; `TooLong` is permanent but has no
+  state of its own. All three render as the last value with its age.
+- `invalid_grant` → `AUTH_DEAD` on one strike (§10.5).
+- A transport failure while refreshing → `NETWORK`. A failed connection is not
+  an auth failure, and treating it as one eventually quarantines an account
+  over a flaky link.
+- Any other OAuth failure, and a usage query the server answers 401/403 →
+  `AUTH_EXPIRED`. A refresh is the remedy in both cases, and the next poll
+  performs one.
+- A non-2xx usage response → `NETWORK`. **A 5xx is not a network error**; the
+  mapping is by *rendering*. This table defines `NETWORK` as "treated the same
+  as `STALE`", and keeping the last value with its age is the right display for
+  a fetch that failed without implicating the credential. The honest
+  alternative is a ninth state whose display is identical to two existing ones.
+- A 429 is **not** one of these at all. It carries a wait, so it drives §6.2's
+  throttle path instead; folding it in here would discard the `Retry-After`.
+- A rotation that succeeded over HTTP but failed to persist changes **no**
+  state — the token is live for this cycle. It is warned about, carrying the
+  store error rather than a flag, because the cases differ: a locked store
+  recovers on unlock, a backend failure is usually transient, and `TooLong` is
+  permanent — that blob will never fit, so every restart will silently demand a
+  re-login until someone is told why (§9.3).
+
+No error type on any of these paths carries a credential.
 
 ### 7.2 How loud failures are
 
@@ -705,6 +779,32 @@ changed underneath us, adopt the new value rather than overwriting it).
 recover on its own. Only re-login helps. **Quarantine the account on one
 strike** and surface `AUTH_DEAD`. Do not retry.
 
+**What the lock and the compare-and-swap do not cover.** They are worth having
+and they are narrower than they look; both facts are recorded here so neither
+is rediscovered as a surprise.
+
+- **Across processes the compare-and-swap is largely inert.** Under §10.7's
+  single-use rotating chain, the loser's refresh has already failed with
+  `invalid_grant` before its re-read runs. The swap's real job is the
+  re-login-landing-mid-refresh case, which is in-process — which is why the
+  paragraph above scopes itself to a single process.
+- **In one process it is correct on both stores**, including the encrypted file
+  store, whose write updates the cached map that its read serves. **Across
+  processes on that store the re-read is blind**, because the read serves that
+  cached map rather than the disk. A store-level compare-and-swap *would* be
+  genuinely atomic there — its write already takes an exclusive lock and
+  re-reads from disk inside the critical section — but not on the keychain,
+  which exposes no such primitive and is the primary store (§9.2). One uniform
+  implementation above the store abstraction was chosen over two divergent ones.
+- **A crash between the token endpoint's 200 and the store write loses the
+  rotation permanently.** The store keeps the pre-rotation token, the server has
+  moved past it, and the next launch gets `invalid_grant` — so the visible
+  outcome is `AUTH_DEAD` and a forced re-login. Neither the lock nor the
+  compare-and-swap addresses this.
+- **Nothing structurally prevents a future caller from refreshing directly**
+  and bypassing the lock. The compare-and-swap narrows that window; it does not
+  close it.
+
 ### 10.6 Revocation
 
 On account deletion, POST
@@ -929,7 +1029,8 @@ conclusion is that the *429 budget* is not the shared thing.
 ## 13. Verification status
 
 What has been measured, and how, is recorded in
-**docs/research/usage-endpoint.md**. In summary:
+**docs/research/usage-endpoint.md** — one section per run, Spikes A through E.
+In summary:
 
 | Item | Status |
 |---|---|
@@ -941,17 +1042,33 @@ What has been measured, and how, is recorded in
 | Access-token lifetime: **8 hours** (28,799 s, twice) | **confirmed** |
 | Refresh rotates both tokens on every call | **confirmed** |
 | The refresh chain's expiry is absolute and is **not** extended by refreshing | **confirmed** |
-| A single account reports **different window sets** across accounts | **confirmed** |
-| Whether our refresh disturbs a Claude Code session (§10.7) | **confirmed** — chains are per grant; it does not |
+| Different accounts report **different window sets** | **confirmed** |
+| Whether our refresh disturbs a Claude Code session (§10.7) | **observational** — chains are per grant; it does not. Not an experiment; see below |
 | Whether `user:profile` alone passes server-side (§10.4) | **confirmed** — it does; `user:inference` dropped |
 | Whether 429 budgets are independent per account (§12.8) | **confirmed** — independent, for N=3 on one IP |
+
+**One row is graded differently, and the difference is the point.** Every other
+row above was measured on the wire, in a run written down with its method in the
+research document. The §10.7 row was not. It rests on long-standing everyday use
+of one class of grant observed against itself, which §10.7 itself records as
+"measured rather than proven" and the research document as "observational, not a
+controlled experiment". Bolding it as **confirmed** alongside the wire-measured
+rows erased a distinction that the prose keeps in both places, and this table is
+where a reader looks precisely when they do not want to read the prose.
+
+**What would upgrade it**: a run that drives one of this project's grants and a
+Claude Code grant on the same account directly against each other — refresh
+ours, then confirm the Claude Code session still refreshes rather than being
+sent to re-authenticate. That requires deliberately risking a working session on
+the user's primary tool, so it has not been done, and the evidence above is the
+strongest available short of it.
 
 ## 14. Test strategy
 
 | Target | Method |
 |---|---|
-| `usage` | Put HTTP behind a trait and verify parsing against stored response fixtures. **No real network calls.** Fixtures must include: both 5h and 7d present; `seven_day: null` with weekly_scoped; weekly entirely absent; many unknown fields; a completely alien shape (`UNKNOWN_SHAPE`) |
-| `scheduler` | Inject the clock to verify polling interval, jitter, stagger, freshness transitions, visibility gating, both meanings of `Retry-After`, and exponential backoff without real waiting |
+| `usage` | Inject the endpoint URL and point it at a wiremock server on loopback (§4.3); verify parsing against stored response fixtures. **No real network calls.** Fixtures must include: both 5h and 7d present; `seven_day: null` with weekly_scoped; weekly entirely absent; many unknown fields; a completely alien shape (`UNKNOWN_SHAPE`) |
+| `scheduler` | Inject the clock to verify polling interval, stagger, freshness transitions, visibility gating, both meanings of `Retry-After`, and exponential backoff without real waiting. **Not jitter** — §6.1 records that it is deliberately not implemented |
 | `auth` | A local mock OAuth server for the PKCE flow, state-mismatch rejection, the manual-paste path, scope-preserving refresh, the one `invalid_scope` retry, one-strike `invalid_grant` quarantine, and serialized concurrent refresh |
 | `secrets` | Contract tests against an in-memory implementation. Distinguish the three states `NO_BACKEND`/`LOCKED`/`NOT_FOUND`. **Must test that the canary self-check detects a mock store** |
 | `accounts` | CRUD round-trip in a temporary directory. uuid keying, cache invalidation by token fingerprint |
