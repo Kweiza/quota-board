@@ -438,7 +438,12 @@ rows that are decisions rather than mechanics:
   permanent — that blob will never fit, so every restart will silently demand a
   re-login until someone is told why (§9.3).
 
-No error type on any of these paths carries a credential.
+No error type on any of these paths carries a credential, and that is a rule
+rather than an observation: **any type holding a live credential hand-writes its
+`Debug` and prints `"<redacted>"` for the sensitive fields — it is never
+derived.** `TokenSet` is the shape to copy. A derived `Debug` reaches a log line,
+an `assert_eq!` failure, or a panic message, and this repository has shipped that
+defect twice.
 
 ### 7.2 How loud failures are
 

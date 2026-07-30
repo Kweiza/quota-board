@@ -33,8 +33,17 @@ These are not style preferences. Violating any of them is a defect.
   account metadata file. Tokens live in `secrets` only.
 - **The account primary key is `account.uuid`.** Never key by email or by user
   label — emails are display-only and user-editable.
-- **No test may consume real account limits or throttle budget.** All HTTP goes
-  behind a trait and is mocked in tests.
+- **No test may consume real account limits or throttle budget.** Every test
+  reaches a local mock, never the network. Two different seams achieve that, and
+  the difference is deliberate: `secrets`' store access and `auth`'s HTTP both
+  sit behind traits, while `usage` injects the endpoint URL instead — its path
+  needs `Retry-After`, which `auth`'s HTTP trait discards. See `docs/design.md`
+  §4.3 before adding a trait there.
+- **Never let a token reach an error message, `Debug` output, or a panic.** Any
+  type carrying a live credential hand-writes `Debug` and prints `"<redacted>"`
+  for the sensitive fields — never derives it. `TokenSet` in
+  `crates/core/src/auth/token.rs` is the pattern to copy. This exists because
+  the same defect shipped twice in this repository.
 - **Never demote a missing or unparseable value to 0%.** Degrade to "unknown".
   A confidently wrong number is the worst failure mode this product has.
 
