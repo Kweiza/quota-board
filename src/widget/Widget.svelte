@@ -1,6 +1,7 @@
 <script lang="ts">
   import { onDestroy } from 'svelte'
   import AccountRow from './AccountRow.svelte'
+  import { enableDrag } from '../lib/ipc'
   import type { AccountView } from '../lib/types'
 
   export let accounts: AccountView[] = []
@@ -20,8 +21,13 @@
   onDestroy(() => clearInterval(tick))
 </script>
 
-<div class="widget">
-  <div class="titlebar" data-drag>
+<!-- The whole card is the drag handle, not just the titlebar: at 19px tall and
+     inset 8px from the top edge, the titlebar is a poor handle for a window
+     that is meant to be nudged out of the way. `enableDrag`'s
+     `closest('button, a, input')` guard is what keeps the gear and the row
+     remedies clickable inside it. docs/design.md §8.3. -->
+<div class="widget" use:enableDrag>
+  <div class="titlebar">
     <button class="gear" title="Settings" on:click={onOpenSettings}>⚙</button>
   </div>
   {#each accounts as a (a.uuid)}
@@ -43,11 +49,15 @@
      window, and the reset column fell off the right edge. The background lives
      here and nowhere else — painting :root, html or body would defeat the
      window's transparency (see src/app.css). */
+  /* user-select: none belongs with the drag: without it, dragging from an
+     account name selects the text under the pointer instead. It also removes
+     the double-click-selects-a-word artefact the card would otherwise have. */
   .widget { box-sizing: border-box; width: 100%; padding: .5em .7em .7em;
             background: rgba(20, 20, 24, .88); color: #e5e7eb;
             border-radius: 10px; backdrop-filter: blur(8px);
-            font-family: system-ui, sans-serif; }
-  .titlebar { display: flex; justify-content: flex-end; height: 1.2em; cursor: grab; }
+            font-family: system-ui, sans-serif;
+            cursor: grab; user-select: none; }
+  .titlebar { display: flex; justify-content: flex-end; height: 1.2em; }
   .gear { background: none; border: none; color: #9ca3af; cursor: pointer;
           font-size: 12px; padding: 0; line-height: 1; }
   .gear:hover { color: #e5e7eb; }

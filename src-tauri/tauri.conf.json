@@ -29,6 +29,7 @@
         "visible": false,
         "focus": false,
         "center": false,
+        "acceptFirstMouse": true,
         "backgroundColor": "#00000000"
       },
       {
