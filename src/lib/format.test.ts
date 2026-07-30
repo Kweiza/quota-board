@@ -72,6 +72,9 @@ describe('formatReset', () => {
   it('pads the hours inside a days reading', () => {
     expect(formatReset(new Date('2026-08-01T16:00:00Z'), now)).toBe('3d 04h')
   })
+  it('switches to the days branch at exactly one day', () => {
+    expect(formatReset(new Date('2026-07-30T17:00:00Z'), now)).toBe('1d 05h')
+  })
   it('reports "now" at exactly zero', () => {
     expect(formatReset(new Date('2026-07-29T12:00:00Z'), now)).toBe('now')
   })
