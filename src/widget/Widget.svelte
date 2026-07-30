@@ -5,6 +5,13 @@
 
   export let accounts: AccountView[] = []
   export let onOpenSettings: () => void = () => {}
+  // §7.1 makes clicking these the only remedy AUTH_DEAD and SECRETS_LOCKED
+  // have, so the row's callbacks must reach the mount site rather than stop
+  // here. Keyed by uuid, never by email or label: the account primary key is
+  // `account.uuid`. Task 17 supplies the handlers (OAuth restart, unlock
+  // prompt); this task only guarantees the seam is unbroken.
+  export let onRelogin: (uuid: string) => void = () => {}
+  export let onUnlock: (uuid: string) => void = () => {}
 
   // Re-render relative times once a minute. This never refetches, and a minute is the
   // finest unit relativeAge and formatReset can show, so a faster tick paints nothing new.
@@ -18,7 +25,12 @@
     <button class="gear" title="Settings" on:click={onOpenSettings}>⚙</button>
   </div>
   {#each accounts as a (a.uuid)}
-    <AccountRow account={a} {now} />
+    <AccountRow
+      account={a}
+      {now}
+      onRelogin={() => onRelogin(a.uuid)}
+      onUnlock={() => onUnlock(a.uuid)}
+    />
   {/each}
   {#if accounts.length === 0}
     <div class="empty">Add an account in Settings</div>

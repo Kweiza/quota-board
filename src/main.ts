@@ -82,11 +82,26 @@ function followContentHeight(root: HTMLElement): void {
   }).observe(root)
 }
 
+/**
+ * A click on a remedy must not vanish silently while its owner task is
+ * outstanding. Task 16 owns `openSettings()`; Task 17 owns the OAuth restart
+ * and the unlock prompt, because both need credentials this layer has no
+ * access to.
+ */
+function pending(what: string): void {
+  console.warn(`quoata-board: ${what} is not wired up yet`)
+}
+
 const target = document.getElementById('app')!
 
 const app = mount(Widget, {
   target,
-  props: { accounts: fixture() },
+  props: {
+    accounts: fixture(),
+    onOpenSettings: () => pending('opening settings (Task 16)'),
+    onRelogin: (uuid: string) => pending(`re-login for account ${uuid} (Task 17)`),
+    onUnlock: (uuid: string) => pending(`unlocking the token store for account ${uuid} (Task 17)`),
+  },
 })
 
 followContentHeight(target)

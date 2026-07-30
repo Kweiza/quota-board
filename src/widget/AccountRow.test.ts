@@ -84,12 +84,53 @@ describe('AccountRow states', () => {
 
   it('keeps the bar colour at full strength on a stale row', () => {
     const fetched = new Date(NOW.getTime() - 12 * 60_000).toISOString()
-    render(AccountRow, {
+    const { unmount } = render(AccountRow, {
       account: view({ kind: 'stale', windows: [win('five_hour', '5h', 91)], fetched_at: fetched }),
       now: NOW,
     })
     expect(screen.getByRole('meter').className).toContain('red')
     expect(screen.getByRole('meter').className).not.toContain('dim')
+    // A class list cannot see a dim applied in CSS. `css: true` in
+    // vitest.config.ts makes the scoped stylesheet real, so compare what the
+    // cascade actually resolves to against the same bar on a fresh row.
+    const staleBar = getComputedStyle(screen.getByRole('meter'))
+    const stale = { opacity: staleBar.opacity, color: staleBar.color }
+    unmount()
+
+    render(AccountRow, { account: ok([win('five_hour', '5h', 91)]), now: NOW })
+    const freshBar = getComputedStyle(screen.getByRole('meter'))
+    expect(stale).toEqual({ opacity: freshBar.opacity, color: freshBar.color })
+    expect(stale.opacity).toBe('1')
+  })
+
+  it('dims every text element of a stale row', () => {
+    const fetched = new Date(NOW.getTime() - 12 * 60_000).toISOString()
+    const opacities = (root: HTMLElement) =>
+      Object.fromEntries(
+        (['.name', '.label', '.pct', '.reset'] as const).map((sel) => [
+          sel,
+          Number(getComputedStyle(root.querySelector(sel) as HTMLElement).opacity),
+        ]),
+      )
+
+    const staleRow = render(AccountRow, {
+      account: view({ kind: 'stale', windows: [win('five_hour', '5h', 38)], fetched_at: fetched }),
+      now: NOW,
+    })
+    const stale = opacities(staleRow.container)
+    staleRow.unmount()
+
+    const freshRow = render(AccountRow, { account: ok([win('five_hour', '5h', 38)]), now: NOW })
+    const fresh = opacities(freshRow.container)
+
+    for (const sel of ['.name', '.label', '.pct', '.reset']) {
+      // An earlier rule set .7 on elements whose own base was .75 and .7, which
+      // dimmed nothing; §7.1 requires a stale value to read as stale.
+      expect(stale[sel], `${sel} must dim when the row goes stale`).toBeLessThan(fresh[sel])
+      // ...but not past legibility: over the worst-case composited background
+      // rgb(48,48,52), .4 is where #e5e7eb falls to the 3:1 floor.
+      expect(stale[sel], `${sel} must stay legible`).toBeGreaterThanOrEqual(0.4)
+    }
   })
 
   it('offers re-login on auth_dead and calls back when clicked', async () => {
