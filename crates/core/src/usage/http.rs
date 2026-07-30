@@ -132,10 +132,17 @@ mod tests {
         // above. Same shape as
         // `get_json_sends_the_oauth_beta_header_and_no_claude_identifying_header`
         // in `auth/token.rs`, and it catches headers this test does not name.
+        //
+        // Names are swept as well as values. Checking values alone let
+        // `x-claude-code-version: 1.0.0` through — the value carries no
+        // "claude" at all, and the header identifies Claude Code just as
+        // plainly as a user agent would.
         let req = captured.lock().unwrap().take().expect("the request never reached the mock");
         for (name, value) in req.headers.iter() {
+            let n = name.as_str().to_lowercase();
             let v = value.to_str().unwrap_or_default().to_lowercase();
-            assert!(!v.contains("claude"), "header `{name}` leaked a Claude-identifying value: {v}");
+            assert!(!n.contains("claude"), "header name `{n}` identifies Claude Code");
+            assert!(!v.contains("claude"), "header `{n}` leaked a Claude-identifying value: {v}");
         }
     }
 
@@ -188,11 +195,18 @@ mod tests {
         assert!(matches!(err, UsageError::UnknownShape));
     }
 
-    /// The other half of "never demote to 0%": `five_hour` is present but its
+    /// The other half of "never demote to 0%". `five_hour` is present but its
     /// `utilization` is not a number, so `parse_usage` reports
-    /// `ParseError::UnreadableSource` rather than `UnknownShape` — and that
-    /// must map to `UnknownShape` here too, not fall through to a fabricated
-    /// empty success.
+    /// `ParseError::UnreadableSource`.
+    ///
+    /// **This does not distinguish `UnreadableSource` from `UnknownShape`**,
+    /// and cannot: both `ParseError` arms deliberately map to the same
+    /// `UsageError::UnknownShape`, so the assertion is identical to its
+    /// sibling's above. What it pins is the thing that matters at this layer —
+    /// that a window present but unreadable becomes an error rather than
+    /// falling through to a fabricated empty success, i.e. an implicit 0%. The
+    /// distinction between the two parse failures is pinned where it is real,
+    /// in `usage::parse`'s `unreadable_sources_yield_an_error_not_an_empty_success`.
     #[tokio::test]
     async fn an_unreadable_source_is_unknown_shape_not_zero() {
         let server = MockServer::start().await;
