@@ -248,6 +248,12 @@ This figure matches almost exactly the "28–30 per hour" estimate carried in th
 - **The initial 26 consecutive successes are not the steady-state sustainable rate**; they appear to be the draining of an initial allowance already accumulated in the bucket or quota. Steady state is only observed from seq 33 onward. The design should anticipate the user-visible behavior that "polling works rapidly right after launch, then suddenly starts mixing in 429s about half the time."
 - **The fact that `Retry-After` is always 0 explicitly rules out a design that follows the server's stated value.** The client must rely on its own fixed backoff with no server hint.
 
+> **Correction (2026-07-30). Refuted by Spike D — see below.** That bullet, and the "Observed Retry-After values" section above it, both generalize from 34 observations in one run to a property of the endpoint. Spike D drove a single account at 10-second intervals and got **`Retry-After: 300`** on the first 429, then **`299`** on a probe one second later. `N > 0` does occur, it is a real countdown, and probing does not extend it.
+>
+> The client therefore **does** follow the server's stated value when one is given, and applies its own fixed backoff only for `Retry-After: 0`. Had this bullet been implemented as written, a 300-second block would have been met with a ~180-second backoff and the client would have returned while it was still in force. Why the two runs differ is undetermined; a burst rule distinct from the sustained-rate budget is the obvious candidate, and nothing here establishes it.
+>
+> What survives from this run is unaffected: the sustainable-rate measurement, the 180-second floor derived from it, and the refutation of a 60-second interval. Only the claim about the header is withdrawn.
+
 ### Scope limits
 
 - **One account, one process only.** This measurement used a single account in a single process. Whether this throttle is independent per account, or a shared budget per IP/process/application, when several accounts are polled concurrently from one process is **entirely unknown from this measurement.** It remains an open question for a separate task.
@@ -454,3 +460,73 @@ nothing here establishes it.
   scopes** — one `user:profile` + `user:inference`, one `user:profile` alone.
   Both returned 200, which is weak evidence that the budget does not depend on
   the token's scope set. It was not designed as a test of that.
+
+---
+
+# Spike E — does `user:profile` alone pass server-side?
+
+Run date: 2026-07-30
+User-Agent: `quoata-board/0.1.0`
+Account: one, referred to below as A. Identifiers are not reproduced.
+
+## The question
+
+Claude Code requests both `user:profile` and `user:inference`, and gates its own
+`/api/oauth/usage` call on holding both. It was not known whether that gate is
+client-side or whether the server also requires `user:inference` on the token
+presented to the usage endpoint.
+
+The answer decides §10.4. A widget that must hold `user:inference` holds a token
+capable of running inference, which sits badly beside a project whose entire
+terms-of-service position (§5.2, §16.1) is that it is a reader and not an
+inference client.
+
+## Method
+
+The full lifecycle was run against a real account with the scope list narrowed
+to `user:profile` alone — no separate instrument, just this project's own OAuth
+and CLI:
+
+1. `quoata-cli login`, with the authorize URL carrying `scope=user%3Aprofile`.
+2. Read back the scopes in the token response.
+3. `quoata-cli show` — one `GET /api/oauth/usage`.
+4. `quoata-cli refresh` — a refresh sending the stored (narrow) scopes verbatim.
+5. Read back the scopes in the refresh response.
+6. `quoata-cli show` again, on the post-refresh access token.
+
+Step 4 matters on its own. §10.5 requires sending stored scopes back verbatim
+because a hardcoded list silently narrows them on every refresh; the mirror-image
+risk is a server that silently *widens* a narrowed scope set back to its default.
+
+## Result
+
+| Step | Observation |
+|---|---|
+| Consent screen | Accepted the narrowed scope. No warning, no forced widening |
+| Token response | `scope` came back as `user:profile` only |
+| Usage query | **200**, with a complete response body — same shape as Spike A's |
+| Refresh | Succeeded |
+| Refresh response | `scope` still `user:profile`; `user:inference` was not re-added |
+| Usage query after refresh | **200** |
+
+**Claude Code's requirement of both scopes is a client-side gate.** The server
+serves `/api/oauth/usage` to a `user:profile`-only token, before and after a
+refresh, and it does not restore the dropped scope on its own.
+
+Consequence: §10.4 requests `user:profile` alone, and `user:inference` is
+dropped.
+
+## Scope limits
+
+- **One account, one run.** Nothing here bounds whether the server's behaviour
+  differs by plan or changes over time. It is an undocumented endpoint (§12.4).
+- **That the resulting token is actually incapable of inference was NOT
+  verified, and will not be.** Confirming it means sending
+  `POST /v1/messages`, which this project forbids outright — it would consume
+  the very limit the product reports and turn the reader into an inference
+  client. What is recorded here is strictly narrower and is stated that way in
+  §10.4: we requested a narrower scope, and the server issued it and honoured
+  it on the endpoint we use. Whether it would also refuse inference is
+  untested.
+- **Only the usage endpoint was exercised.** No other API path was tried with
+  the narrowed token.
