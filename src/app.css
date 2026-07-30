@@ -1,0 +1,6 @@
+/*
+ * Deliberately empty. Task 15 owns the widget's styling.
+ *
+ * Do not reintroduce an opaque background on :root or body: the widget window
+ * is transparent, and a painted canvas would silently defeat that.
+ */
