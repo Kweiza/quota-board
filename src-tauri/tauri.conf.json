@@ -1,0 +1,58 @@
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "productName": "quoata-board",
+  "version": "0.1.0",
+  "identifier": "com.quoata.board",
+  "build": {
+    "frontendDist": "../dist",
+    "devUrl": "http://localhost:5173",
+    "beforeDevCommand": "npm run dev",
+    "beforeBuildCommand": "npm run build"
+  },
+  "app": {
+    "withGlobalTauri": false,
+    "macOSPrivateApi": true,
+    "security": { "csp": null },
+    "windows": [
+      {
+        "label": "widget",
+        "title": "quoata-board",
+        "url": "index.html",
+        "width": 280,
+        "height": 200,
+        "resizable": false,
+        "decorations": false,
+        "transparent": true,
+        "shadow": false,
+        "alwaysOnTop": true,
+        "skipTaskbar": true,
+        "visible": false,
+        "focus": false,
+        "center": false,
+        "backgroundColor": "#00000000"
+      },
+      {
+        "label": "settings",
+        "title": "quoata-board Settings",
+        "url": "index.html?window=settings",
+        "width": 720,
+        "height": 560,
+        "minWidth": 520,
+        "minHeight": 400,
+        "resizable": true,
+        "decorations": true,
+        "visible": false,
+        "center": true
+      }
+    ]
+  },
+  "bundle": {
+    "active": true,
+    "targets": ["deb", "rpm", "appimage", "msi", "dmg"],
+    "icon": ["icons/icon.png"],
+    "licenseFile": "../LICENSE",
+    "linux": {
+      "deb": { "depends": ["libwebkit2gtk-4.1-0", "libayatana-appindicator3-1"] }
+    }
+  }
+}
