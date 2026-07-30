@@ -3,9 +3,17 @@
 A desktop widget showing the 5-hour and 7-day usage limits of several Claude
 accounts at once.
 
-> **Status: work in progress.** The headless core (account metadata, token
-> storage, usage-response parsing) is implemented and tested. The OAuth flow,
-> scheduler, and Tauri UI are not finished yet. There is no release to install.
+> **Status: work in progress. There is no release to install.**
+>
+> The headless core is implemented and tested: account metadata, token storage
+> (OS keychain with an encrypted-file fallback), the OAuth flow with per-account
+> refresh serialization, usage-response parsing, the live usage fetch, and the
+> polling-policy state machine. A headless CLI exercises all of it end to end
+> against real accounts.
+>
+> **The Tauri desktop UI is not written yet** — that is the remaining work.
+> `crates/core` is deliberately Tauri-unaware, so everything above builds and
+> tests with no GTK or WebKit present.
 
 ## Why it exists
 
