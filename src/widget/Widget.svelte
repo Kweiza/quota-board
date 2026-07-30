@@ -9,7 +9,7 @@
   // §7.1 makes clicking these the only remedy AUTH_DEAD and SECRETS_LOCKED
   // have, so the row's callbacks must reach the mount site rather than stop
   // here. Keyed by uuid, never by email or label: the account primary key is
-  // `account.uuid`. Task 17 supplies the handlers (OAuth restart, unlock
+  // `account.uuid`. Task 18 supplies the handlers (OAuth restart, unlock
   // prompt); this task only guarantees the seam is unbroken.
   export let onRelogin: (uuid: string) => void = () => {}
   export let onUnlock: (uuid: string) => void = () => {}

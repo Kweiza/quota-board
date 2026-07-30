@@ -14,7 +14,7 @@ const win = (id: string, label: string, pct: number) => ({
 })
 
 function view(state: AccountView['state']): AccountView {
-  return { uuid: 'u1', label: 'work@example.com', state }
+  return { uuid: 'u1', label: 'work@example.com', email: 'work@example.com', state }
 }
 
 const ok = (windows: ReturnType<typeof win>[], fetchedAt = NOW.toISOString()) =>

@@ -1,5 +1,8 @@
+import { invoke } from '@tauri-apps/api/core'
+import { listen, type UnlistenFn } from '@tauri-apps/api/event'
 import { getCurrentWindow } from '@tauri-apps/api/window'
 import { WebviewWindow } from '@tauri-apps/api/webviewWindow'
+import type { AccountView } from './types'
 
 /**
  * Manual dragging. `data-tauri-drag-region` is deliberately not used:
@@ -50,3 +53,16 @@ export async function openSettings(): Promise<void> {
 export function isSettingsWindow(): boolean {
   return new URLSearchParams(location.search).get('window') === 'settings'
 }
+
+/** True inside a Tauri webview. `npm run dev` in a plain browser is not. */
+export function inTauri(): boolean {
+  return '__TAURI_INTERNALS__' in window
+}
+
+export const listAccounts = (): Promise<AccountView[]> => invoke('list_accounts')
+
+export const setWidgetVisible = (visible: boolean): Promise<void> =>
+  invoke('set_widget_visible', { visible })
+
+export const onUsageUpdated = (fn: () => void): Promise<UnlistenFn> =>
+  listen('usage://updated', fn)

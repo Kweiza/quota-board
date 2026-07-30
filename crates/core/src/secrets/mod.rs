@@ -4,6 +4,14 @@ pub mod keychain;
 use std::collections::HashMap;
 use std::sync::Mutex;
 
+/// The keychain service name. docs/design.md §9.3 keys entries "uniquely by
+/// `account.uuid` under our own service name" — this is that name, and both
+/// binaries must pass the same string or the GUI sees none of the CLI's tokens.
+/// A mismatch is silent: `ensure_fresh` returns `StoredTokenError::Missing`,
+/// which classifies to `AuthDead` (scheduler.rs:95) and quarantines every
+/// account on the first tick.
+pub const SERVICE: &str = "quoata-board";
+
 #[derive(Debug, thiserror::Error)]
 pub enum SecretError {
     /// No usable OS store is available. The signal to switch to the encrypted-file fallback.
