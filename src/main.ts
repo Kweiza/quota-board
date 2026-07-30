@@ -4,6 +4,7 @@ import { getCurrentWindow, LogicalSize } from '@tauri-apps/api/window'
 // own window; dropping it silently widens the document past 280px.
 import './app.css'
 import Widget from './widget/Widget.svelte'
+import { isSettingsWindow, openSettings } from './lib/ipc'
 import type { AccountView } from './lib/types'
 
 /** docs/design.md §8.1: "Fixed width of about 280px; height follows content." */
@@ -72,8 +73,9 @@ function followContentHeight(root: HTMLElement): void {
   // Absent when the page is opened in a plain browser, e.g. `npm run dev`.
   if (!('__TAURI_INTERNALS__' in window)) return
   const appWindow = getCurrentWindow()
-  // The settings window shares this entry point until Task 16 routes it, and
-  // it must not be resized to widget dimensions.
+  // Both windows load the same document, so this stays even now that the
+  // settings route no longer reaches here: only the widget window may be
+  // resized to widget dimensions.
   if (appWindow.label !== 'widget') return
 
   new ResizeObserver(() => {
@@ -84,9 +86,8 @@ function followContentHeight(root: HTMLElement): void {
 
 /**
  * A click on a remedy must not vanish silently while its owner task is
- * outstanding. Task 16 owns `openSettings()`; Task 17 owns the OAuth restart
- * and the unlock prompt, because both need credentials this layer has no
- * access to.
+ * outstanding. Task 17 owns the OAuth restart and the unlock prompt, because
+ * both need credentials this layer has no access to.
  */
 function pending(what: string): void {
   console.warn(`quoata-board: ${what} is not wired up yet`)
@@ -94,16 +95,25 @@ function pending(what: string): void {
 
 const target = document.getElementById('app')!
 
-const app = mount(Widget, {
-  target,
-  props: {
-    accounts: fixture(),
-    onOpenSettings: () => pending('opening settings (Task 16)'),
-    onRelogin: (uuid: string) => pending(`re-login for account ${uuid} (Task 17)`),
-    onUnlock: (uuid: string) => pending(`unlocking the token store for account ${uuid} (Task 17)`),
-  },
-})
+// Both windows load index.html; the query string in tauri.conf.json is what
+// tells them apart. An if/else rather than a ternary because only one branch
+// takes props (docs/design.md §8.4).
+if (isSettingsWindow()) {
+  // Task 18 mounts the real settings view here. Until then the window is
+  // routed and visibly identifiable, so the gear can be verified end to end.
+  target.textContent = 'Settings (Task 18)'
+} else {
+  mount(Widget, {
+    target,
+    props: {
+      accounts: fixture(),
+      // The gear is the only route into the settings window (§8.4), so this
+      // wiring is what makes that window reachable at all.
+      onOpenSettings: () => void openSettings(),
+      onRelogin: (uuid: string) => pending(`re-login for account ${uuid} (Task 17)`),
+      onUnlock: (uuid: string) => pending(`unlocking the token store for account ${uuid} (Task 17)`),
+    },
+  })
 
-followContentHeight(target)
-
-export default app
+  followContentHeight(target)
+}
