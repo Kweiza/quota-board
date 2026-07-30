@@ -1,5 +1,6 @@
 pub mod encrypted_file;
 pub mod keychain;
+pub mod timeout;
 
 use std::collections::HashMap;
 use std::sync::Mutex;
