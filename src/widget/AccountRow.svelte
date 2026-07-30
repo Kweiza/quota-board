@@ -66,14 +66,31 @@
 
 <style>
   .account { padding: .35em 0; }
-  /* Stale dims the text only. The bar keeps full-strength colour: a stale 95% must
-     still read as red. §7.3 asks for dimming and names no number; at opacity .45 the
-     red measured 2.04:1, which is not legible on a transparent always-on-top widget. */
+  /* Stale dims every piece of text in the row — name, age, note, and the bar
+     row's label, percent and reset time. The bar glyphs keep full-strength
+     colour: a stale 95% must still read as red (§8.1 annotates the stale row
+     "entire row dimmed"; §7.3 asks for dimming and names no number).
+
+     These opacities are lower than each element's own base value on purpose.
+     An earlier version set .7 here, which was a no-op for `.reset` (already .7)
+     and a 5% change for `.label` (.75), because a `.account.stale :global(.x)`
+     selector is more specific than the element's own rule and therefore
+     *replaces* its opacity instead of multiplying with it. A stale 38% then
+     shipped pixel-for-pixel as bright as a live one.
+
+     The values are the dimmest that still clear WCAG against the worst-case
+     composited background. The widget is rgba(20,20,24,.88), so over a white
+     desktop — the brightest backdrop, and therefore the lowest contrast for
+     light text — it composites to rgb(48,48,52). Against that, #e5e7eb at
+     .58 measures 4.67:1 (AA for the account name), at .5 measures 3.90:1 and
+     at .45 measures 3.42:1 (both above the 3:1 floor for the secondary text).
+     Any darker backdrop only raises these. */
   .account.stale .name,
-  .account.stale .age,
-  .account.stale .note,
+  .account.stale .age { opacity: .58; }
+  .account.stale .note { opacity: .5; }
   .account.stale :global(.label),
-  .account.stale :global(.reset) { opacity: .7; }
+  .account.stale :global(.pct),
+  .account.stale :global(.reset) { opacity: .45; }
   .head { display: flex; justify-content: space-between; align-items: baseline; gap: .5em; }
   .name { font-size: 11px; font-weight: 600; white-space: nowrap;
           overflow: hidden; text-overflow: ellipsis; }
