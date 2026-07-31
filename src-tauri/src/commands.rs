@@ -134,6 +134,34 @@ impl Drop for LoginGuard {
     }
 }
 
+/// §10.3's overall wait for the loopback callback.
+const LOGIN_TIMEOUT_SECS: u64 = 300;
+
+/// The wait, with a **`debug_assertions`-only** override so Step 8's manual
+/// verification does not cost five minutes per attempt.
+///
+/// Release builds ignore the environment entirely, the same rule `usage_url()`
+/// and `token_url()` state in `main.rs`: a shipped binary whose login window
+/// anything on the machine could collapse would push users onto the paste path
+/// at will.
+///
+/// A zero or unparseable value falls back rather than being honoured — a
+/// zero-second timeout would fail every login instantly, which is a worse
+/// outcome than ignoring a typo in a debugging variable.
+#[cfg(debug_assertions)]
+fn login_timeout_secs() -> u64 {
+    std::env::var("QUOTA_LOGIN_TIMEOUT_SECS")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .filter(|s| *s > 0)
+        .unwrap_or(LOGIN_TIMEOUT_SECS)
+}
+
+#[cfg(not(debug_assertions))]
+fn login_timeout_secs() -> u64 {
+    LOGIN_TIMEOUT_SECS
+}
+
 /// The two authorize URLs one login has (§10.3: "Always construct both URLs").
 ///
 /// Mirrors `LoginUrls` in `src/lib/types.ts`. Change both together.
@@ -228,7 +256,7 @@ pub async fn begin_login(app: tauri::AppHandle) -> Result<LoginUrls, String> {
         // nothing inside it bounds the overall wait, so an abandoned login
         // would hold its port for the life of the process.
         let waited = tokio::time::timeout(
-            Duration::from_secs(300),
+            Duration::from_secs(login_timeout_secs()),
             // The second argument is the listener's own state guard, not a
             // duplicate of `exchange_code`'s check: the listener is
             // single-shot, so without it "a single stray or forged request
