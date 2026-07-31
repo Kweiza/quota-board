@@ -365,7 +365,7 @@ describe('Settings manual refresh', () => {
       accounts: two,
       refreshStates: [
         { kind: 'throttled', until: first.iso },
-        { kind: 'ok', windows: [], fetched_at: '2026-07-31T09:05:00Z' },
+        { kind: 'ok', windows: [], credit: null, fetched_at: '2026-07-31T09:05:00Z' },
       ],
     })
     render(Settings)

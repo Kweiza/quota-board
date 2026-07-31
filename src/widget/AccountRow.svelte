@@ -1,5 +1,6 @@
 <script lang="ts">
   import Bar from './Bar.svelte'
+  import CreditLine from './CreditLine.svelte'
   import { relativeAge, untilHhMm } from '../lib/format'
   import type { AccountView } from '../lib/types'
 
@@ -14,6 +15,16 @@
   $: hasWeekly = windows.some(
     (w) => w.window_id.startsWith('weekly') || w.window_id === 'seven_day',
   )
+  /**
+   * Absent for every account without a monthly spending limit, which is the
+   * common case — and there is deliberately no "credits off" placeholder for
+   * them. It is also absent for the first poll after a restart, because the
+   * snapshot cache does not persist a figure it cannot date (see
+   * `Entry::last_credit`). Both are silence, never a zero: the endpoint sends
+   * `used: $0.00` and `percent: 0` for an account that never had credits, and
+   * rendering that is exactly the demote-to-0% CLAUDE.md forbids.
+   */
+  $: credit = state.kind === 'ok' || state.kind === 'stale' ? state.credit : null
   $: isStale = state.kind === 'stale'
 </script>
 
@@ -33,6 +44,9 @@
     {/each}
     {#if !hasWeekly}
       <div class="note small">weekly not reported</div>
+    {/if}
+    {#if credit}
+      <CreditLine {credit} />
     {/if}
   {:else if state.kind === 'loading'}
     <div class="note">…</div>
@@ -82,6 +96,11 @@
   .account.stale .note { opacity: .5; }
   .account.stale :global(.label),
   .account.stale :global(.pct),
+  /* `.amounts` belongs in this list for the same reason `.reset` does: it is
+     CreditLine's third column and shares `.reset`'s .7 base opacity, so leaving
+     it out would light the money up at full strength inside an otherwise dimmed
+     row. */
+  .account.stale :global(.amounts),
   .account.stale :global(.reset) { opacity: .45; }
   .head { display: flex; justify-content: space-between; align-items: baseline; gap: .5em; }
   .name { font-size: 11px; font-weight: 600; white-space: nowrap;

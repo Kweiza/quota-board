@@ -7,9 +7,15 @@ import type { Severity } from './types'
  * `crates/core/src/model.rs` carries the identical table and has its own test;
  * no single test can catch the two drifting apart, so change them together.
  *
- * `percent` is always a finite 0-100 value: the Rust parser never fabricates a
- * window, so a missing or unparseable value arrives as an absent window rather
- * than as a number. See `crates/core/src/usage/parse.rs`.
+ * `percent` is always finite: the Rust parser never fabricates a window, so a
+ * missing or unparseable value arrives as an absent window rather than as a
+ * number. See `crates/core/src/usage/parse.rs`.
+ *
+ * **It is not always 0-100.** A window's percentage is, but `CreditSpend.percent`
+ * is `used / limit` and `parse_credit` deliberately does not clamp it — spending
+ * past the monthly limit is the thing the credit line exists to show, and the
+ * measured body had $22.31 against a $20.00 limit. Everything downstream must
+ * cope: this function saturates at `red`, and `barWidth` clamps when it draws.
  */
 export function severityOf(percent: number): Severity {
   if (percent >= 90) return 'red'
@@ -69,6 +75,34 @@ export function untilHhMm(iso: string): string {
   const hh = String(d.getHours()).padStart(2, '0')
   const mm = String(d.getMinutes()).padStart(2, '0')
   return `${hh}:${mm}`
+}
+
+/**
+ * One `CreditSpend` amount as text, e.g. `$22.31`.
+ *
+ * The exponent comes from the response and is honoured rather than assumed to
+ * be 2 — `crates/core/src/usage/raw.rs` leaves `exponent` unmasked in the debug
+ * window precisely because a silent change from cents to mills is the drift
+ * §12.4 asks us to notice, and hardcoding 2 here is how that drift would become
+ * a wrong number on screen instead.
+ *
+ * `Intl` throws a `RangeError` on a currency code it does not know. The fallback
+ * keeps the amount readable rather than blanking the line: the digits are the
+ * part the user needs, and dropping them to protect a currency symbol would be
+ * the worse trade.
+ */
+export function formatMoney(minor: number, currency: string, exponent: number): string {
+  const amount = minor / 10 ** exponent
+  try {
+    return new Intl.NumberFormat('en-US', {
+      style: 'currency',
+      currency,
+      minimumFractionDigits: exponent,
+      maximumFractionDigits: exponent,
+    }).format(amount)
+  } catch {
+    return `${amount.toFixed(exponent)} ${currency}`
+  }
 }
 
 /**

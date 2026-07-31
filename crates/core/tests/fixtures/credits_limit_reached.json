@@ -1,0 +1,57 @@
+{
+  "five_hour": {
+    "limit_dollars": null,
+    "remaining_dollars": null,
+    "resets_at": null,
+    "used_dollars": null,
+    "utilization": 0.0
+  },
+  "seven_day": {
+    "limit_dollars": null,
+    "remaining_dollars": null,
+    "resets_at": "2026-08-01T18:59:59.544250+00:00",
+    "used_dollars": null,
+    "utilization": 97.0
+  },
+  "limits": [
+    {
+      "group": "weekly",
+      "is_active": false,
+      "kind": "weekly_all",
+      "percent": 97,
+      "resets_at": "2026-08-01T18:59:59.544250+00:00",
+      "scope": null,
+      "severity": "critical"
+    }
+  ],
+  "spend": {
+    "auto_reload": null,
+    "balance": null,
+    "can_purchase_credits": false,
+    "can_toggle": false,
+    "cap": {
+      "credits": { "amount_minor": 2000, "exponent": 2 },
+      "money": null
+    },
+    "disabled_reason": "org_level_disabled_until",
+    "enabled": false,
+    "limit": { "amount_minor": 2000, "currency": "USD", "exponent": 2 },
+    "percent": 100,
+    "severity": "critical",
+    "used": { "amount_minor": 2231, "currency": "USD", "exponent": 2 }
+  },
+  "extra_usage": {
+    "credits_ever_enabled": true,
+    "currency": "USD",
+    "daily": null,
+    "decimal_places": 2,
+    "disabled_reason": "org_level_disabled_until",
+    "is_enabled": false,
+    "monthly_limit": 2000,
+    "spend_limit_reached": true,
+    "used_credits": 2231.0,
+    "user_disabled": false,
+    "utilization": 100.0,
+    "weekly": null
+  }
+}

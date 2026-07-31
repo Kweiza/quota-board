@@ -16,6 +16,30 @@ pub struct UsageWindow {
     pub scope: Option<String>,
 }
 
+/// The monthly credit spend, for an account that has a spending limit.
+///
+/// **Money stays in minor units.** The endpoint sends `{amount_minor, currency,
+/// exponent}` and never a decimal, so widening to `f64` here would round a value
+/// the UI then prints as an exact amount.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct CreditSpend {
+    /// Spent this month, in minor units (cents at `exponent` 2).
+    pub used_minor: i64,
+    /// The monthly spend limit, same units. Always > 0 — see `parse_credit`.
+    pub limit_minor: i64,
+    /// ISO-4217 code, e.g. "USD". Both amounts are in this currency.
+    pub currency: String,
+    /// Minor-unit scale: 2 means `amount_minor` counts cents.
+    pub exponent: u32,
+    /// `used_minor / limit_minor` as a percentage. **Not the endpoint's own
+    /// `spend.percent`**, and that is a deliberate divergence — see
+    /// `usage::parse::parse_credit`, which carries the measurement.
+    ///
+    /// **May exceed 100.** Spending past the limit is exactly what this line
+    /// exists to show, so no clamp happens here; the bar clamps when it draws.
+    pub percent: f64,
+}
+
 /// Spec §7.1. All of these are user-visible states.
 ///
 /// **The serialized form must match the `AccountState` union in
@@ -26,10 +50,21 @@ pub struct UsageWindow {
 pub enum AccountState {
     /// Right after the account is added, before the first fetch.
     Loading,
-    Ok { windows: Vec<UsageWindow>, fetched_at: DateTime<Utc> },
+    /// `credit` is `None` for an account with no spending limit, which is the
+    /// normal case — it is not a failure and renders as no credit line at all.
+    /// Never a zero: see `usage::parse::parse_credit`.
+    Ok {
+        windows: Vec<UsageWindow>,
+        credit: Option<CreditSpend>,
+        fetched_at: DateTime<Utc>,
+    },
     /// Automatic polling failed but the last known value is kept. **Never
     /// render without its age.**
-    Stale { windows: Vec<UsageWindow>, fetched_at: DateTime<Utc> },
+    Stale {
+        windows: Vec<UsageWindow>,
+        credit: Option<CreditSpend>,
+        fetched_at: DateTime<Utc>,
+    },
     Throttled { until: DateTime<Utc> },
     /// Access token expired, refresh in progress.
     AuthExpired,

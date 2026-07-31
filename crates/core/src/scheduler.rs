@@ -1,7 +1,7 @@
 use crate::accounts::{Account, AccountError, AccountStore};
 use crate::auth::stored::StoredTokenError;
 use crate::auth::token::AuthError;
-use crate::model::{AccountState, UsageWindow};
+use crate::model::{AccountState, CreditSpend, UsageWindow};
 use crate::secrets::SecretError;
 use crate::snapshots::CachedSnapshot;
 use crate::usage::http::UsageError;
@@ -241,6 +241,15 @@ struct Entry {
     next_due_at: DateTime<Utc>,
     backoff_level: u32,
     last_windows: Option<Vec<UsageWindow>>,
+    /// The credit spend from the last successful poll **of this process**.
+    ///
+    /// Deliberately absent from `CachedSnapshot`: a credit figure carries no
+    /// reset date (measured — the endpoint has none, see
+    /// `usage::parse::parse_credit`), so a snapshot restored across a month
+    /// boundary would show last month's spend as this month's with no way to
+    /// tell. Windows can be filtered on `resets_at`; this cannot, so it is not
+    /// persisted at all and reappears on the first poll instead.
+    last_credit: Option<CreditSpend>,
     last_fetched_at: Option<DateTime<Utc>>,
     last_failure: Option<FailureKind>,
     throttled_until: Option<DateTime<Utc>>,
@@ -324,6 +333,7 @@ impl<C: Clock> Scheduler<C> {
                 next_due_at: self.clock.now() + offset,
                 backoff_level: 0,
                 last_windows: None,
+                last_credit: None,
                 last_fetched_at: None,
                 last_failure: None,
                 throttled_until: None,
@@ -533,11 +543,20 @@ impl<C: Clock> Scheduler<C> {
         self.entries.get(uuid).map(|e| e.next_due_at)
     }
 
-    pub fn record_success(&mut self, uuid: &str, windows: Vec<UsageWindow>) {
+    /// `credit` is overwritten on every success, `None` included: an account
+    /// whose spending limit was removed must lose its credit line, not keep the
+    /// last figure it ever reported.
+    pub fn record_success(
+        &mut self,
+        uuid: &str,
+        windows: Vec<UsageWindow>,
+        credit: Option<CreditSpend>,
+    ) {
         let now = self.clock.now();
         let interval = self.policy.interval;
         if let Some(e) = self.entries.get_mut(uuid) {
             e.last_windows = Some(windows);
+            e.last_credit = credit;
             e.last_fetched_at = Some(now);
             e.last_failure = None;
             e.throttled_until = None;
@@ -586,6 +605,10 @@ impl<C: Clock> Scheduler<C> {
     pub fn seed(&mut self, uuid: &str, windows: Vec<UsageWindow>, fetched_at: DateTime<Utc>) {
         if let Some(e) = self.entries.get_mut(uuid) {
             e.last_windows = Some(windows);
+            // A restored snapshot carries no credit — see `Entry::last_credit`.
+            // Cleared rather than left alone so a re-seed cannot strand a figure
+            // from an earlier poll beside a much older `fetched_at`.
+            e.last_credit = None;
             e.last_fetched_at = Some(fetched_at);
             // §7.4: a restored snapshot reads as STALE until the first poll of
             // this process confirms it, regardless of age. Without this a
@@ -732,10 +755,11 @@ impl<C: Clock> Scheduler<C> {
             (Some(w), Some(at)) => {
                 // Failed, or past the staleness boundary: Stale.
                 let too_old = now - at > self.policy.interval * 2;
+                let credit = e.last_credit.clone();
                 if e.last_failure.is_some() || too_old {
-                    Some(AccountState::Stale { windows: w.clone(), fetched_at: at })
+                    Some(AccountState::Stale { windows: w.clone(), credit, fetched_at: at })
                 } else {
-                    Some(AccountState::Ok { windows: w.clone(), fetched_at: at })
+                    Some(AccountState::Ok { windows: w.clone(), credit, fetched_at: at })
                 }
             }
             // Never succeeded yet — show the failure itself.
@@ -921,7 +945,7 @@ mod tests {
     fn success_schedules_the_next_poll_one_interval_later() {
         let (mut s, c) = sched();
         s.add("a");
-        s.record_success("a", win(20.0));
+        s.record_success("a", win(20.0), None);
         assert!(s.due().is_empty(), "just fetched, so wait");
         c.advance_secs(299);
         assert!(s.due().is_empty());
@@ -956,7 +980,7 @@ mod tests {
         let (mut s, c) = sched();
         for id in ["a", "b", "c"] {
             s.add(id);
-            s.record_success(id, win(10.0));
+            s.record_success(id, win(10.0), None);
         }
         c.advance_secs(3600);
         assert_eq!(s.due().len(), 1);
@@ -967,7 +991,7 @@ mod tests {
     fn failure_keeps_the_last_good_value_as_stale() {
         let (mut s, c) = sched();
         s.add("a");
-        s.record_success("a", win(42.0));
+        s.record_success("a", win(42.0), None);
         c.advance_secs(400);
         s.record_failure("a", FailureKind::Network);
         match s.state("a").unwrap() {
@@ -1038,14 +1062,14 @@ mod tests {
     fn repeated_failures_back_off_exponentially_and_reset_on_success() {
         let (mut s, c) = sched();
         s.add("a");
-        s.record_success("a", win(1.0));
+        s.record_success("a", win(1.0), None);
         let mut waits = vec![];
         for _ in 0..3 {
             s.record_failure("a", FailureKind::Network);
             waits.push(s.next_wake("a").unwrap() - c.now());
         }
         assert!(waits[1] > waits[0] && waits[2] > waits[1], "intervals must grow: {waits:?}");
-        s.record_success("a", win(1.0));
+        s.record_success("a", win(1.0), None);
         let after = s.next_wake("a").unwrap() - c.now();
         assert!(after <= PollPolicy::default().interval(), "success resets the backoff");
     }
@@ -1065,7 +1089,7 @@ mod tests {
     fn becoming_visible_makes_everything_due_at_once() {
         let (mut s, c) = sched();
         s.add("a");
-        s.record_success("a", win(5.0));
+        s.record_success("a", win(5.0), None);
         s.set_visible(false);
         c.advance_secs(60);
         s.set_visible(true);
@@ -1100,7 +1124,7 @@ mod tests {
     fn value_goes_stale_after_twice_the_interval() {
         let (mut s, c) = sched();
         s.add("a");
-        s.record_success("a", win(30.0));
+        s.record_success("a", win(30.0), None);
         c.advance_secs(599);
         assert!(matches!(s.state("a"), Some(AccountState::Ok { .. })));
         c.advance_secs(2);
@@ -1178,7 +1202,7 @@ mod tests {
         s.seed("a", win(63.0), cached_at);
 
         match s.state("a").unwrap() {
-            AccountState::Stale { windows, fetched_at } => {
+            AccountState::Stale { windows, fetched_at, .. } => {
                 assert_eq!(windows[0].percent, 63.0);
                 assert_eq!(fetched_at, cached_at, "the cached snapshot was stamped with the restart time");
                 assert_eq!(
@@ -1197,7 +1221,7 @@ mod tests {
     fn seeding_does_not_make_an_account_due_earlier_than_its_schedule() {
         let (mut s, c) = sched();
         s.add("a");
-        s.record_success("a", win(10.0));
+        s.record_success("a", win(10.0), None);
         let scheduled = s.next_wake("a").unwrap();
 
         s.seed("a", win(63.0), c.now() - TimeDelta::seconds(3600));
@@ -1234,7 +1258,7 @@ mod tests {
     fn a_locked_store_wins_over_stale_even_after_a_success() {
         let (mut s, c) = sched();
         s.add("a");
-        s.record_success("a", win(42.0));
+        s.record_success("a", win(42.0), None);
         c.advance_secs(10);
         s.record_failure("a", FailureKind::SecretsLocked);
         assert_eq!(
@@ -1245,7 +1269,7 @@ mod tests {
 
         // The shadowing §7.1 does ask for is unchanged: NETWORK is defined as
         // "treated the same as STALE".
-        s.record_success("a", win(42.0));
+        s.record_success("a", win(42.0), None);
         s.record_failure("a", FailureKind::Network);
         assert!(
             matches!(s.state("a"), Some(AccountState::Stale { .. })),
@@ -1262,7 +1286,7 @@ mod tests {
         s.add("a");
         assert!(s.begin_poll("a"), "poll once");
         s.end_poll("a");
-        s.record_success("a", win(10.0));
+        s.record_success("a", win(10.0), None);
 
         c.advance_secs(5);
         s.set_visible(false);
@@ -1330,7 +1354,7 @@ mod tests {
         let at = c.now();
         s.seed_from_cache("a", cached(&c, 63.0, 3600, "fp"), "fp");
         match s.state("a").unwrap() {
-            AccountState::Stale { windows, fetched_at } => {
+            AccountState::Stale { windows, fetched_at, .. } => {
                 assert_eq!(windows[0].percent, 63.0);
                 assert_eq!(fetched_at, at, "the cached age must be the real one");
             }
@@ -1471,7 +1495,7 @@ mod tests {
 
         assert!(s.begin_poll("a"));
         s.end_poll("a");
-        s.record_success("a", win(10.0));
+        s.record_success("a", win(10.0), None);
 
         let until = s.earliest_manual_refresh("a").expect("inside the floor, refresh must be refused");
         assert_eq!(until, c.now() + TimeDelta::seconds(PollPolicy::MIN_INTERVAL_SECS));
@@ -1503,7 +1527,7 @@ mod tests {
         s.add("a");
         s.set_policy(p);
         assert!(s.begin_poll("a"));
-        s.record_success("a", win(10.0));
+        s.record_success("a", win(10.0), None);
         let p = PollPolicy::with_interval_secs(600);
         assert_eq!(p.interval().num_seconds(), 600, "a legitimate value must still pass through");
     }
@@ -1514,7 +1538,7 @@ mod tests {
         s.add("a");
         assert!(s.begin_poll("a"));
         s.end_poll("a");
-        s.record_success("a", win(10.0));
+        s.record_success("a", win(10.0), None);
         let started = c.now();
         assert_eq!(s.next_wake("a").unwrap(), started + PollPolicy::default().interval());
 
@@ -1537,7 +1561,7 @@ mod tests {
         s.add("a");
         assert!(s.begin_poll("a"));
         s.end_poll("a");
-        s.record_success("a", win(10.0));
+        s.record_success("a", win(10.0), None);
         let started = c.now();
         s.set_policy(PollPolicy::with_interval_secs(3600));
         assert_eq!(s.next_wake("a").unwrap(), started + TimeDelta::seconds(3600));
@@ -1656,7 +1680,7 @@ mod tests {
             s.add(id);
             assert!(s.begin_poll(id));
             s.end_poll(id);
-            s.record_success(id, win(10.0));
+            s.record_success(id, win(10.0), None);
         }
         assert!(s.due().is_empty(), "premise: no existing account is due, so due() below is about the new one");
 

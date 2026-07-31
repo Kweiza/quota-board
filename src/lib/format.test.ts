@@ -1,6 +1,7 @@
 import { describe, expect, it } from 'vitest'
 import {
   barWidth,
+  formatMoney,
   formatReset,
   queriesPerDay,
   relativeAge,
@@ -135,5 +136,36 @@ describe('formatReset', () => {
   })
   it('reports under a minute as 0m, not "now"', () => {
     expect(formatReset(new Date('2026-07-29T12:00:30Z'), now)).toBe('0m')
+  })
+})
+
+describe('formatMoney', () => {
+  /** The measured pair: $22.31 spent against a $20.00 limit. */
+  it('divides minor units by the exponent the response reported', () => {
+    expect(formatMoney(2231, 'USD', 2)).toBe('$22.31')
+    expect(formatMoney(2000, 'USD', 2)).toBe('$20.00')
+  })
+
+  /**
+   * The exponent is honoured rather than assumed to be 2. `raw.rs` leaves it
+   * unmasked in the debug window precisely so a cents-to-mills change is
+   * visible; hardcoding 2 here is how that change would instead become a wrong
+   * number on screen — 2231 mills is $2.231, not $22.31.
+   */
+  it('reads a non-2 exponent instead of assuming cents', () => {
+    expect(formatMoney(2231, 'USD', 3)).toBe('$2.231')
+    expect(formatMoney(5, 'JPY', 0)).toBe('¥5')
+  })
+
+  /**
+   * `Intl` throws a RangeError on a code it does not know. The digits are the
+   * part the user needs, so the line degrades to them rather than disappearing.
+   */
+  it('still prints the amount when the currency code is not recognized', () => {
+    expect(formatMoney(2231, 'XYZZY', 2)).toBe('22.31 XYZZY')
+  })
+
+  it('keeps a zero amount distinguishable from a missing one', () => {
+    expect(formatMoney(0, 'USD', 2)).toBe('$0.00')
   })
 })
