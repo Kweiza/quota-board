@@ -1,13 +1,13 @@
 # Spike A — measuring /api/oauth/usage
 
 Run date: 2026-07-29
-User-Agent: `quoata-board/0.1.0-spike`
+User-Agent: `quota-board/0.1.0-spike`
 
 ## Verdict
 
 **GO**
 
-The request to `https://api.anthropic.com/api/oauth/usage` was made with an honest User-Agent (`quoata-board/0.1.0-spike`, not impersonating Claude Code) and returned HTTP 200 on the first attempt. The architecture's central premise — that the usage endpoint can be read without impersonating Claude Code — holds.
+The request to `https://api.anthropic.com/api/oauth/usage` was made with an honest User-Agent (`quota-board/0.1.0-spike`, not impersonating Claude Code) and returned HTTP 200 on the first attempt. The architecture's central premise — that the usage endpoint can be read without impersonating Claude Code — holds.
 
 ## HTTP status
 
@@ -179,7 +179,7 @@ The response body itself contained no email address, organization UUID, or accou
 
 ## Throttle boundary (Spike B)
 
-Measurement conditions: 1 account, `scripts/spike-throttle.sh` targeting 90 iterations at 60-second intervals (about 90 minutes), User-Agent `quoata-board/0.1.0-spike`. The raw log lives at `.local/research/throttle-log.tsv` and is not committed.
+Measurement conditions: 1 account, `scripts/spike-throttle.sh` targeting 90 iterations at 60-second intervals (about 90 minutes), User-Agent `quota-board/0.1.0-spike`. The raw log lives at `.local/research/throttle-log.tsv` and is not committed.
 
 ### Summary
 
@@ -264,7 +264,7 @@ This figure matches almost exactly the "28–30 per hour" estimate carried in th
 # Spike C — refresh behaviour and per-account window sets
 
 Run date: 2026-07-30
-User-Agent: `quoata-board/0.1.0`
+User-Agent: `quota-board/0.1.0`
 Accounts: three, referred to below as A, B and C. Identifiers are not reproduced.
 
 ## Method
@@ -273,7 +273,7 @@ Three accounts were signed in through this project's own OAuth (authorization_co
 PKCE, loopback redirect, Claude Code's public client_id). The machine is headless, so the
 consent redirects were received over an SSH tunnel to the loopback listener.
 
-For the refresh measurements, `quoata-cli refresh` was temporarily instrumented to print a
+For the refresh measurements, `quota-cli refresh` was temporarily instrumented to print a
 truncated, non-reversible SHA-256 of each credential before and after the call, alongside
 the stored expiry timestamps. The instrument was reverted before commit; no credential was
 ever printed, only a hash prefix.
@@ -381,7 +381,7 @@ under a per-`(account, client_id)` binding.
 # Spike D — is the 429 budget per account or per IP?
 
 Run date: 2026-07-30
-User-Agent: `quoata-board/0.1.0`
+User-Agent: `quota-board/0.1.0`
 Accounts: three, on one machine behind one IP, referred to as A, B and C.
 
 ## Why the obvious method does not work
@@ -466,7 +466,7 @@ nothing here establishes it.
 # Spike E — does `user:profile` alone pass server-side?
 
 Run date: 2026-07-30
-User-Agent: `quoata-board/0.1.0`
+User-Agent: `quota-board/0.1.0`
 Account: one, referred to below as A. Identifiers are not reproduced.
 
 ## The question
@@ -487,12 +487,12 @@ The full lifecycle was run against a real account with the scope list narrowed
 to `user:profile` alone — no separate instrument, just this project's own OAuth
 and CLI:
 
-1. `quoata-cli login`, with the authorize URL carrying `scope=user%3Aprofile`.
+1. `quota-cli login`, with the authorize URL carrying `scope=user%3Aprofile`.
 2. Read back the scopes in the token response.
-3. `quoata-cli show` — one `GET /api/oauth/usage`.
-4. `quoata-cli refresh` — a refresh sending the stored (narrow) scopes verbatim.
+3. `quota-cli show` — one `GET /api/oauth/usage`.
+4. `quota-cli refresh` — a refresh sending the stored (narrow) scopes verbatim.
 5. Read back the scopes in the refresh response.
-6. `quoata-cli show` again, on the post-refresh access token.
+6. `quota-cli show` again, on the post-refresh access token.
 
 Step 4 matters on its own. §10.5 requires sending stored scopes back verbatim
 because a hardcoded list silently narrows them on every refresh; the mirror-image

@@ -1,11 +1,11 @@
-# quoata-board — Design
+# quota-board — Design
 
 > Status: settled. Section numbers in §5, §7, §8, and §9 are cited from code
 > comments and are kept stable.
 
 ## 1. Scope
 
-quoata-board is a desktop widget that shows the 5-hour and 7-day usage limits
+quota-board is a desktop widget that shows the 5-hour and 7-day usage limits
 of several Claude accounts at once. This document records the architecture, the
 constraints that shape it, and the terms-of-service position the project takes.
 
@@ -177,7 +177,7 @@ GET https://api.anthropic.com/api/oauth/usage
 Authorization: Bearer <access_token for the account>
 anthropic-beta: oauth-2025-04-20
 Content-Type: application/json
-User-Agent: quoata-board/<version>
+User-Agent: quota-board/<version>
 ```
 
 The following two paths are **explicitly out of scope**:
@@ -196,7 +196,7 @@ termination.
 
 ### 5.2 User-Agent policy (a non-goal)
 
-**We send an honest `quoata-board/<version>`. We never impersonate
+**We send an honest `quota-board/<version>`. We never impersonate
 `claude-code/<version>`.**
 
 The community's standard workaround for the 429 problem is User-Agent
@@ -949,6 +949,42 @@ processes** — reports describe RSS growing without being returned, eventually
 invoking the OOM killer. A polling widget that stays resident for 24 hours
 **needs a periodic webview reload or a memory watchdog. Treat this as a
 functional requirement, not an optimization.**
+
+> **On the watchdog.** It is deliberately not implemented. A design for one was
+> written, reviewed before any code, and dropped — the reasons are worth keeping
+> because they are the reasons anyone would write the same design again.
+>
+> **It would apply to one platform of three.** The leak above is WebKitGTK's,
+> which is the Linux webview. macOS runs WKWebView and Windows runs WebView2;
+> neither shares that engine or that report. Two thirds of the shipped bundles
+> would carry a component that can never act.
+>
+> **It has never been measured against this app.** The footprint figures above
+> come from a default Tauri app (tauri#5889); the leak itself is cited from
+> third-party reports, not from an observation of this binary. `docs/research/`
+> holds no memory measurement, and §12 does not list memory as a risk. The
+> workload here is also unlike the reports': a few rows of text and block glyphs,
+> rewritten once per polling interval.
+>
+> **The obvious design does not work, and the review found it before it was
+> built.** Reading `/proc/self/smaps_rollup` measures the GTK main process —
+> `smaps_rollup` is strictly one process's own rollup, and the leaking heap is in
+> WebKitWebProcess, a different pid. That is why the sentence above says
+> `/proc/*/smaps_rollup` with a glob: the number has to be summed across the
+> process tree, including the intermediate parent WebKitGTK's sandbox inserts.
+> A watchdog on `self` cannot fire, and one that cannot fire is worse than none —
+> it reads as a mitigation while providing nothing.
+>
+> **And the remedy is unproven.** `location.reload()` returns objects to the same
+> allocator this section says does not return memory. Whether it reclaims
+> anything has never been measured before and after a forced reload.
+>
+> **Revive it when there is a measurement**: run on Linux long enough to see PSS
+> summed across the process tree grow materially above the 120–200MB idle band,
+> then force one reload and record PSS on both sides of it. That number decides
+> both whether the feature is needed and whether a reload is the right lever —
+> if it is not, the remedy is a different one (recreating the webview window, or
+> a supervised restart) and belongs in a different design.
 
 ## 12. Risks
 

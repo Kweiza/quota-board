@@ -1,0 +1,42 @@
+//! Where this application's files live. docs/design.md §9.1.
+//!
+//! There is one derivation and both binaries call it. The CLI used to hand-roll
+//! `$XDG_CONFIG_HOME || $HOME/.config` (crates/cli/src/main.rs:16-25), which is
+//! correct on Linux and wrong on macOS and Windows — and `quota-cli login` is
+//! how accounts are added, so a second derivation means the GUI reads a file
+//! nobody writes. Re-derived paths and keys are the ccstatusline #521 bug class
+//! §9.3 cites.
+
+use std::path::PathBuf;
+
+/// The OS config directory for this application, per §9.1. `dirs` resolves it:
+///
+/// ```text
+///   macOS    ~/Library/Application Support/quota-board
+///   Linux    $XDG_CONFIG_HOME/quota-board, else ~/.config/quota-board
+///   Windows  %APPDATA%\quota-board
+/// ```
+///
+/// Falls back to the current directory only when the platform reports no config
+/// directory at all, which on a desktop means `$HOME` is unset.
+pub fn config_dir() -> PathBuf {
+    dirs::config_dir().unwrap_or_else(|| PathBuf::from(".")).join("quota-board")
+}
+
+/// The account metadata file. Shared by the GUI and `quota-cli`.
+pub fn accounts_file() -> PathBuf {
+    config_dir().join("accounts.json")
+}
+
+/// User settings. §9.1 puts these beside `accounts.json` in the OS config
+/// directory. Tokens never live here — `secrets` owns those.
+pub fn settings_file() -> PathBuf {
+    config_dir().join("settings.json")
+}
+
+/// §9.2's encrypted-file fallback. Only reached when no OS keychain is
+/// usable; `unlock_secrets` is the one caller, because opening it needs a
+/// passphrase the user types.
+pub fn secrets_file() -> PathBuf {
+    config_dir().join("secrets.enc")
+}

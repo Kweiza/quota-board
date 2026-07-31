@@ -1,30 +1,18 @@
 //! Headless smoke tool. Exercises login, query, and refresh for real, with no GUI.
 //!
 //! Usage:
-//!   quoata-cli login          — add one account via browser OAuth
-//!   quoata-cli show [uuid]    — print usage. With a uuid, only that account
-//!   quoata-cli refresh <uuid> — force-refresh that account's token
+//!   quota-cli login          — add one account via browser OAuth
+//!   quota-cli show [uuid]    — print usage. With a uuid, only that account
+//!   quota-cli refresh <uuid> — force-refresh that account's token
 
-use quoata_core::accounts::{Account, AccountStore};
-use quoata_core::auth::callback::Callback;
-use quoata_core::auth::pkce::{begin, success_redirect, AuthConfig};
-use quoata_core::auth::stored::{ensure_fresh, token_key, RefreshLocks};
-use quoata_core::auth::token::{exchange_code, refresh, ReqwestHttp, TokenSet};
-use quoata_core::secrets::{keychain::KeychainStore, SecretStore};
-use quoata_core::usage::http::fetch_usage;
-
-fn config_dir() -> std::path::PathBuf {
-    let base = std::env::var("XDG_CONFIG_HOME")
-        .map(std::path::PathBuf::from)
-        .unwrap_or_else(|_| {
-            let mut p = std::path::PathBuf::from(std::env::var("HOME").unwrap());
-            p.push(".config");
-            p
-        });
-    base.join("quoata-board")
-}
-
-const SERVICE: &str = "quoata-board";
+use quota_core::accounts::{Account, AccountStore};
+use quota_core::auth::callback::Callback;
+use quota_core::auth::pkce::{begin, success_redirect, AuthConfig};
+use quota_core::auth::stored::{ensure_fresh, token_key, RefreshLocks};
+use quota_core::auth::token::{exchange_code, refresh, ReqwestHttp, TokenSet};
+use quota_core::paths::accounts_file;
+use quota_core::secrets::{keychain::KeychainStore, SecretStore, SERVICE};
+use quota_core::usage::http::fetch_usage;
 
 fn open_store() -> Box<dyn SecretStore> {
     match KeychainStore::probe(SERVICE) {
@@ -60,7 +48,7 @@ async fn cmd_login() -> Result<(), Box<dyn std::error::Error>> {
     // re-derived here, `token_key` above is the only place it is built.
     open_store().put(&token_key(&identity.uuid), &serde_json::to_vec(&tokens)?)?;
 
-    let mut accounts = AccountStore::load(&config_dir().join("accounts.json"))?;
+    let mut accounts = AccountStore::load(&accounts_file());
     accounts.upsert(Account {
         uuid: identity.uuid.clone(),
         display_label: identity.email.clone(),
@@ -86,7 +74,7 @@ async fn cmd_login() -> Result<(), Box<dyn std::error::Error>> {
 /// separates the two — see docs/research/usage-endpoint.md, Spike D.
 async fn cmd_show(only: Option<&str>) -> Result<(), Box<dyn std::error::Error>> {
     let store = open_store();
-    let accounts = AccountStore::load(&config_dir().join("accounts.json"))?;
+    let accounts = AccountStore::load(&accounts_file());
     let http = ReqwestHttp::new()?;
     let cfg = AuthConfig::default();
 
@@ -149,7 +137,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         Some("show") => cmd_show(args.get(2).map(String::as_str)).await,
         Some("refresh") => cmd_refresh(args.get(2).ok_or("a uuid is required")?).await,
         _ => {
-            eprintln!("usage: quoata-cli [login|show|refresh <uuid>]");
+            eprintln!("usage: quota-cli [login|show|refresh <uuid>]");
             std::process::exit(2);
         }
     }

@@ -1,0 +1,29 @@
+{
+  "five_hour": { "utilization": 30, "resets_at": "2026-08-01T00:00:00Z" },
+  "seven_day": { "utilization": 45, "resets_at": "2026-08-02T00:00:00Z" },
+  "limits": [],
+  "spend": {
+    "auto_reload": null,
+    "balance": null,
+    "can_purchase_credits": false,
+    "can_toggle": false,
+    "cap": { "credits": null, "money": null },
+    "limit": null,
+    "percent": 0,
+    "used": { "amount_minor": 0, "currency": "USD", "exponent": 2 }
+  },
+  "extra_usage": {
+    "credits_ever_enabled": false,
+    "currency": null,
+    "daily": null,
+    "decimal_places": null,
+    "disabled_reason": null,
+    "is_enabled": false,
+    "monthly_limit": null,
+    "spend_limit_reached": false,
+    "used_credits": null,
+    "user_disabled": false,
+    "utilization": null,
+    "weekly": null
+  }
+}

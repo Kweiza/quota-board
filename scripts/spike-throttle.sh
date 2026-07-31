@@ -7,7 +7,7 @@
 set -euo pipefail
 
 CREDS="${CLAUDE_CREDS:-$HOME/.claude/.credentials.json}"
-UA="quoata-board/0.1.0-spike"
+UA="quota-board/0.1.0-spike"
 LOG="${THROTTLE_LOG:-.local/research/throttle-log.tsv}"
 ITERATIONS="${ITERATIONS:-90}"
 
