@@ -1,6 +1,6 @@
 import { svelte } from '@sveltejs/vite-plugin-svelte'
 import { svelteTesting } from '@testing-library/svelte/vite'
-import { defineConfig } from 'vitest/config'
+import { configDefaults, defineConfig } from 'vitest/config'
 
 // Standalone on purpose: do not move `test` into vite.config.ts and do not
 // mergeConfig() the two. Vite's own defineConfig rejects a `test` key, which
@@ -15,5 +15,18 @@ import { defineConfig } from 'vitest/config'
 // cascade well enough to assert `opacity` and `color`; measured, not assumed.
 export default defineConfig({
   plugins: [svelte(), svelteTesting()],
-  test: { environment: 'jsdom', css: true },
+  test: {
+    environment: 'jsdom',
+    css: true,
+    // **Spread the defaults, never replace them** — a bare `exclude` drops
+    // `node_modules` and `dist` and the run slows to a crawl on vendored specs.
+    //
+    // `.local/` and `.superpowers/` are git-ignored working directories, so a
+    // clone does not have them and CI cannot run what they contain. Without
+    // this the local totals and the CI totals silently disagree: measured, a
+    // scratch probe in `.local/` added 4 tests and one file to every number
+    // this project quoted as a gate result, none of which any checkout could
+    // reproduce.
+    exclude: [...configDefaults.exclude, '.local/**', '.superpowers/**'],
+  },
 })

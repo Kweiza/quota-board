@@ -54,12 +54,12 @@ pub fn build_tray(app: &tauri::App) -> tauri::Result<()> {
         .build()?;
 
     TrayIconBuilder::with_id("main-tray")
-        // **Not `default_window_icon()`.** That is `icons/icon.png`, which is a
-        // 512x512 image of one flat colour with no transparency anywhere — a
-        // placeholder that renders in the menu bar as exactly what it is, a
-        // filled box. This icon is monochrome with a real alpha channel, which
-        // is what macOS template rendering needs: it recolours the alpha
-        // silhouette to match the menu bar, light or dark.
+        // **Not `default_window_icon()`.** The app icon is full colour, and a
+        // full-colour image in the macOS menu bar cannot follow a light or dark
+        // bar — it stays as it is and reads as a sticker. This one is monochrome
+        // with a real alpha channel, which is what template rendering needs: the
+        // system recolours the alpha silhouette to match the bar. The two are
+        // the same artwork, drawn for the two jobs.
         .icon(tauri::image::Image::from_bytes(include_bytes!("../icons/tray.png"))?)
         .icon_as_template(true)
         .menu(&menu)
