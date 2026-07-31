@@ -103,7 +103,22 @@
       // Login finishes in the background, so without these two subscriptions a
       // completed login never reaches this window.
       const fns = [
-        await onAccountsChanged(() => void pullAccounts()),
+        await onAccountsChanged(() => {
+          // An `accounts://changed` means an account mutation *succeeded*, so
+          // it retires whatever error is on screen. `guard()` only clears the
+          // banner for click-driven commands; without this, the refusal from a
+          // second "Add account" click survives the login the user then
+          // completed in the browser — the account appears in the list and the
+          // widget while the banner still says a login is in progress.
+          //
+          // Cleared synchronously, before the awaited re-read: an
+          // `auth://failed` arriving afterwards sets the banner again and must
+          // win, and a clear deferred behind `pullAccounts` would stomp it.
+          // The two events do not race for one outcome — they report different
+          // ones.
+          error = null
+          void pullAccounts()
+        }),
         await onAuthFailed((message) => {
           error = message
         }),
@@ -268,19 +283,28 @@
     <h2>Token store</h2>
     {#if status}
       <p class="note">{status.description}</p>
-      <!-- The form's visibility is decided by `kind`, never by
-           `fallback_file_exists`: on a missing file any passphrase opens an
-           empty store and writes nothing, so that flag is still false right
-           after the first successful unlock. It chooses the wording only. -->
+      <!-- One branch per `StoreKind`, plus a fallback. The form's visibility is
+           decided by `kind`, never by `fallback_file_exists`: on a missing file
+           any passphrase opens an empty store and writes nothing, so that flag
+           is still false right after the first successful unlock — it chooses
+           the wording only. `encrypted_file` therefore cannot share a branch
+           with `no_backend`, which is how the shipped window came to tell a
+           user who had just unlocked the store that no store existed yet and
+           that values would not update. -->
       {#if status.kind === 'keychain'}
         <p class="note">Tokens are held in the OS keychain, which unlocks at login.</p>
+      {:else if status.kind === 'encrypted_file'}
+        <p class="note">
+          The encrypted store is open, so values update normally. It has to be
+          unlocked again after each boot.
+        </p>
       {:else if status.kind === 'keychain_locked'}
         <p class="warn">
           A keychain exists on this machine but did not answer. Unlock it in the
           OS and restart quota-board — a passphrase here would open a
           different, empty store.
         </p>
-      {:else}
+      {:else if status.kind === 'no_backend'}
         <p class="warn">
           Values will not update until the passphrase is entered after each boot.
         </p>
@@ -296,6 +320,16 @@
         <button on:click={unlock} disabled={busy || passphrase === ''}>
           {status.fallback_file_exists ? 'Unlock' : 'Set a passphrase'}
         </button>
+      {:else}
+        <!-- A `StoreKind` variant added on the Rust side must not render an
+             empty section here: silence in this panel reads as "the token store
+             is fine", which is CLAUDE.md's never-degrade-silently rule applied
+             to UI state. It says what it does not know instead. -->
+        <p class="warn">
+          This build does not recognize the token store state the backend
+          reported, so it cannot say whether values will update or how to unlock
+          the store. Update quota-board.
+        </p>
       {/if}
     {/if}
   </section>
