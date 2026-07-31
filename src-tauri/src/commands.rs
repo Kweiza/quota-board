@@ -56,8 +56,15 @@ pub async fn list_accounts(state: State<'_, AppState>) -> Result<Vec<AccountView
 
 /// §6.3. Records what the widget webview reports; the polling loop combines it
 /// with the window's own `is_visible()`/`is_minimized()` once per tick and is
-/// the single writer of `Scheduler::set_visible`. Task 19's tray toggle calls
-/// this too, so there is one entry point rather than two scheduler touches.
+/// the single writer of `Scheduler::set_visible`.
+///
+/// **The webview is the only caller, and the tray toggle deliberately is not
+/// one** — an earlier draft of this comment said it would be. The loop already
+/// re-reads the window's own visibility every tick, so hiding from the tray
+/// closes the gate without help; pushing a `false` in here as well would create
+/// the stale value this half cannot clear on its own, leaving polling off after
+/// the widget came back until the 30-second heartbeat fired. See
+/// `tray::toggle_widget`.
 #[tauri::command]
 pub async fn set_widget_visible(state: State<'_, AppState>, visible: bool) -> Result<(), String> {
     state.webview_visible.store(visible, Ordering::Relaxed);
