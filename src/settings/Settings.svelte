@@ -417,7 +417,7 @@
 </script>
 
 <main class="settings">
-  <h1>quota-board</h1>
+  <h1>Quota Board</h1>
   {#if error}
     <p class="warn" role="alert">{error}</p>
   {/if}
@@ -508,7 +508,7 @@
   <section>
     <h2>Start at login</h2>
     {#if autostart}
-      <label for="autostart">Launch quota-board when I log in</label>
+      <label for="autostart">Launch Quota Board when I log in</label>
       <input
         id="autostart"
         type="checkbox"
@@ -547,7 +547,7 @@
       {:else if status.kind === 'keychain_locked'}
         <p class="warn">
           A keychain exists on this machine but did not answer. Unlock it in the
-          OS and restart quota-board — a passphrase here would open a
+          OS and restart Quota Board — a passphrase here would open a
           different, empty store.
         </p>
       {:else if status.kind === 'no_backend'}
@@ -574,7 +574,7 @@
         <p class="warn">
           This build does not recognize the token store state the backend
           reported, so it cannot say whether values will update or how to unlock
-          the store. Update quota-board.
+          the store. Update Quota Board.
         </p>
       {/if}
     {/if}

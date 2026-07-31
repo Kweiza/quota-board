@@ -50,7 +50,7 @@ pub fn build_tray(app: &tauri::App) -> tauri::Result<()> {
         // is undecorated, and closing the settings window hides it — so without
         // this item the process can only be killed, and a kill skips
         // `RunEvent::Exit`, which is what persists the widget's position.
-        .quit_with_text("Quit quota-board")
+        .quit_with_text("Quit Quota Board")
         .build()?;
 
     TrayIconBuilder::with_id("main-tray")
@@ -68,7 +68,7 @@ pub fn build_tray(app: &tauri::App) -> tauri::Result<()> {
         // the icon looking dead to a left click. Unsupported on Linux, where
         // the appindicator opens its menu on either button anyway.
         .show_menu_on_left_click(true)
-        .tooltip("quota-board")
+        .tooltip("Quota Board")
         .on_menu_event(|app, event| {
             if event.id().as_ref() == "toggle_widget" {
                 toggle_widget(app);

@@ -682,7 +682,7 @@ pub async fn unlock_secrets(
         }
         StoreKind::KeychainLocked => {
             return Err("a keychain exists on this machine but did not answer; \
-                        unlock it in the OS and restart quota-board. A passphrase \
+                        unlock it in the OS and restart Quota Board. A passphrase \
                         here would open a different, empty store"
                 .into())
         }
