@@ -5,6 +5,7 @@ use tauri_plugin_window_state::StateFlags;
 
 mod commands;
 mod state;
+mod tray;
 
 use quota_core::accounts::AccountStore;
 use quota_core::auth::pkce::AuthConfig;
@@ -22,8 +23,16 @@ use quota_core::secrets::SecretError;
 use quota_core::settings::SettingsStore;
 use quota_core::snapshots::fingerprint;
 use state::{poll_loop, AppState, LockedStore, SecretsHandle, StoreKind};
+use tauri_plugin_global_shortcut::{Code, GlobalShortcutExt, Modifiers, Shortcut, ShortcutState};
 use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
+
+/// §3.3's global toggle. Built on demand rather than stored in a `static`:
+/// `Shortcut::new` is cheap, and the handler and the registration have to agree
+/// on one value — a second literal is how they would stop agreeing.
+fn toggle_shortcut() -> Shortcut {
+    Shortcut::new(Some(Modifiers::CONTROL | Modifiers::ALT), Code::KeyQ)
+}
 
 fn main() {
     // Must be set before gtk::init(). .setup() is already too late — the
@@ -58,6 +67,19 @@ fn main() {
         // button silently does nothing at runtime**, which is exactly the
         // state `tauri-plugin-autostart` is in today (Task 20 owns that).
         .plugin(tauri_plugin_opener::init())
+        // §3.3's second recovery route. **`Builder`, not `init()`** — this
+        // plugin has no `init`. The handler fires on both press and release, so
+        // without the `Pressed` filter every hotkey toggles twice and looks
+        // like it did nothing.
+        .plugin(
+            tauri_plugin_global_shortcut::Builder::new()
+                .with_handler(move |app, shortcut, event| {
+                    if event.state == ShortcutState::Pressed && shortcut == &toggle_shortcut() {
+                        tray::toggle_widget(app);
+                    }
+                })
+                .build(),
+        )
         .setup(|app| {
             // §9.1 + user decision 1: the same file `quota-cli login` writes.
             // There is one derivation of this path and both binaries call it.
@@ -174,6 +196,26 @@ fn main() {
             if let Some(widget) = app.get_webview_window("widget") {
                 widget.show()?;
             }
+
+            tray::build_tray(app)?;
+
+            // **Not fatal.** On Linux this needs X11 regardless of
+            // `GDK_BACKEND`, because `global-hotkey` opens its own `$DISPLAY`
+            // connection, so a pure Wayland session cannot register it at all —
+            // and there the tray menu is the only way back to a hidden widget.
+            // A failure here must therefore lose the shortcut, not the app.
+            if let Err(e) = app.global_shortcut().register(toggle_shortcut()) {
+                eprintln!("the global shortcut could not be registered ({e}) — use the tray menu");
+            }
+
+            // §3.3: this is a widget, not an application. Done **after** the
+            // tray exists, and in the same commit as it, because it is the tray
+            // menu that replaces everything this takes away: with no Dock icon
+            // there is no Cmd+Q and no Cmd+Tab entry, so an app that hid its
+            // icon before it had a tray would have no quit at all.
+            #[cfg(target_os = "macos")]
+            app.set_activation_policy(tauri::ActivationPolicy::Accessory);
+
             Ok(())
         })
         .on_window_event(|window, event| {
