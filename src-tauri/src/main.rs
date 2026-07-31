@@ -23,6 +23,7 @@ use quota_core::secrets::SecretError;
 use quota_core::settings::SettingsStore;
 use quota_core::snapshots::fingerprint;
 use state::{poll_loop, AppState, LockedStore, SecretsHandle, StoreKind};
+use tauri_plugin_autostart::MacosLauncher;
 use tauri_plugin_global_shortcut::{Code, GlobalShortcutExt, Modifiers, Shortcut, ShortcutState};
 use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
@@ -67,6 +68,18 @@ fn main() {
         // button silently does nothing at runtime**, which is exactly the
         // state `tauri-plugin-autostart` is in today (Task 20 owns that).
         .plugin(tauri_plugin_opener::init())
+        // §11.3. **LaunchAgent, never AppleScript mode** — that one drives
+        // System Events through osascript, which trips a TCC automation
+        // consent prompt, needs `NSAppleEventsUsageDescription`, and registers
+        // the raw Unix executable whenever `.app/` does not appear exactly once
+        // in the canonical path. design.md calls it an explicit non-goal.
+        //
+        // **No launch arguments.** The plan called for `--minimized`, but
+        // nothing in this binary reads an argument, so a `--minimized` sitting
+        // in the user's LaunchAgent plist would promise a hidden start that
+        // does not happen. §11.3 does not ask for one either — it mentions
+        // those flags only when explaining what AppleScript mode is limited to.
+        .plugin(tauri_plugin_autostart::init(MacosLauncher::LaunchAgent, None))
         // §3.3's second recovery route. **`Builder`, not `init()`** — this
         // plugin has no `init`. The handler fires on both press and release, so
         // without the `Pressed` filter every hotkey toggles twice and looks
@@ -233,6 +246,8 @@ fn main() {
             commands::set_widget_visible,
             commands::begin_login,
             commands::submit_manual_code,
+            commands::get_autostart,
+            commands::set_autostart,
             commands::remove_account,
             commands::rename_account,
             commands::reorder_accounts,

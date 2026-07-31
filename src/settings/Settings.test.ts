@@ -7,6 +7,7 @@ import Settings from './Settings.svelte'
 import type {
   AccountState,
   AccountView,
+  AutostartView,
   LoginUrls,
   RawResponse,
   SettingsView,
@@ -37,6 +38,16 @@ interface Backend {
   loginUrls?: LoginUrls
   /** Rejects `submit_manual_code` with this message. */
   submitError?: string
+  /** What `get_autostart` answers with. §11.3. */
+  autostart?: AutostartView
+  /** Rejects `set_autostart` with this message, as a debug build does. */
+  autostartError?: string
+  /**
+   * What `set_autostart` answers with, regardless of what was asked. §11.3's
+   * command reports the state the OS has *afterwards*, and the two can
+   * disagree — an enable that the OS quietly declined comes back disabled.
+   */
+  autostartApplied?: AutostartView
   raw?: RawResponse | null
 }
 
@@ -111,6 +122,16 @@ function mockBackend(b: Backend = {}): IpcCall[] {
       case 'submit_manual_code':
         if (b.submitError !== undefined) return Promise.reject(b.submitError)
         return null
+      case 'get_autostart':
+        return b.autostart ?? { enabled: false, writable: true }
+      case 'set_autostart':
+        if (b.autostartError !== undefined) return Promise.reject(b.autostartError)
+        return (
+          b.autostartApplied ?? {
+            enabled: (args as { enabled?: boolean } | undefined)?.enabled ?? false,
+            writable: true,
+          }
+        )
       case 'last_response':
         return b.raw ?? null
       default:
@@ -632,5 +653,84 @@ describe('Settings manual login fallback', () => {
 
     expect(screen.getByText(/older login attempt/)).toBeTruthy()
     expect(screen.getByLabelText('Code from the page')).toBeTruthy()
+  })
+})
+
+/** docs/design.md §11.3. */
+describe('Settings start at login', () => {
+  it('shows the state the backend reports, not a guess', async () => {
+    mockBackend({ autostart: { enabled: true, writable: true } })
+    render(Settings)
+    await settle()
+    expect((screen.getByLabelText(/Launch quota-board/) as HTMLInputElement).checked).toBe(true)
+  })
+
+  it('sends the new value', async () => {
+    const calls = mockBackend({ autostart: { enabled: false, writable: true } })
+    render(Settings)
+    await settle()
+
+    await fireEvent.click(screen.getByLabelText(/Launch quota-board/))
+    await settle()
+
+    expect(calls.find((c) => c.cmd === 'set_autostart')?.args.enabled).toBe(true)
+  })
+
+  /**
+   * §11.3's command answers with what the OS reports *afterwards*, which is not
+   * always what was asked for. The window has to render that answer — showing
+   * the click instead would tell the user autostart is on when the OS declined
+   * it, which is the confidently-wrong display CLAUDE.md forbids.
+   *
+   * The mock deliberately disagrees with the request: a test where the answer
+   * matches the click cannot tell the two apart, and an earlier version of this
+   * one could not.
+   */
+  it('renders the answer the backend gave, not the click that was made', async () => {
+    mockBackend({
+      autostart: { enabled: false, writable: true },
+      autostartApplied: { enabled: false, writable: true },
+    })
+    render(Settings)
+    await settle()
+
+    await fireEvent.click(screen.getByLabelText(/Launch quota-board/))
+    await settle()
+
+    expect((screen.getByLabelText(/Launch quota-board/) as HTMLInputElement).checked).toBe(false)
+  })
+
+  /**
+   * §11.3's pitfall: the plugin resolves its target with `current_exe()`, so a
+   * development build would register the build directory. The control is
+   * disabled and says why, rather than offering a toggle that always fails.
+   */
+  it('disables the control and explains itself in a development build', async () => {
+    mockBackend({ autostart: { enabled: false, writable: false } })
+    render(Settings)
+    await settle()
+
+    expect((screen.getByLabelText(/Launch quota-board/) as HTMLInputElement).disabled).toBe(true)
+    expect(screen.getByText(/development build/)).toBeTruthy()
+  })
+
+  /**
+   * The click already moved the DOM checkbox. Re-rendering from an unchanged
+   * object would not move it back, so a refused change would sit there looking
+   * applied — the confidently-wrong display CLAUDE.md forbids, in miniature.
+   */
+  it('puts the box back when the backend refuses', async () => {
+    mockBackend({
+      autostart: { enabled: false, writable: true },
+      autostartError: 'this is a development build',
+    })
+    render(Settings)
+    await settle()
+
+    await fireEvent.click(screen.getByLabelText(/Launch quota-board/))
+    await settle()
+
+    expect((screen.getByLabelText(/Launch quota-board/) as HTMLInputElement).checked).toBe(false)
+    expect(screen.getByText(/development build/)).toBeTruthy()
   })
 })

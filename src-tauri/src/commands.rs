@@ -13,6 +13,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 use tauri::{Emitter, Manager, State};
+use tauri_plugin_autostart::ManagerExt;
 
 /// Mirrors `AccountView` in `src/lib/types.ts`. The two must be changed
 /// together — `crates/core/src/model.rs:19-23` carries the reciprocal note for
@@ -323,6 +324,55 @@ pub async fn begin_login(app: tauri::AppHandle) -> Result<LoginUrls, String> {
     });
 
     Ok(LoginUrls { loopback, manual })
+}
+
+/// Mirrors `AutostartView` in `src/lib/types.ts`. Change both together.
+#[derive(serde::Serialize)]
+pub struct AutostartView {
+    pub enabled: bool,
+    /// False in a development build. Same shape as `SettingsView::writable`,
+    /// and for the same reason: the window disables the control and says why,
+    /// rather than offering one that is guaranteed to fail.
+    pub writable: bool,
+}
+
+/// docs/design.md §11.3.
+///
+/// **Reading is always allowed; only writing is refused in a debug build.**
+/// Knowing the state is harmless, and a window that could not read it would
+/// have to either guess or show nothing.
+#[tauri::command]
+pub fn get_autostart(app: tauri::AppHandle) -> Result<AutostartView, String> {
+    Ok(AutostartView {
+        enabled: app.autolaunch().is_enabled().map_err(|e| e.to_string())?,
+        writable: !cfg!(debug_assertions),
+    })
+}
+
+/// docs/design.md §11.3. Answers with the state the OS reports afterwards, not
+/// with the state that was asked for — the two can disagree.
+///
+/// **Refused in a development build.** The plugin resolves its target with
+/// `std::env::current_exe()` at the moment it is enabled, so doing this here
+/// would write a LaunchAgent pointing at `target/debug/quota-board`: a path the
+/// user never installed, that `cargo clean` deletes, and that would then fail
+/// silently at every login. §11.3 names this as a pitfall and says not to
+/// validate autostart with a development build; refusing is what makes that
+/// advice enforceable rather than a note somebody has to remember.
+#[tauri::command]
+pub fn set_autostart(app: tauri::AppHandle, enabled: bool) -> Result<AutostartView, String> {
+    if cfg!(debug_assertions) {
+        return Err("this is a development build, so start-at-login cannot be changed here — \
+                    it would register the build directory rather than an installed app"
+            .into());
+    }
+    let mgr = app.autolaunch();
+    if enabled {
+        mgr.enable().map_err(|e| e.to_string())?;
+    } else {
+        mgr.disable().map_err(|e| e.to_string())?;
+    }
+    get_autostart(app)
 }
 
 /// §10.3's paste path: finishes a login whose loopback half did not.
