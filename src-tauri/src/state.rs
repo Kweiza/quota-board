@@ -1,28 +1,77 @@
-use quoata_core::accounts::AccountStore;
+use chrono::Utc;
+use quoata_core::accounts::{Account, AccountStore};
 use quoata_core::auth::pkce::AuthConfig;
 use quoata_core::auth::stored::{ensure_fresh, RefreshLocks};
 use quoata_core::auth::token::ReqwestHttp;
 use quoata_core::scheduler::{persist_quarantine, FailureKind, Scheduler, SystemClock};
 use quoata_core::secrets::{SecretError, SecretStore};
+use quoata_core::settings::SettingsStore;
 use quoata_core::snapshots::{fingerprint, save as save_snapshot};
-use quoata_core::usage::http::{fetch_usage_at, UsageError};
+use quoata_core::usage::http::{fetch_usage_captured_at, UsageError};
+use quoata_core::usage::raw::{RawLog, RawResponse};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, RwLock};
 use tauri::{Emitter, Manager};
 use tokio::sync::Mutex;
 
 /// **Lock order: `scheduler` before `accounts`, never the reverse, and never
-/// hold either across `ensure_fresh` or `fetch_usage_at`.** Both are `tokio`
+/// hold either across `ensure_fresh` or `fetch_usage_captured_at`.** Both are `tokio`
 /// mutexes and neither is reentrant. Task 18 adds commands that touch the same
 /// two stores; a command taking them in the other order deadlocks against the
 /// polling loop. `crates/core/src/accounts.rs:36-47` carries the matching
 /// warning for the store itself: two open `AccountStore` instances silently
 /// discard each other's writes, so the one in this struct is the sole owner.
+///
+/// The `secrets` lock added in Task 18 is deliberately **not** part of that
+/// order. It is a leaf: taken alone, holding nothing else while held, released
+/// before any other acquisition — and the `!Send` guard below is what makes
+/// that mechanical rather than a convention. `settings` is not part of it
+/// either: `set_poll_interval` takes it and releases it before touching
+/// `scheduler`.
 pub struct AppState {
     pub scheduler: Mutex<Scheduler<SystemClock>>,
     pub accounts: Mutex<AccountStore>,
-    pub secrets: Arc<dyn SecretStore>,
+    /// §9.1's settings file, and the only live instance of it.
+    pub settings: Mutex<SettingsStore>,
+    /// §9.2's token store, swappable at runtime.
+    ///
+    /// **`pub(crate)` and never locked directly — use `secrets()`,
+    /// `install_store()`, `secrets_status()` and `store_kind()`.** The same
+    /// convention as `poll_permit` below, and for a sharper reason: a read
+    /// guard held across `ensure_fresh`'s awaits would make `unlock_secrets`
+    /// block behind a poll that can legitimately run 150 seconds
+    /// (`IN_FLIGHT_RECLAIM_SECS` in `scheduler`). The accessor hands out
+    /// an `Arc` clone instead, so a poll finishes against the store it started
+    /// with and an unlock never waits on one.
+    ///
+    /// A `std::sync` lock rather than a `tokio` one on purpose, and the
+    /// compiler is what enforces it: `std::sync::RwLockReadGuard` is `!Send`,
+    /// so a guard held across an `await` makes the future non-`Send` and
+    /// `tauri::async_runtime::spawn` (`F: Future + Send`), which is how
+    /// `poll_loop` is started in `main.rs`'s `setup`, refuses to compile it.
+    /// Measured: "the trait `Send` is not implemented for
+    /// `std::sync::RwLockReadGuard<'_, SecretsHandle>`". A `tokio::sync::RwLock`
+    /// here would compile silently.
+    pub(crate) secrets: RwLock<SecretsHandle>,
+    /// §5.5's "retain the raw JSON so it can be inspected in a debug window",
+    /// keyed by uuid, **already masked** (`usage::raw`).
+    ///
+    /// **In memory only.** It is deliberately not merged into
+    /// `snapshots_path`: §9.1 puts that cache in a plain file on disk, and a
+    /// whole response body carries fields this app does not read and therefore
+    /// has not reasoned about. Losing the debug body on restart is the correct
+    /// trade.
+    ///
+    /// **There is no entry cap.** The key set is a subset of the registered
+    /// accounts — `record` is reached only from `poll_claimed` with a
+    /// scheduler-owned uuid — and `forget_raw` drops an entry when the account
+    /// is deleted. `crates/core/src/snapshots.rs:73-86` is a uuid-keyed map with
+    /// the same `save`/`remove` shape and no cap, for the same reason.
+    ///
+    /// Same `std::sync` rule as `secrets`: taken and released inside one
+    /// statement, never across an `await`.
+    pub(crate) last_raw: std::sync::Mutex<RawLog>,
     pub http: ReqwestHttp,
     pub cfg: AuthConfig,
     /// Per-account refresh locks (Task 10b). **Exactly one instance may exist
@@ -49,9 +98,9 @@ pub struct AppState {
     pub snapshots_path: PathBuf,
     /// §4.3's URL-injection seam, carried one layer up. Without it nothing in
     /// this path can ever be exercised against a mock, because `fetch_usage`
-    /// hardcodes §5.1's production URL (usage/http.rs:6, :22-27). This is what
-    /// makes Step 11 executable at all. **Do not add a trait to `usage`** —
-    /// CLAUDE.md and design.md §4.3 forbid it; the URL is the seam.
+    /// hardcodes §5.1's production URL (`USAGE_URL` in usage/http.rs). This is
+    /// what makes Step 11 executable at all. **Do not add a trait to `usage`**
+    /// — CLAUDE.md and design.md §4.3 forbid it; the URL is the seam.
     pub usage_url: String,
     /// §6.3. What the widget webview last reported. Defaults to `true` so a
     /// webview that never reports at all cannot freeze polling. Combined with
@@ -68,11 +117,72 @@ pub struct AppState {
     pub webview_visible: AtomicBool,
 }
 
-/// Stands in for the token store when §9.2's keychain probe fails and the
-/// encrypted-file fallback cannot be opened (it needs a passphrase prompt no
-/// task has built yet — see Step 9). Every account then renders
-/// `SECRETS_LOCKED`, which is §7.1's state carrying the "unlock" affordance.
-/// The alternatives were a panic and a blank widget; both are worse.
+/// The token store together with what kind of store it is.
+///
+/// One value behind one lock so the two can never disagree. A separate
+/// `store_kind` field would have to be updated in lockstep with the store and
+/// eventually would not be — and the settings window branches on `kind` to
+/// choose which of docs/design.md §9.2's two remedies to offer, so a stale
+/// value there is a *wrong* remedy, not a cosmetic one.
+pub struct SecretsHandle {
+    pub store: Arc<dyn SecretStore>,
+    pub kind: StoreKind,
+}
+
+/// Which store is installed, and therefore which remedy §7.1's
+/// `SECRETS_LOCKED` actually carries.
+///
+/// docs/design.md:587-588 requires exactly this: "`secrets` must distinguish
+/// three states and surface each differently: `NO_BACKEND` / `LOCKED` /
+/// `NOT_FOUND`." §9.2 keeps `NO_BACKEND` off the account-state axis entirely
+/// (:592-594 — "Not surfaced as an account state"); this build nevertheless
+/// renders both it and `LOCKED` as `SECRETS_LOCKED`, because the passphrase
+/// prompt §9.2 asks for cannot be raised from `setup()`, where the store is
+/// opened and no window exists yet. That deviation makes the distinction
+/// *more* load-bearing, not less: the two states carry different remedies and
+/// nothing else on the wire tells them apart, so a single "is it locked"
+/// boolean collapses the one distinction the design document forbids
+/// collapsing.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum StoreKind {
+    /// §9.2's first choice: the OS keychain opened and answered its canary.
+    Keychain,
+    /// §9.2's fallback: the encrypted file is open.
+    EncryptedFile,
+    /// §9.2's `NO_BACKEND`. No credential store is registered on this machine
+    /// at all — the passphrase fallback is the remedy.
+    NoBackend,
+    /// §9.2's `LOCKED`. A keychain exists but did not answer. A passphrase is
+    /// the *wrong* answer here: it would open a different, empty store.
+    KeychainLocked,
+}
+
+impl StoreKind {
+    /// Written exhaustively rather than with a `_` arm, matching
+    /// `FailureKind`'s own rule: a `SecretError` variant added later must be a
+    /// compile error here, not a silent guess. `Backend` and `TooLong` have no
+    /// passphrase remedy either — a `Backend` from an open means "the store
+    /// thread would not start or stopped" (secrets/timeout.rs:105, :117).
+    pub fn from_open_error(e: &SecretError) -> Self {
+        match e {
+            SecretError::NoBackend(_) => StoreKind::NoBackend,
+            SecretError::Locked(_) | SecretError::Backend(_) | SecretError::TooLong { .. } => {
+                StoreKind::KeychainLocked
+            }
+        }
+    }
+}
+
+/// Stands in for the token store when §9.2's keychain probe fails and no
+/// fallback has been opened yet. Every account then renders `SECRETS_LOCKED`,
+/// which is §7.1's state carrying the "unlock" affordance — and that click now
+/// leads somewhere: the settings window's passphrase form calls
+/// `unlock_secrets`, which opens §9.2's encrypted file and swaps it in through
+/// `AppState::install_store`. It is only offered when `StoreKind` says
+/// `NoBackend`: a keychain that merely did not answer arrives as
+/// `KeychainLocked`, and a passphrase there would open a different, empty
+/// store. The alternatives were a panic and a blank widget; both are worse.
 pub struct LockedStore;
 
 impl SecretStore for LockedStore {
@@ -91,6 +201,153 @@ impl SecretStore for LockedStore {
 }
 
 impl AppState {
+    /// The token store in effect right now.
+    ///
+    /// A poisoned lock is recovered from rather than panicked on:
+    /// `poll_claimed`'s doc comment says a panic on that path ends polling for
+    /// the life of the process, and what this lock protects is two fields
+    /// always written together — there is no torn state to refuse.
+    pub fn secrets(&self) -> Arc<dyn SecretStore> {
+        Arc::clone(&self.secrets.read().unwrap_or_else(|e| e.into_inner()).store)
+    }
+
+    /// Which store is installed right now.
+    pub fn store_kind(&self) -> StoreKind {
+        self.secrets.read().unwrap_or_else(|e| e.into_inner()).kind
+    }
+
+    /// Installs a store opened by `unlock_secrets` (§9.2) and returns the one
+    /// it replaced, so the caller drops it after the write guard is released.
+    ///
+    /// Dropping the **last** handle to a replaced `TimeoutStore` closes its job
+    /// channel, which is the only thing that lets a worker stranded inside a
+    /// wedged keychain call retire (secrets/timeout.rs:97-98). A poll already in
+    /// flight holds a clone until it finishes (`poll_claimed`'s `ensure_fresh`
+    /// call in this file), so the thread retires then, not at the moment of the
+    /// swap.
+    ///
+    /// The old store's `stuck` latch is never cleared in place and there is no
+    /// API to do so. It is cleared only by that store's own worker completing a
+    /// job (timeout.rs:100-102), which by definition cannot happen while the
+    /// worker is stranded — the next job would queue behind the wedged one and
+    /// time out again. Replacing the whole store is what recovers, and the new
+    /// `TimeoutStore` starts with its own `stuck: false` (timeout.rs:76).
+    pub fn install_store(
+        &self,
+        store: Arc<dyn SecretStore>,
+        kind: StoreKind,
+    ) -> Arc<dyn SecretStore> {
+        let mut w = self.secrets.write().unwrap_or_else(|e| e.into_inner());
+        w.kind = kind;
+        std::mem::replace(&mut w.store, store)
+    }
+
+    /// `(description, kind)` for the settings window. `describe()` is the one
+    /// `SecretStore` method safe to call from a UI command: `TimeoutStore`
+    /// answers it from a string captured when the store opened
+    /// (secrets/timeout.rs:173-177), unlike `get`/`delete`, which block a real
+    /// thread.
+    pub fn secrets_status(&self) -> (String, StoreKind) {
+        let r = self.secrets.read().unwrap_or_else(|e| e.into_inner());
+        (r.store.describe(), r.kind)
+    }
+
+    /// §5.5's capture. **Never `unwrap()`s the lock**: this runs on the polling
+    /// path, and `poll_claimed`'s doc comment below records that a panic here
+    /// ends polling for the life of the process. The body arrives already
+    /// masked and already bounded — `RawResponse::capture` is the only
+    /// constructor and it does both, so nothing here can forget either.
+    fn record_raw(&self, uuid: &str, raw: RawResponse) {
+        self.last_raw.lock().unwrap_or_else(|e| e.into_inner()).record(uuid, raw);
+    }
+
+    /// §5.5. `None` means this account has not been polled successfully since
+    /// the process started — not "there was no body".
+    pub fn last_raw_for(&self, uuid: &str) -> Option<RawResponse> {
+        self.last_raw.lock().unwrap_or_else(|e| e.into_inner()).get(uuid).cloned()
+    }
+
+    /// Dropped together with the account. With no entry cap this is the only
+    /// bound on the key set, so the call at `remove_account` is not optional.
+    pub fn forget_raw(&self, uuid: &str) {
+        self.last_raw.lock().unwrap_or_else(|e| e.into_inner()).remove(uuid);
+    }
+
+    /// §6.1 + §8.4. Applies a new polling interval to the **running** scheduler.
+    ///
+    /// **Persist first, then swap the live policy.** If the write fails the
+    /// running interval is left alone, so the process can never poll at a
+    /// cadence the settings file does not record.
+    ///
+    /// The two locks are taken sequentially, never nested, so this cannot take
+    /// part in the deadlock this struct's doc comment warns about.
+    ///
+    /// The policy comes from the store that just accepted the value, never from
+    /// a second `PollPolicy::with_interval_secs` call here: `poll_policy`'s own
+    /// doc comment calls itself "the one derivation" of the running policy, and
+    /// a copy of it on this side would be free to disagree the moment the
+    /// policy grows a field the stored value feeds.
+    pub async fn set_poll_interval(&self, secs: i64) -> Result<i64, String> {
+        let (effective, policy) = {
+            let mut settings = self.settings.lock().await;
+            let effective = settings.set_poll_interval_secs(secs).map_err(|e| e.to_string())?;
+            (effective, settings.poll_policy())
+        };
+        self.scheduler.lock().await.set_policy(policy);
+        Ok(effective)
+    }
+
+    /// Registers a freshly authenticated account (§10.3's flow, completed).
+    ///
+    /// **This and `list_accounts` in `commands.rs` are the only two places
+    /// in the application that hold both stores at once**, so the lock order
+    /// documented on this struct is a two-party agreement and nothing else.
+    /// It lives here rather than inside the command because a
+    /// `#[tauri::command]` body needs an `AppHandle` no test can build — see
+    /// `the_two_stores_are_always_taken_in_the_same_order`.
+    ///
+    /// A re-login must clear the quarantine **without clearing the user's
+    /// rename.** `AccountStore::upsert` preserves only `sort_order`
+    /// (accounts.rs:71-83): everything else in the record is overwritten
+    /// wholesale. Writing `display_label: email` here would therefore silently
+    /// undo `rename_account` — and undo the reason `email` is on the wire at
+    /// all (`AccountView`'s doc comment in `commands.rs`) — at the exact moment
+    /// the user is trying to recover a quarantined account.
+    pub async fn register_authenticated(
+        &self,
+        uuid: &str,
+        email: &str,
+    ) -> Result<(), quoata_core::accounts::AccountError> {
+        // Lock order: scheduler before accounts. See this struct's doc comment.
+        let mut sched = self.scheduler.lock().await;
+        let mut accounts = self.accounts.lock().await;
+
+        let existing = accounts.list().iter().find(|a| a.uuid == uuid).cloned();
+        accounts.upsert(Account {
+            uuid: uuid.to_string(),
+            display_label: existing
+                .as_ref()
+                .map(|a| a.display_label.clone())
+                .unwrap_or_else(|| email.to_string()),
+            email: email.to_string(),
+            created_at: existing.as_ref().map(|a| a.created_at).unwrap_or_else(Utc::now),
+            last_ok_at: existing.as_ref().and_then(|a| a.last_ok_at),
+            // Clearing this is the point of a re-login (§7.2).
+            quarantined: false,
+            // Overwritten by `upsert` either way: preserved for a known uuid,
+            // set to the list length for a new one (accounts.rs:71-83).
+            sort_order: 0,
+        })?;
+
+        // `Scheduler::add` returns immediately for a uuid it already holds, so
+        // it alone would leave a quarantined entry AUTH_DEAD forever — and
+        // Task 17 persists `quarantined`, so that now survives every restart.
+        // Drop the entry and rebuild it.
+        sched.remove(uuid);
+        sched.add(uuid);
+        Ok(())
+    }
+
     /// The polling loop's entry point: waits for the global permit.
     pub async fn poll_one(&self, uuid: &str) {
         let _permit = self.poll_permit.lock().await;
@@ -99,7 +356,7 @@ impl AppState {
 
     /// The manual path's entry point. `try_lock` rather than `lock`: blocking a
     /// UI command behind a poll that can legitimately run 150 seconds (the
-    /// `IN_FLIGHT_RECLAIM_SECS` derivation, scheduler.rs:181-206) is the other
+    /// `IN_FLIGHT_RECLAIM_SECS` derivation in scheduler.rs) is the other
     /// failure mode. `false` means "did not run".
     pub async fn try_poll_one(&self, uuid: &str) -> bool {
         match self.poll_permit.try_lock() {
@@ -134,10 +391,14 @@ impl AppState {
         // Task 10b owns read -> refresh -> write. Inlining it here would let
         // scheduler polls and manual refreshes invalidate each other's refresh
         // tokens (§10.5).
+        // One `Arc` clone taken before the await, so no lock is held across
+        // one. A store swapped in mid-poll therefore takes effect from the
+        // next poll, and this one finishes against the store it started with.
+        let store = self.secrets();
         let fresh = match ensure_fresh(
             &self.http,
             &self.cfg,
-            self.secrets.as_ref(),
+            store.as_ref(),
             &self.refresh_locks,
             uuid,
         )
@@ -163,7 +424,14 @@ impl AppState {
             eprintln!("{uuid}: the rotated token could not be persisted: {e}");
         }
 
-        match fetch_usage_at(&self.http, &self.usage_url, &fresh.tokens.access_token).await {
+        // §5.5: capture before classifying, so the body that failed to parse —
+        // the one the debug window exists for — is retained too.
+        let fetched =
+            fetch_usage_captured_at(&self.http, &self.usage_url, &fresh.tokens.access_token).await;
+        if let Some(raw) = fetched.raw {
+            self.record_raw(uuid, raw);
+        }
+        match fetched.outcome {
             Ok(windows) => {
                 // The fingerprint is taken from the token that produced *this*
                 // fetch, not re-read from the store afterwards.
@@ -233,7 +501,8 @@ pub async fn poll_loop(handle: tauri::AppHandle) {
     let mut ticker = tokio::time::interval(std::time::Duration::from_secs(5));
     // The default is `Burst`: after a poll that legitimately ran 150 seconds,
     // ~30 accumulated ticks fire back to back. Harmless — §6.1's floor is
-    // structural inside `due()` (scheduler.rs:334) — but pointless churn.
+    // structural inside `due()`'s `last_attempt_at` check — but pointless
+    // churn.
     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     loop {
         ticker.tick().await;
@@ -248,10 +517,10 @@ pub async fn poll_loop(handle: tauri::AppHandle) {
         // **`WindowEvent::Focused` is deliberately not used.** The widget is
         // declared `focus: false, alwaysOnTop, skipTaskbar` (tauri.conf.json:
         // 27-30) — being unfocused is its normal condition — and `due()`
-        // returns an empty vec unconditionally while `!visible`
-        // (scheduler.rs:311-314). Mapping focus loss to `set_visible(false)`
-        // freezes polling the moment the user clicks anything else, which is
-        // the exact inversion of §6.3's rationale.
+        // returns an empty vec unconditionally while `!visible` (its
+        // `!self.visible` early return). Mapping focus loss to
+        // `set_visible(false)` freezes polling the moment the user clicks
+        // anything else, which is the exact inversion of §6.3's rationale.
         let shown = handle.get_webview_window("widget").is_none_or(|w| {
             w.is_visible().unwrap_or(true) && !w.is_minimized().unwrap_or(false)
         });
@@ -329,7 +598,21 @@ mod tests {
     /// Builds an `AppState` around `secrets`, with accounts a and b registered.
     /// No Tauri window or `AppHandle` is involved — `AppState` is a plain
     /// struct, which is what makes the polling path testable at all.
+    ///
+    /// The healthy default: a keychain-kind store and a throwaway settings
+    /// file. Kept as its own function so the two polling tests that predate
+    /// Task 18 read exactly as they did.
     fn app_state(secrets: Arc<dyn SecretStore>) -> AppState {
+        app_state_with(secrets, StoreKind::Keychain, tmp("settings"))
+    }
+
+    /// The real builder, for the tests that need to say which kind of store is
+    /// installed or where the settings file lives.
+    fn app_state_with(
+        secrets: Arc<dyn SecretStore>,
+        kind: StoreKind,
+        settings_path: PathBuf,
+    ) -> AppState {
         let accounts_path = tmp("accounts");
         let mut accounts = AccountStore::load(&accounts_path).unwrap();
         let mut scheduler = Scheduler::new(PollPolicy::with_interval_secs(300), SystemClock);
@@ -340,7 +623,9 @@ mod tests {
         AppState {
             scheduler: Mutex::new(scheduler),
             accounts: Mutex::new(accounts),
-            secrets,
+            settings: Mutex::new(SettingsStore::load(&settings_path)),
+            secrets: RwLock::new(SecretsHandle { store: secrets, kind }),
+            last_raw: std::sync::Mutex::new(RawLog::default()),
             http: quoata_core::auth::token::ReqwestHttp::new().unwrap(),
             // Unreachable in these tests: the store fails before any request.
             cfg: AuthConfig {
@@ -433,5 +718,237 @@ mod tests {
             Some(AccountState::AuthDead),
             "a healthy store must reach the credential check, not report a locked store"
         );
+    }
+
+    /// **Critical regression guard, and it is measured.**
+    ///
+    /// `register_authenticated` and `list_accounts` (in `commands.rs`) are the
+    /// only two places that hold both stores at once. If they disagree about
+    /// the order, the pair wedges permanently and the polling loop freezes
+    /// behind whichever one holds the scheduler — with **no diagnostic
+    /// anywhere**, because the login half runs inside a
+    /// `tauri::async_runtime::spawn` whose `JoinHandle` is dropped.
+    ///
+    /// The second task is a hand-written copy of `list_accounts`' order rather
+    /// than the command itself, because a `#[tauri::command]` body needs a
+    /// `State<'_, AppState>` no test can build. **If `list_accounts` ever
+    /// changes its order, change it here too** — that is the whole agreement.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn the_two_stores_are_always_taken_in_the_same_order() {
+        let state = Arc::new(app_state(Arc::new(quoata_core::secrets::MemoryStore::default())));
+
+        // **Which task starts first is load-bearing, and it is measured.**
+        // `register_authenticated` has no await point between its two
+        // acquisitions, so whenever it starts first it takes both and returns
+        // before the other task is polled at all. Measured on this machine:
+        // spawning the login task first and the listing task second, with the
+        // two acquisitions in `register_authenticated` inverted, **passed 5
+        // runs out of 5 in 0.28s** — a back-test that proves nothing. Parking
+        // the listing task on `scheduler` and only then starting the login
+        // task removes that race, because the login half is guaranteed to
+        // reach its first acquisition while the listing half holds the
+        // scheduler and is still asleep before its second one. With that
+        // ordering the same inversion **failed 5 of 5 at the 3s timeout**, and
+        // the restored code **passed 5 of 5 in 0.28s**.
+        let listing = {
+            let s = Arc::clone(&state);
+            tokio::spawn(async move {
+                // `list_accounts`' order: scheduler before accounts.
+                let sched = s.scheduler.lock().await;
+                tokio::time::sleep(Duration::from_millis(200)).await;
+                let accounts = s.accounts.lock().await;
+                accounts.list().len() + usize::from(sched.state("a").is_some())
+            })
+        };
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        let login = {
+            let s = Arc::clone(&state);
+            tokio::spawn(async move { s.register_authenticated("a", "a@example.invalid").await })
+        };
+
+        let both = tokio::time::timeout(Duration::from_secs(3), async {
+            let _ = login.await;
+            let _ = listing.await;
+        })
+        .await;
+        assert!(
+            both.is_ok(),
+            "the two paths deadlocked — they take `scheduler` and `accounts` in different orders"
+        );
+    }
+
+    /// §7.2's quarantine must clear on a re-login **without** clearing the
+    /// user's rename. `AccountStore::upsert` preserves only `sort_order`
+    /// (accounts.rs:71-83), so every other field is whatever the caller wrote —
+    /// and writing `display_label: email` there would undo `rename_account` at
+    /// the exact moment the user is recovering a quarantined account.
+    #[tokio::test]
+    async fn a_re_login_clears_the_quarantine_but_keeps_the_users_rename() {
+        let state = app_state(Arc::new(quoata_core::secrets::MemoryStore::default()));
+        let created = Utc::now() - chrono::TimeDelta::days(30);
+        let last_ok = Utc::now() - chrono::TimeDelta::hours(2);
+        {
+            let mut accounts = state.accounts.lock().await;
+            accounts
+                .upsert(Account {
+                    uuid: "a".into(),
+                    display_label: "work".into(),
+                    email: "old@example.invalid".into(),
+                    created_at: created,
+                    last_ok_at: Some(last_ok),
+                    quarantined: true,
+                    sort_order: 0,
+                })
+                .unwrap();
+        }
+        state.scheduler.lock().await.record_failure("a", FailureKind::AuthDead);
+        assert_eq!(
+            state.scheduler.lock().await.state("a"),
+            Some(AccountState::AuthDead),
+            "premise: the account reads as quarantined before the re-login"
+        );
+
+        state.register_authenticated("a", "different@example.invalid").await.unwrap();
+
+        {
+            let accounts = state.accounts.lock().await;
+            let a =
+                accounts.list().iter().find(|x| x.uuid == "a").expect("the account is still there");
+            assert_eq!(a.display_label, "work", "the re-login overwrote the user's rename");
+            assert_eq!(
+                a.email, "different@example.invalid",
+                "the re-login did not record the newly authenticated email"
+            );
+            assert_eq!(a.created_at, created, "the re-login reset when the account was added");
+            assert_eq!(
+                a.last_ok_at,
+                Some(last_ok),
+                "the re-login discarded the last successful poll"
+            );
+            assert!(!a.quarantined, "the quarantine survived the re-login on disk");
+        }
+        assert_ne!(
+            state.scheduler.lock().await.state("a"),
+            Some(AccountState::AuthDead),
+            "the scheduler entry still reads AUTH_DEAD after a successful re-login"
+        );
+    }
+
+    /// **docs/design.md §9.2's fallback had never been exercised by the
+    /// application.** `EncryptedFileStore` is well tested inside `crates/core`,
+    /// but nothing in `src-tauri` had ever constructed one: it was reachable
+    /// only through a passphrase prompt no task had built. This drives the whole
+    /// unlock path — locked store, swap, poll again — against a real encrypted
+    /// file on disk, with no keychain and no network.
+    ///
+    /// The final assertion is `Network`, not merely "not locked". "Not locked"
+    /// would also pass if the swap had installed some other broken store;
+    /// `Network` is reachable only by decrypting the token off disk, handing it
+    /// to `ensure_fresh` without a refresh being due, and failing the usage
+    /// fetch against 127.0.0.1:1.
+    ///
+    /// `EncryptedFileStore::open` runs Argon2 twice here, which is the bulk of
+    /// this test's runtime. That is the intended cost, and it is why these
+    /// three behaviours are one test rather than three.
+    #[tokio::test]
+    async fn unlocking_installs_the_encrypted_file_store_and_the_poll_path_uses_it() {
+        use quoata_core::auth::stored::token_key;
+        use quoata_core::auth::token::TokenSet;
+        use quoata_core::secrets::encrypted_file::EncryptedFileStore;
+
+        let path = tmp("tokens");
+        // Not due for a refresh, so `ensure_fresh` answers straight from the
+        // store and never touches the network (§10.5's five-minute skew).
+        let tokens = TokenSet {
+            access_token: "live-access".into(),
+            refresh_token: "live-refresh".into(),
+            expires_at: Utc::now() + chrono::TimeDelta::hours(1),
+            refresh_token_expires_at: Utc::now() + chrono::TimeDelta::days(30),
+            scopes: vec![],
+            client_id: "test".into(),
+        };
+        {
+            let seed = EncryptedFileStore::open(&path, "correct horse").unwrap();
+            seed.put(&token_key("a"), &serde_json::to_vec(&tokens).unwrap()).unwrap();
+        }
+
+        let state = app_state_with(Arc::new(LockedStore), StoreKind::NoBackend, tmp("settings"));
+        state.poll_one("a").await;
+        assert_eq!(
+            state.scheduler.lock().await.state("a"),
+            Some(AccountState::SecretsLocked),
+            "premise: with no store open every account reads as locked (§7.1)"
+        );
+
+        let open_path = path.clone();
+        let opened = TimeoutStore::spawn(Duration::from_secs(10), move || {
+            EncryptedFileStore::open(&open_path, "correct horse")
+                .map(|s| Box::new(s) as Box<dyn SecretStore>)
+        })
+        .expect("the encrypted-file fallback opens");
+        drop(state.install_store(Arc::new(opened), StoreKind::EncryptedFile));
+        assert_eq!(state.store_kind(), StoreKind::EncryptedFile);
+
+        state.poll_one("a").await;
+        assert_eq!(
+            state.scheduler.lock().await.state("a"),
+            Some(AccountState::Network),
+            "the fallback store was installed but the poll path did not read it"
+        );
+
+        std::fs::remove_file(&path).ok();
+        let mut lock = path.clone().into_os_string();
+        lock.push(".lock");
+        std::fs::remove_file(PathBuf::from(lock)).ok();
+    }
+
+    /// The wiring, not the store. What is untested without this is whether a
+    /// saved value ever reaches the object the polling loop actually reads.
+    #[tokio::test]
+    async fn a_new_interval_is_persisted_and_reaches_the_running_scheduler() {
+        let settings_path = tmp("settings");
+        let state =
+            app_state_with(Arc::new(LockedStore), StoreKind::Keychain, settings_path.clone());
+        assert_eq!(state.scheduler.lock().await.policy().interval().num_seconds(), 300);
+
+        assert_eq!(state.set_poll_interval(600).await.unwrap(), 600);
+
+        assert_eq!(
+            state.scheduler.lock().await.policy().interval().num_seconds(),
+            600,
+            "the setting never reached the running scheduler"
+        );
+        assert_eq!(
+            SettingsStore::load(&settings_path).poll_interval_secs(),
+            600,
+            "the setting never reached the disk"
+        );
+
+        // §6.1's floor is enforced here, not only by the control in the window.
+        assert_eq!(state.set_poll_interval(5).await.unwrap(), 180);
+        assert_eq!(state.scheduler.lock().await.policy().interval().num_seconds(), 180);
+
+        std::fs::remove_file(&settings_path).ok();
+    }
+
+    /// Persist first, then apply. A cadence the settings file does not record
+    /// is one the next process start silently abandons.
+    #[tokio::test]
+    async fn an_interval_that_cannot_be_saved_does_not_change_the_running_one() {
+        let blocker = tmp("settings-blocker");
+        std::fs::write(&blocker, b"a regular file, not a directory").unwrap();
+        let state = app_state_with(
+            Arc::new(LockedStore),
+            StoreKind::Keychain,
+            blocker.join("settings.json"),
+        );
+
+        assert!(state.set_poll_interval(600).await.is_err(), "the write cannot succeed here");
+        assert_eq!(
+            state.scheduler.lock().await.policy().interval().num_seconds(),
+            300,
+            "a setting that was never saved was applied to the running scheduler anyway"
+        );
+        std::fs::remove_file(&blocker).ok();
     }
 }

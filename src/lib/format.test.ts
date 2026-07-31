@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest'
-import { barWidth, formatReset, relativeAge, severityOf } from './format'
+import { barWidth, formatReset, queriesPerDay, relativeAge, severityOf } from './format'
 
 describe('severityOf', () => {
   it('changes at the 40/70/90 boundaries', () => {
@@ -52,6 +52,25 @@ describe('relativeAge', () => {
   })
   it('switches to days at exactly 24 hours', () => {
     expect(relativeAge(new Date('2026-07-28T12:00:00Z'), now)).toBe('1d ago')
+  })
+})
+
+describe('queriesPerDay', () => {
+  it('scales with the account count and inversely with the interval', () => {
+    expect(queriesPerDay(300, 1)).toBe(288)
+    expect(queriesPerDay(300, 3)).toBe(864)
+    expect(queriesPerDay(180, 3)).toBe(1440)
+  })
+
+  // Every one of these reaches the hint through `bind:value`, which answers
+  // `null` for a cleared field. Without the guard the first case renders
+  // "roughly Infinity queries per day".
+  it('never reports Infinity or NaN for a degenerate input', () => {
+    expect(queriesPerDay(null, 2)).toBe(0)
+    expect(queriesPerDay(0, 2)).toBe(0)
+    expect(queriesPerDay(-1, 2)).toBe(0)
+    expect(queriesPerDay(NaN, 2)).toBe(0)
+    expect(queriesPerDay(300, 0)).toBe(0)
   })
 })
 

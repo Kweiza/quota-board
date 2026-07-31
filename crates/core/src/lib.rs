@@ -4,5 +4,6 @@ pub mod model;
 pub mod paths;
 pub mod scheduler;
 pub mod secrets;
+pub mod settings;
 pub mod snapshots;
 pub mod usage;

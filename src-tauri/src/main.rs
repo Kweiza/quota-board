@@ -10,10 +10,18 @@ use quoata_core::accounts::AccountStore;
 use quoata_core::auth::pkce::AuthConfig;
 use quoata_core::auth::stored::{token_key, RefreshLocks};
 use quoata_core::auth::token::{ReqwestHttp, TokenSet};
-use quoata_core::scheduler::{register_accounts, PollPolicy, Scheduler, SystemClock};
+use quoata_core::scheduler::{register_accounts, Scheduler, SystemClock};
 use quoata_core::secrets::{keychain::KeychainStore, timeout::TimeoutStore, SecretStore, SERVICE};
+/// Named only inside the `QUOATA_FORCE_FALLBACK` block below, which is itself
+/// `debug_assertions`-only. Imported unconditionally it is an `unused_imports`
+/// warning in every release build — invisible to `cargo clippy --all-targets`,
+/// which builds the debug profile, and therefore only surfacing at the release
+/// build the installer step runs.
+#[cfg(debug_assertions)]
+use quoata_core::secrets::SecretError;
+use quoata_core::settings::SettingsStore;
 use quoata_core::snapshots::fingerprint;
-use state::{poll_loop, AppState, LockedStore};
+use state::{poll_loop, AppState, LockedStore, SecretsHandle, StoreKind};
 use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
 
@@ -43,6 +51,13 @@ fn main() {
                 .skip_initial_state("settings")
                 .build(),
         )
+        // Opening the authorize URL in the user's real browser is the whole
+        // point of §10.3's flow — the consent screen must not run inside this
+        // app's webview. **Without this line the permission in
+        // capabilities/settings.json still resolves at build time and the
+        // button silently does nothing at runtime**, which is exactly the
+        // state `tauri-plugin-autostart` is in today (Task 20 owns that).
+        .plugin(tauri_plugin_opener::init())
         .setup(|app| {
             // §9.1 + user decision 1: the same file `quoata-cli login` writes.
             // There is one derivation of this path and both binaries call it.
@@ -67,18 +82,38 @@ fn main() {
                 std::time::Duration::from_secs(quoata_core::secrets::timeout::DEFAULT_TIMEOUT_SECS),
                 || KeychainStore::probe(SERVICE).map(|s| Box::new(s) as Box<dyn SecretStore>),
             );
-            let secrets: Arc<dyn SecretStore> = match opened {
+            // docs/design.md §9.2's real trigger — a Linux box with no Secret
+            // Service (design.md:580-586) — cannot be reproduced on a macOS
+            // development machine, and "the fallback has never been exercised
+            // by the application" is a pre-release blocker. Debug builds only,
+            // for the reason `usage_url()`'s doc comment below already gives
+            // for the URL overrides. It cannot redirect writes: the path comes
+            // from `paths::secrets_file()`, never from the environment.
+            #[cfg(debug_assertions)]
+            let opened = if std::env::var_os("QUOATA_FORCE_FALLBACK").is_some() {
+                Err(SecretError::NoBackend(
+                    "QUOATA_FORCE_FALLBACK is set: pretending this machine has no keychain".into(),
+                ))
+            } else {
+                opened
+            };
+
+            let (secrets, store_kind): (Arc<dyn SecretStore>, StoreKind) = match opened {
                 Ok(s) => {
                     eprintln!("token store: {}", s.describe());
-                    Arc::new(s)
+                    (Arc::new(s), StoreKind::Keychain)
                 }
                 Err(e) => {
-                    // §9.2 wants the encrypted-file fallback here. It needs a
-                    // passphrase prompt, which **no task in this plan builds**
-                    // (see Step 9). Until one does, keep running and render
-                    // every account SECRETS_LOCKED rather than crashing.
-                    eprintln!("no usable credential store ({e}) — every account will read as locked");
-                    Arc::new(LockedStore)
+                    // §9.2's encrypted-file fallback needs a passphrase, and a
+                    // passphrase cannot be asked for from `setup()` — there is
+                    // no window yet. Start locked, render every account
+                    // SECRETS_LOCKED (§7.1), and let the settings window's
+                    // `unlock_secrets` swap a real store in. `store_kind` is
+                    // what tells that window which of §9.2's two remedies to
+                    // offer.
+                    eprintln!("{e} — every account will read as locked until it is unlocked in Settings");
+                    let kind = StoreKind::from_open_error(&e);
+                    (Arc::new(LockedStore) as Arc<dyn SecretStore>, kind)
                 }
             };
 
@@ -90,7 +125,14 @@ fn main() {
                 .map_err(|e| format!("no cache directory: {e}"))?;
             let mut cache = quoata_core::snapshots::load(&snapshots_path);
 
-            let mut scheduler = Scheduler::new(PollPolicy::with_interval_secs(300), SystemClock);
+            // §9.1: settings live beside accounts.json, through the one shared
+            // `paths` derivation. Deleting the literal 300 is the guard that
+            // keeps the file the only source of the running interval.
+            let settings = SettingsStore::load(&quoata_core::paths::settings_file());
+            if let Some(w) = settings.warning() {
+                eprintln!("settings: {w}");
+            }
+            let mut scheduler = Scheduler::new(settings.poll_policy(), SystemClock);
             let store = Arc::clone(&secrets);
             let current_fp = move |uuid: &str| -> Option<String> {
                 let raw = store.get(&token_key(uuid)).ok().flatten()?;
@@ -105,7 +147,12 @@ fn main() {
             app.manage(AppState {
                 scheduler: tokio::sync::Mutex::new(scheduler),
                 accounts: tokio::sync::Mutex::new(accounts),
-                secrets,
+                settings: tokio::sync::Mutex::new(settings),
+                secrets: std::sync::RwLock::new(SecretsHandle {
+                    store: secrets,
+                    kind: store_kind,
+                }),
+                last_raw: std::sync::Mutex::new(quoata_core::usage::raw::RawLog::default()),
                 http: ReqwestHttp::new()?,
                 cfg: AuthConfig { token_url: token_url(), ..AuthConfig::default() },
                 refresh_locks: RefreshLocks::default(),
@@ -140,7 +187,16 @@ fn main() {
         .invoke_handler(tauri::generate_handler![
             commands::list_accounts,
             commands::refresh_account,
-            commands::set_widget_visible
+            commands::set_widget_visible,
+            commands::begin_login,
+            commands::remove_account,
+            commands::rename_account,
+            commands::reorder_accounts,
+            commands::store_status,
+            commands::unlock_secrets,
+            commands::get_settings,
+            commands::set_settings,
+            commands::last_response
         ])
         .build(tauri::generate_context!())
         .expect("failed to build the Tauri application")

@@ -155,12 +155,36 @@ impl PollPolicy {
     /// entirely — see `record_throttle`. An hour is far beyond any legitimate
     /// value; the largest ever observed is 300.
     pub const MAX_RETRY_AFTER_SECS: u64 = 3600;
+    /// Upper bound on the polling interval. **Not a preference — two separate
+    /// panics and one correctness rule.**
+    ///
+    /// (1) `TimeDelta::seconds` panics above `i64::MAX / 1000` and
+    /// `with_interval_secs` calls it: measured on chrono 0.4.45,
+    /// `PollPolicy::with_interval_secs(i64::MAX)` panics with "TimeDelta::
+    /// seconds out of bounds" — inside `setup()`, before any window exists.
+    /// (2) Even a value chrono accepts panics later: `Utc::now() +
+    /// TimeDelta::seconds(i64::MAX / 1000)` panics, and `record_success` does
+    /// exactly `now + interval` — on the task whose panic, per state.rs's own
+    /// doc comment, "stops all polling for the life of the process".
+    /// (3) One hour is the ceiling rather than one day because `state()` calls
+    /// a value stale only past `interval * 2`: at a one-day interval a
+    /// two-day-old percentage still renders as `Ok`, long after the 5-hour
+    /// window it describes has rotated — the confidently-wrong-number failure
+    /// CLAUDE.md names as the worst one. At one hour the staleness boundary is
+    /// two hours, comfortably inside that window.
+    ///
+    /// Both bounds are reachable from a file a user can hand-edit, which is
+    /// why they are structural rather than advisory — the same argument the
+    /// struct doc above makes for the private fields.
+    pub const MAX_INTERVAL_SECS: i64 = 3_600;
 
     /// The only way to set the interval, and it clamps to
-    /// [`PollPolicy::MIN_INTERVAL_SECS`].
+    /// [`PollPolicy::MIN_INTERVAL_SECS`] ..= [`PollPolicy::MAX_INTERVAL_SECS`].
     pub fn with_interval_secs(secs: i64) -> Self {
         Self {
-            interval: TimeDelta::seconds(secs.max(Self::MIN_INTERVAL_SECS)),
+            interval: TimeDelta::seconds(
+                secs.clamp(Self::MIN_INTERVAL_SECS, Self::MAX_INTERVAL_SECS),
+            ),
             stagger: TimeDelta::seconds(15),
         }
     }
@@ -283,29 +307,105 @@ impl<C: Clock> Scheduler<C> {
         self.order.retain(|x| x != uuid);
     }
 
+    /// The policy the loop is **actually** running under. `get_settings` reads
+    /// the interval back from here rather than from the settings file, so the
+    /// window can never display a number the poll loop is not using — the same
+    /// two-sources-disagree argument the `AccountView` doc comment in
+    /// `src-tauri/src/commands.rs` already makes about `quarantined`.
+    pub fn policy(&self) -> &PollPolicy {
+        &self.policy
+    }
+
+    /// §6.1's "Configurable". Replaces the policy while the loop is running and
+    /// re-anchors every account that has already been polled to the new
+    /// interval.
+    ///
+    /// **The re-anchoring is the point, not a side effect.** `next_due_at` is
+    /// written only by `record_success`, `record_failure` and `record_throttle`,
+    /// so without it a user who lowers the interval from an hour to three
+    /// minutes keeps waiting out the old hour — a setting that appears to do
+    /// nothing, which is the two-sources-disagree hazard §7.1 exists to prevent.
+    ///
+    /// It recomputes exactly what `record_failure` would compute — the interval
+    /// times the current backoff factor — so a settings change does not reset an
+    /// exponential backoff earned against an unreachable network. Three
+    /// exclusions, each pinned by a test: an account that has never been polled
+    /// keeps `add()`'s startup stagger; a throttled account keeps the server's
+    /// `Retry-After` (§6.2); a quarantined account has no schedule to move
+    /// (§7.2).
+    ///
+    /// The floor cannot be crossed here: `with_interval_secs` is the only
+    /// constructor and it clamps, and `due()` re-checks `last_attempt_at +
+    /// MIN_INTERVAL_SECS` independently of the policy whatever is written here.
+    pub fn set_policy(&mut self, policy: PollPolicy) {
+        self.policy = policy;
+        let now = self.clock.now();
+        let interval = self.policy.interval;
+        for e in self.entries.values_mut() {
+            if e.quarantined || e.throttled_until.is_some_and(|t| t > now) {
+                continue;
+            }
+            let Some(attempted) = e.last_attempt_at else { continue };
+            let factor = 1i32 << e.backoff_level;
+            e.next_due_at = interval
+                .checked_mul(factor)
+                .and_then(|wait| attempted.checked_add_signed(wait))
+                .unwrap_or(DateTime::<Utc>::MAX_UTC);
+        }
+    }
+
     /// Widget visibility. On the false→true transition, every account
     /// becomes immediately due.
     pub fn set_visible(&mut self, visible: bool) {
         let becoming_visible = visible && !self.visible;
         self.visible = visible;
         if becoming_visible {
-            let now = self.clock.now();
-            let floor = TimeDelta::seconds(PollPolicy::MIN_INTERVAL_SECS);
-            for e in self.entries.values_mut() {
-                if !e.quarantined && e.throttled_until.is_none_or(|t| t <= now) {
-                    // Pull the poll forward, but never inside §6.1's per-account
-                    // floor. Setting this to `now` unconditionally let a widget
-                    // that is hidden and shown every five seconds poll every
-                    // five seconds — the floor simply was not enforced on this
-                    // path — and it reset the failure backoff on every flip.
-                    // Focus changes and workspace switches are not rare
-                    // deliberate acts. `min` keeps §6.3's "refresh the moment it
-                    // becomes visible" intact for any realistic hidden duration.
-                    let earliest = e.last_attempt_at.map_or(now, |t| t + floor);
-                    e.next_due_at = e.next_due_at.min(now.max(earliest));
-                }
+            self.pull_forward();
+        }
+    }
+
+    /// Pulls every eligible account's next poll forward to the earliest moment
+    /// §6.1 allows. Extracted from `set_visible` so the visibility path and the
+    /// remedy path cannot drift; the floor arithmetic below is the thing that
+    /// must never be re-derived by a second caller.
+    fn pull_forward(&mut self) {
+        let now = self.clock.now();
+        let floor = TimeDelta::seconds(PollPolicy::MIN_INTERVAL_SECS);
+        for e in self.entries.values_mut() {
+            if !e.quarantined && e.throttled_until.is_none_or(|t| t <= now) {
+                // Pull the poll forward, but never inside §6.1's per-account
+                // floor. Setting this to `now` unconditionally let a widget
+                // that is hidden and shown every five seconds poll every
+                // five seconds — the floor simply was not enforced on this
+                // path — and it reset the failure backoff on every flip.
+                // Focus changes and workspace switches are not rare
+                // deliberate acts. `min` keeps §6.3's "refresh the moment it
+                // becomes visible" intact for any realistic hidden duration.
+                let earliest = e.last_attempt_at.map_or(now, |t| t + floor);
+                e.next_due_at = e.next_due_at.min(now.max(earliest));
             }
         }
+    }
+
+    /// §9.2's unlock succeeded. Make every account due again as soon as §6.1
+    /// allows.
+    ///
+    /// **Without this the remedy works and the display does not change.** A
+    /// store answering `LOCKED` drives `record_failure(SecretsLocked)` on every
+    /// tick, and that doubles `next_due_at` up to `MAX_BACKOFF_LEVEL` — 64x,
+    /// over five hours at the 300-second default.
+    ///
+    /// **`backoff_level` and `last_failure` are deliberately left alone.**
+    /// Clearing `last_failure` would promote a row that has not been re-fetched:
+    /// measured, an account whose last success was ten seconds before a
+    /// `SecretsLocked` failure jumps straight to `AccountState::Ok` with a stale
+    /// `fetched_at`, un-dimming a row §7.1 requires to be dimmed. It buys
+    /// nothing either — an account carrying any backoff last attempted at least
+    /// one interval ago, so the pull-forward alone makes it due on the next
+    /// 5-second tick. `record_success` clears both on the first poll that works.
+    /// §7.2's quarantine is untouched: `pull_forward` skips `e.quarantined`.
+    pub fn retry_all_now(&mut self) {
+        self.pull_forward();
     }
 
     /// Accounts that should be polled right now. **At most one** — global
@@ -429,8 +529,8 @@ impl<C: Clock> Scheduler<C> {
             // this process confirms it, regardless of age. Without this a
             // restart inside 2x the interval renders the cached number as a
             // live value (measured: a 60-second-old seed returns `Ok`, because
-            // `state()` only calls a value stale past `interval * 2`,
-            // scheduler.rs:496). `next_due_at` and `backoff_level` are still
+            // `state()` only calls a value stale past `interval * 2` — its
+            // `too_old` check). `next_due_at` and `backoff_level` are still
             // untouched: restoring a cache is not a poll.
             e.last_failure = Some(FailureKind::Network);
         }
@@ -440,11 +540,10 @@ impl<C: Clock> Scheduler<C> {
     ///
     /// Delegates to `seed` on purpose. A second entry point that also wrote
     /// `next_due_at = now` was measured to flatten the startup stagger `add()`
-    /// installs (scheduler.rs:261): with three accounts the wake times went
-    /// from 12:00:00 / 12:00:15 / 12:00:30 to all three at 12:00:00, and the
-    /// shipped guard test `seeding_does_not_make_an_account_due_earlier_than_
-    /// its_schedule` (scheduler.rs:899) could not see it because it names the
-    /// other function.
+    /// installs: with three accounts the wake times went from 12:00:00 /
+    /// 12:00:15 / 12:00:30 to all three at 12:00:00, and the shipped guard test
+    /// `seeding_does_not_make_an_account_due_earlier_than_its_schedule` could
+    /// not see it because it names the other function.
     pub fn seed_from_cache(&mut self, uuid: &str, snap: CachedSnapshot, current_fp: &str) {
         // §9.3: a fingerprint that does not match means "cannot verify", and an
         // unverified cache is not shown. This is ccstatusline #459 — stale
@@ -455,10 +554,11 @@ impl<C: Clock> Scheduler<C> {
         let now = self.clock.now();
         // User decision 3: never restore a window the data itself says has
         // rotated. `formatReset` prints the literal "now" for any `resets_at`
-        // in the past (src/lib/format.ts:43) and `Bar.svelte` renders the
-        // percentage beside it unconditionally, so a weekend-old snapshot would
-        // show a rotated window's old percentage as if it were current — the
-        // confidently-wrong-number failure CLAUDE.md names as the worst one.
+        // in the past (its `secs <= 0` early return in src/lib/format.ts) and
+        // `Bar.svelte` renders the percentage beside it unconditionally, so a
+        // weekend-old snapshot would show a rotated window's old percentage as
+        // if it were current — the confidently-wrong-number failure CLAUDE.md
+        // names as the worst one.
         let live: Vec<UsageWindow> =
             snap.windows.into_iter().filter(|w| w.resets_at > now).collect();
         // Nothing survived: leave the account `Loading` rather than restoring an
@@ -488,13 +588,14 @@ impl<C: Clock> Scheduler<C> {
 
     /// §6.4. The earliest instant a manual refresh may fire. `None` means "now".
     ///
-    /// §6.1's 180-second floor is enforced inside `due()` (scheduler.rs:334)
-    /// and inside `set_visible` (scheduler.rs:302), and deliberately **not**
-    /// inside `begin_poll`: the shipped test at scheduler.rs:826-834 requires a
-    /// re-claim immediately after `end_poll` with the clock unmoved. Manual
-    /// refresh never goes through `due()` (begin_poll's own doc, :346-349), so
-    /// it has to ask. Measured: begin_poll/end_poll/record_success can be
-    /// cycled once per simulated second while `due()` allows zero.
+    /// §6.1's 180-second floor is enforced inside `due()`'s `last_attempt_at`
+    /// check and inside `set_visible`'s pull-forward, and deliberately **not**
+    /// inside `begin_poll`: the shipped test
+    /// `a_second_poll_cannot_start_while_one_is_in_flight` requires a re-claim
+    /// immediately after `end_poll` with the clock unmoved. Manual refresh never
+    /// goes through `due()` (`begin_poll`'s own doc says so), so it has to ask.
+    /// Measured: begin_poll/end_poll/record_success can be cycled once per
+    /// simulated second while `due()` allows zero.
     pub fn earliest_manual_refresh(&self, uuid: &str) -> Option<DateTime<Utc>> {
         let e = self.entries.get(uuid)?;
         let floor = TimeDelta::seconds(PollPolicy::MIN_INTERVAL_SECS);
@@ -615,8 +716,9 @@ pub fn register_accounts<C: Clock>(
             // §7.2/§10.5: one strike survives a restart. Replaying the failure
             // is enough and needs no new API — `record_failure` is the only
             // writer of the in-memory flag and it returns before touching the
-            // backoff (scheduler.rs:390-394). Order against the seed above does
-            // not matter: `state()` checks `quarantined` first (:468).
+            // backoff (its `AuthDead` early return). Order against the seed
+            // above does not matter: `state()` checks `quarantined` before
+            // anything else.
             sched.record_failure(&a.uuid, FailureKind::AuthDead);
         }
     }
@@ -1324,5 +1426,160 @@ mod tests {
         assert!(s.earliest_manual_refresh("a").is_some(), "still inside the floor");
         c.advance_secs(2);
         assert_eq!(s.earliest_manual_refresh("a"), None, "the floor has passed");
+    }
+
+    /// The ceiling exists because chrono panics: measured on 0.4.45,
+    /// `PollPolicy::with_interval_secs(i64::MAX)` panicked with "TimeDelta::
+    /// seconds out of bounds", and `Utc::now() + TimeDelta::seconds(i64::MAX /
+    /// 1000)` panicked too — the second inside `record_success`, on the task
+    /// whose panic ends all polling for the process.
+    #[test]
+    fn an_interval_above_the_ceiling_is_clamped_rather_than_panicking() {
+        let p = PollPolicy::with_interval_secs(i64::MAX);
+        assert_eq!(p.interval().num_seconds(), PollPolicy::MAX_INTERVAL_SECS);
+        let (mut s, _c) = sched();
+        s.add("a");
+        s.set_policy(p);
+        assert!(s.begin_poll("a"));
+        s.record_success("a", win(10.0));
+        let p = PollPolicy::with_interval_secs(600);
+        assert_eq!(p.interval().num_seconds(), 600, "a legitimate value must still pass through");
+    }
+
+    #[test]
+    fn lowering_the_interval_pulls_a_pending_poll_forward() {
+        let (mut s, c) = sched();
+        s.add("a");
+        assert!(s.begin_poll("a"));
+        s.end_poll("a");
+        s.record_success("a", win(10.0));
+        let started = c.now();
+        assert_eq!(s.next_wake("a").unwrap(), started + PollPolicy::default().interval());
+
+        s.set_policy(PollPolicy::with_interval_secs(PollPolicy::MIN_INTERVAL_SECS));
+
+        assert_eq!(
+            s.next_wake("a").unwrap(),
+            started + TimeDelta::seconds(PollPolicy::MIN_INTERVAL_SECS),
+            "the new interval never reached the schedule"
+        );
+        c.advance_secs(PollPolicy::MIN_INTERVAL_SECS - 1);
+        assert!(s.due().is_empty(), "an interval change must not poll inside §6.1's floor");
+        c.advance_secs(1);
+        assert_eq!(s.due(), vec!["a"], "due once the new interval has passed");
+    }
+
+    #[test]
+    fn raising_the_interval_takes_effect_at_once() {
+        let (mut s, c) = sched();
+        s.add("a");
+        assert!(s.begin_poll("a"));
+        s.end_poll("a");
+        s.record_success("a", win(10.0));
+        let started = c.now();
+        s.set_policy(PollPolicy::with_interval_secs(3600));
+        assert_eq!(s.next_wake("a").unwrap(), started + TimeDelta::seconds(3600));
+    }
+
+    /// A settings change must not reset an exponential backoff earned against
+    /// an unreachable network. Measured: an assignment of `now + interval`
+    /// collapses a 19000-second wait to 180.
+    #[test]
+    fn changing_the_interval_does_not_reset_an_exponential_backoff() {
+        let (mut s, c) = sched();
+        s.add("a");
+        for _ in 0..8 {
+            assert!(s.begin_poll("a"));
+            s.end_poll("a");
+            s.record_failure("a", FailureKind::Network);
+            c.advance_secs(200);
+        }
+        let attempted = c.now() - TimeDelta::seconds(200);
+        s.set_policy(PollPolicy::with_interval_secs(PollPolicy::MIN_INTERVAL_SECS));
+        assert_eq!(
+            s.next_wake("a").unwrap(),
+            attempted + TimeDelta::seconds(PollPolicy::MIN_INTERVAL_SECS * 64),
+            "the backoff level was silently discarded by a settings change"
+        );
+    }
+
+    /// §6.2: the wait after a 429 is the server's, not a local preference.
+    #[test]
+    fn changing_the_interval_does_not_shorten_a_server_ordered_backoff() {
+        let (mut s, c) = sched();
+        s.add("a");
+        assert!(s.begin_poll("a"));
+        s.end_poll("a");
+        let started = c.now();
+        s.record_throttle("a", 300);
+        s.set_policy(PollPolicy::with_interval_secs(PollPolicy::MIN_INTERVAL_SECS));
+        assert_eq!(
+            s.next_wake("a").unwrap(),
+            started + TimeDelta::seconds(300),
+            "a settings change overrode the server's Retry-After"
+        );
+    }
+
+    /// The same invariant `restoring_a_cache_does_not_erase_the_startup_stagger`
+    /// pins for the cache path. Measured: `min(now + interval)` collapses
+    /// accounts 13-16 of 16 onto one instant at the floor.
+    #[test]
+    fn changing_the_interval_does_not_erase_the_startup_stagger() {
+        let (mut s, _c) = sched();
+        for id in ["a", "b", "c"] {
+            s.add(id);
+        }
+        let stagger = PollPolicy::default().stagger();
+        assert!(stagger > TimeDelta::zero(), "a zero stagger would make this test catch nothing");
+        let a = s.next_wake("a").unwrap();
+        s.set_policy(PollPolicy::with_interval_secs(1800));
+        assert_eq!(s.next_wake("a").unwrap(), a);
+        assert_eq!(s.next_wake("b").unwrap() - a, stagger);
+        assert_eq!(s.next_wake("c").unwrap() - a, stagger * 2);
+    }
+
+    #[test]
+    fn set_policy_does_not_resurrect_a_quarantined_account() {
+        let (mut s, c) = sched();
+        s.add("a");
+        assert!(s.begin_poll("a"));
+        s.end_poll("a");
+        s.record_failure("a", FailureKind::AuthDead);
+        let before = s.next_wake("a").unwrap();
+        s.set_policy(PollPolicy::with_interval_secs(PollPolicy::MIN_INTERVAL_SECS));
+        assert_eq!(s.next_wake("a").unwrap(), before);
+        c.advance_secs(100_000);
+        assert!(s.due().is_empty(), "a quarantined account was made due again");
+    }
+
+    #[test]
+    fn a_remedy_makes_a_backed_off_account_due_again_without_breaking_the_floor() {
+        let (mut s, c) = sched();
+        s.add("a");
+        for _ in 0..4 {
+            assert!(s.begin_poll("a"));
+            s.record_failure("a", FailureKind::SecretsLocked);
+            s.end_poll("a");
+            c.advance_secs(1);
+        }
+        assert!(s.due().is_empty(), "premise: the backoff has pushed the poll far out");
+        let last_attempt = c.now() - TimeDelta::seconds(1);
+
+        s.retry_all_now();
+        // The floor half is asserted on `next_wake`, NOT on `due()`. `due()`
+        // re-applies the same floor itself (its `last_attempt_at` predicate), so
+        // it answers "empty" even when the pull-forward has dropped the floor
+        // entirely — measured, and it is why the shipped
+        // `becoming_visible_never_polls_inside_the_floor` also survives that
+        // mutation.
+        assert_eq!(
+            s.next_wake("a"),
+            Some(last_attempt + TimeDelta::seconds(PollPolicy::MIN_INTERVAL_SECS)),
+            "the remedy pulled the next poll inside §6.1's floor"
+        );
+        assert!(s.due().is_empty(), "and it is not due yet");
+
+        c.advance_secs(PollPolicy::MIN_INTERVAL_SECS);
+        assert_eq!(s.due(), vec!["a"], "the account never became due again after the remedy");
     }
 }

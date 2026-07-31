@@ -1,3 +1,4 @@
+import { emit } from '@tauri-apps/api/event'
 import { clearMocks, mockIPC, mockWindows } from '@tauri-apps/api/mocks'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 // Imported at module scope on purpose. `getCurrentWindow()` reads
@@ -5,7 +6,18 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 // if it were ever hoisted back out of the mousedown handler this import alone
 // would fail the whole file — which is the failure `npm run dev` in a plain
 // browser would otherwise hit.
-import { enableDrag, isSettingsWindow, openSettings } from './ipc'
+import {
+  beginLogin,
+  enableDrag,
+  isSettingsWindow,
+  lastResponse,
+  onAccountsChanged,
+  onAuthFailed,
+  openSettings,
+  renameAccount,
+  setSettings,
+} from './ipc'
+import type { RawResponse, SettingsView } from './types'
 
 /**
  * Records every IPC command the real `@tauri-apps/api` code path emits, so the
@@ -18,6 +30,24 @@ function recordIpc(labels: string[]): Array<{ cmd: string; label: unknown }> {
     calls.push({ cmd, label: (args as { label?: unknown } | undefined)?.label })
     if (cmd === 'plugin:window|get_all_windows') return labels
     return null
+  })
+  return calls
+}
+
+type IpcCall = { cmd: string; args: Record<string, unknown> }
+
+/**
+ * A second recorder, deliberately **not** a widening of `recordIpc`: the three
+ * `describe` blocks below assert on exact arrays of `{ cmd, label }`, so giving
+ * that helper a whole-`args` field would rewrite assertions this step does not
+ * own. The command wrappers are contracts about argument *shape*, which is the
+ * one thing `recordIpc` throws away.
+ */
+function recordArgs(reply: (cmd: string) => unknown = () => null): IpcCall[] {
+  const calls: IpcCall[] = []
+  mockIPC((cmd, args) => {
+    calls.push({ cmd, args: (args ?? {}) as Record<string, unknown> })
+    return reply(cmd)
   })
   return calls
 }
@@ -179,5 +209,108 @@ describe('openSettings', () => {
 
     expect(warn).toHaveBeenCalledOnce()
     expect(calls.map((c) => c.cmd)).toEqual(['plugin:window|get_all_windows'])
+  })
+})
+
+/**
+ * `mockIPC` runs the wrapper only — no `#[tauri::command]` body executes here,
+ * so none of this stands in for the Rust-side tests. What it pins is the two
+ * halves of the contract a webview can get wrong silently: the command name and
+ * the argument shape. A misspelled key reaches the user as a command that
+ * rejects at runtime with nothing on the JS side to catch it.
+ */
+describe('command wrappers', () => {
+  it('beginLogin invokes the begin_login command with no arguments and returns the URL', async () => {
+    const url = 'https://claude.ai/oauth/authorize?code_challenge=abc'
+    const calls = recordArgs((cmd) => (cmd === 'begin_login' ? url : null))
+
+    await expect(beginLogin()).resolves.toBe(url)
+
+    expect(calls).toEqual([{ cmd: 'begin_login', args: {} }])
+  })
+
+  // Tauri v2 maps a camelCase key on this side onto the snake_case parameter of
+  // the command. This is the only multi-word argument the settings window
+  // sends, so it is the only place that mapping is exercised at all.
+  it('setSettings sends the interval under the camelCase key Tauri maps', async () => {
+    const view: SettingsView = {
+      poll_interval_secs: 300,
+      min_interval_secs: 180,
+      max_interval_secs: 3600,
+      warning: null,
+      writable: true,
+    }
+    const calls = recordArgs((cmd) => (cmd === 'set_settings' ? view : null))
+
+    await expect(setSettings(300)).resolves.toEqual(view)
+
+    expect(calls).toEqual([{ cmd: 'set_settings', args: { pollIntervalSecs: 300 } }])
+  })
+
+  it('renameAccount sends the uuid and the label, in that shape', async () => {
+    const calls = recordArgs()
+
+    await renameAccount('acct-1', 'Work')
+
+    expect(calls).toEqual([{ cmd: 'rename_account', args: { uuid: 'acct-1', label: 'Work' } }])
+  })
+
+  it('lastResponse returns the captured response keyed by uuid', async () => {
+    const captured: RawResponse = {
+      captured_at: '2026-07-31T09:00:00Z',
+      status: 200,
+      truncated: false,
+      body: '{"five_hour":{"utilization":42}}',
+    }
+    const calls = recordArgs((cmd) => (cmd === 'last_response' ? captured : null))
+
+    await expect(lastResponse('acct-1')).resolves.toEqual(captured)
+
+    expect(calls).toEqual([{ cmd: 'last_response', args: { uuid: 'acct-1' } }])
+  })
+
+  // `null` means "nothing captured for this account yet", which the debug panel
+  // renders differently from an empty body. A `??` default anywhere on this
+  // path would erase that distinction — CLAUDE.md's never-demote rule.
+  it('lastResponse passes a null capture through unchanged', async () => {
+    recordArgs()
+
+    await expect(lastResponse('acct-1')).resolves.toBeNull()
+  })
+})
+
+describe('event subscriptions', () => {
+  /**
+   * `shouldMockEvents` makes `listen`/`emit` round-trip inside the mock, so
+   * these assert delivery rather than inspecting the arguments of
+   * `plugin:event|listen`. A wrapper subscribed to the wrong event name then
+   * fails by receiving nothing, which is exactly how it would fail in the app.
+   */
+  const withEvents = (): void => {
+    mockIPC(() => null, { shouldMockEvents: true })
+  }
+
+  // The refresh path that does not traverse the poll loop's visibility gate.
+  // Until this task nothing listened for `accounts://changed` at all, so
+  // "add an account and see it in the widget" rested on WKWebView's
+  // `visibilityState` behaviour.
+  it('onAccountsChanged subscribes to the event the commands emit', async () => {
+    withEvents()
+    const fn = vi.fn()
+    await onAccountsChanged(fn)
+
+    await emit('accounts://changed')
+
+    expect(fn).toHaveBeenCalledOnce()
+  })
+
+  it('onAuthFailed hands the callback the message, not the event envelope', async () => {
+    withEvents()
+    const fn = vi.fn()
+    await onAuthFailed(fn)
+
+    await emit('auth://failed', 'the login timed out')
+
+    expect(fn).toHaveBeenCalledExactlyOnceWith('the login timed out')
   })
 })

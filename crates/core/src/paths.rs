@@ -27,3 +27,16 @@ pub fn config_dir() -> PathBuf {
 pub fn accounts_file() -> PathBuf {
     config_dir().join("accounts.json")
 }
+
+/// User settings. §9.1 puts these beside `accounts.json` in the OS config
+/// directory. Tokens never live here — `secrets` owns those.
+pub fn settings_file() -> PathBuf {
+    config_dir().join("settings.json")
+}
+
+/// §9.2's encrypted-file fallback. Only reached when no OS keychain is
+/// usable; `unlock_secrets` is the one caller, because opening it needs a
+/// passphrase the user types.
+pub fn secrets_file() -> PathBuf {
+    config_dir().join("secrets.enc")
+}
