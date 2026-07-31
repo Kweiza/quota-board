@@ -5,6 +5,15 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 
+[features]
+# Serves the frontend from the asset store embedded in the binary instead of
+# fetching `devUrl`. **Without this the shipped app loads http://localhost:5173**
+# — a dev server that does not exist on a user's machine — and the widget window
+# is transparent with no decorations, so it renders as nothing at all, with no
+# error anywhere. Measured: a `tauri build` of the tree before this feature
+# existed produced a binary containing `localhost:5173` and none of the bundle.
+custom-protocol = ["tauri/custom-protocol"]
+
 [build-dependencies]
 tauri-build = { version = "2.6.3", features = [] }
 
