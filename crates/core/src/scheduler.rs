@@ -834,6 +834,33 @@ pub fn persist_quarantine(
     Ok(true)
 }
 
+/// Records the time of a successful poll in the account metadata file.
+/// `Ok(false)` means there was no such account and nothing was written.
+///
+/// docs/design.md:636 lists `last_ok_at` in that file, but nothing ever wrote
+/// it: every path either set `None` or copied the previous value forward, so a
+/// profile that had been polling successfully for weeks still read
+/// `"last_ok_at": null` on every account — a stored claim that the account had
+/// never once succeeded. Nothing reads the field yet, which is why this went
+/// unnoticed; a value that is wrong only when someone finally looks is still
+/// wrong.
+///
+/// Writes on every success rather than diffing first, because the value changes
+/// every time. `AccountStore::flush` is temp-file-plus-rename, so the raised
+/// write frequency cannot tear the file (accounts.rs:143-160).
+pub fn persist_last_ok(
+    accounts: &mut AccountStore,
+    uuid: &str,
+    at: DateTime<Utc>,
+) -> Result<bool, AccountError> {
+    let Some(mut a) = accounts.list().iter().find(|a| a.uuid == uuid).cloned() else {
+        return Ok(false);
+    };
+    a.last_ok_at = Some(at);
+    accounts.upsert(a)?;
+    Ok(true)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1479,6 +1506,48 @@ mod tests {
         assert!(
             reloaded.list()[0].quarantined,
             "the quarantine never reached the disk — it dies with the process"
+        );
+        std::fs::remove_file(&path).ok();
+    }
+
+    /// Measured on a real profile: three accounts that had all polled
+    /// successfully, and `accounts.json` read `"last_ok_at": null` for every
+    /// one of them. docs/design.md:636 puts the field in that file, so a
+    /// permanent null there is a stored statement that no poll has ever
+    /// worked.
+    #[test]
+    fn a_successful_poll_writes_the_time_through_to_the_account_file() {
+        let mut path = std::env::temp_dir();
+        path.push(format!("quota-lastok-{}-{:016x}.json", std::process::id(), rand::random::<u64>()));
+        let _ = std::fs::remove_file(&path);
+
+        let at: DateTime<Utc> = "2026-07-31T11:41:03.891055Z".parse().unwrap();
+        let mut store = AccountStore::load(&path).unwrap();
+        let mut renamed = account("a", false);
+        renamed.display_label = "work".into();
+        store.upsert(renamed).unwrap();
+
+        assert!(persist_last_ok(&mut store, "a", at).unwrap(), "the account exists, so it writes");
+        assert!(
+            !persist_last_ok(&mut store, "unknown", at).unwrap(),
+            "an unknown uuid is a no-op"
+        );
+
+        let reloaded = AccountStore::load(&path).unwrap();
+        assert_eq!(
+            reloaded.list()[0].last_ok_at,
+            Some(at),
+            "the successful poll never reached the disk"
+        );
+        // The same trap `persist_quarantine` has: this rewrites a whole account
+        // record, so a field it does not mean to touch is one it can erase.
+        assert_eq!(
+            reloaded.list()[0].display_label, "work",
+            "recording the poll time overwrote the user's rename"
+        );
+        assert!(
+            !reloaded.list()[0].quarantined,
+            "recording the poll time changed the quarantine flag"
         );
         std::fs::remove_file(&path).ok();
     }
