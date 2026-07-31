@@ -126,3 +126,15 @@ export interface ManualFallback {
   /** Shown verbatim: it is written for the user, not for a log. */
   reason: string
 }
+
+/**
+ * Mirrors `AutostartView` in `src-tauri/src/commands.rs`. Change both together.
+ *
+ * `writable` is false in a development build, where enabling would register the
+ * build directory instead of an installed app (docs/design.md §11.3). Same
+ * shape as `SettingsView.writable` and read the same way.
+ */
+export interface AutostartView {
+  enabled: boolean
+  writable: boolean
+}

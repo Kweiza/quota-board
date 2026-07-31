@@ -6,6 +6,7 @@
   import { queriesPerDay } from '../lib/format'
   import {
     beginLogin,
+    getAutostart,
     getSettings,
     lastResponse,
     listAccounts,
@@ -16,6 +17,7 @@
     removeAccount,
     renameAccount,
     reorderAccounts,
+    setAutostart,
     setSettings,
     storeStatus,
     submitManualCode,
@@ -23,6 +25,7 @@
   } from '../lib/ipc'
   import type {
     AccountView,
+    AutostartView,
     LoginUrls,
     ManualFallback,
     RawResponse,
@@ -99,6 +102,39 @@
   let view: SettingsView | null = null
   let intervalSecs: number | null = null
 
+  /** §11.3. `null` until the first read answers; never assumed either way. */
+  let autostart: AutostartView | null = null
+
+  async function toggleAutostart(e: Event): Promise<void> {
+    // Captured before the first await: `currentTarget` is null once the event
+    // has finished dispatching, and the catch below needs the element.
+    const box = e.currentTarget as HTMLInputElement
+    const wanted = box.checked
+    try {
+      // The answer is what the OS reports afterwards, not what was asked for.
+      autostart = await setAutostart(wanted)
+      error = null
+      // Corrected by hand on **this** path too, not only on refusal. When the
+      // OS declines quietly the answer comes back equal to the value already
+      // rendered, so `checked={autostart.enabled}` writes nothing — and the box
+      // keeps the position the click gave it while the state says the opposite.
+      // Measured: the test for this failed against a version that only fixed
+      // the catch.
+      box.checked = autostart.enabled
+    } catch (err) {
+      error = String(err)
+      // A refused change must not stay on screen looking applied. **The DOM has
+      // to be corrected by hand**: the click moved the checkbox itself, and
+      // re-rendering `checked={autostart.enabled}` from a value that has not
+      // changed writes nothing, so the box would keep the position the user
+      // put it in while the state says otherwise. Measured — the test for this
+      // failed against a version that reassigned a fresh object instead.
+      box.checked = autostart?.enabled ?? false
+      // `autostart` is deliberately left alone: the command failed, so nothing
+      // is known about the OS state that was not known before it was called.
+    }
+  }
+
   let status: StoreStatus | null = null
   let passphrase = ''
   let busy = false
@@ -167,6 +203,13 @@
       try {
         view = await getSettings()
         intervalSecs = view.poll_interval_secs
+      } catch (e) {
+        error = String(e)
+      }
+    })()
+    void (async () => {
+      try {
+        autostart = await getAutostart()
       } catch (e) {
         error = String(e)
       }
@@ -455,6 +498,28 @@
         <p class="warn">
           The settings file cannot be written by this build, so the interval
           cannot be changed here.
+        </p>
+      {/if}
+    {/if}
+  </section>
+
+  <!-- docs/design.md §11.3. LaunchAgent on macOS, XDG autostart on Linux, and
+       a per-user HKCU Run entry on Windows — never HKLM, so no elevation. -->
+  <section>
+    <h2>Start at login</h2>
+    {#if autostart}
+      <label for="autostart">Launch quota-board when I log in</label>
+      <input
+        id="autostart"
+        type="checkbox"
+        checked={autostart.enabled}
+        disabled={!autostart.writable}
+        on:change={toggleAutostart}
+      />
+      {#if !autostart.writable}
+        <p class="warn">
+          This is a development build, so this cannot be changed here — it would
+          register the build directory rather than an installed app.
         </p>
       {/if}
     {/if}

@@ -5,6 +5,7 @@ import { WebviewWindow } from '@tauri-apps/api/webviewWindow'
 import type {
   AccountState,
   AccountView,
+  AutostartView,
   LoginUrls,
   ManualFallback,
   RawResponse,
@@ -83,6 +84,13 @@ export const beginLogin = (): Promise<LoginUrls> => invoke('begin_login')
 /** §10.3's paste path. Rejects with a sentence meant for the user. */
 export const submitManualCode = (pasted: string): Promise<void> =>
   invoke('submit_manual_code', { pasted })
+
+/** docs/design.md §11.3. */
+export const getAutostart = (): Promise<AutostartView> => invoke('get_autostart')
+
+/** Answers with the state the OS reports afterwards, which can differ. */
+export const setAutostart = (enabled: boolean): Promise<AutostartView> =>
+  invoke('set_autostart', { enabled })
 
 export const removeAccount = (uuid: string): Promise<void> =>
   invoke('remove_account', { uuid })
