@@ -3,7 +3,9 @@ use quota_core::accounts::{Account, AccountStore};
 use quota_core::auth::pkce::AuthConfig;
 use quota_core::auth::stored::{ensure_fresh, RefreshLocks};
 use quota_core::auth::token::ReqwestHttp;
-use quota_core::scheduler::{persist_quarantine, FailureKind, Scheduler, SystemClock};
+use quota_core::scheduler::{
+    persist_last_ok, persist_quarantine, FailureKind, Scheduler, SystemClock,
+};
 use quota_core::secrets::{SecretError, SecretStore};
 use quota_core::settings::SettingsStore;
 use quota_core::snapshots::{fingerprint, save as save_snapshot};
@@ -451,6 +453,10 @@ impl AppState {
                     sched.record_success(uuid, windows, credit);
                     sched.snapshot(uuid, &fp)
                 };
+                // Taken from the snapshot rather than read off the clock again,
+                // so the file and the screen cannot disagree about when this
+                // poll happened: `record_success` already stamped it.
+                let polled_at = snap.as_ref().map(|s| s.fetched_at);
                 // Lock released before touching the filesystem.
                 if let Some(snap) = snap {
                     let path = self.snapshots_path.clone();
@@ -464,6 +470,16 @@ impl AppState {
                     // next restart.
                     if let Ok(Err(e)) = written {
                         eprintln!("{uuid}: the snapshot cache could not be written: {e}");
+                    }
+                }
+                // §9.1's metadata file. Taken *after* the scheduler lock is
+                // released, in the scheduler-then-accounts order `record` uses:
+                // the two are never held together, which is what the deadlock
+                // test below pins.
+                if let Some(at) = polled_at {
+                    let mut accounts = self.accounts.lock().await;
+                    if let Err(e) = persist_last_ok(&mut accounts, uuid, at) {
+                        eprintln!("{uuid}: the successful poll could not be recorded: {e}");
                     }
                 }
             }
