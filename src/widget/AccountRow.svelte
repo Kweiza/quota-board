@@ -1,6 +1,6 @@
 <script lang="ts">
   import Bar from './Bar.svelte'
-  import { relativeAge } from '../lib/format'
+  import { relativeAge, untilHhMm } from '../lib/format'
   import type { AccountView } from '../lib/types'
 
   export let account: AccountView
@@ -15,14 +15,6 @@
     (w) => w.window_id.startsWith('weekly') || w.window_id === 'seven_day',
   )
   $: isStale = state.kind === 'stale'
-
-  /** docs/design.md §7.1 fixes this as "throttled, after HH:MM" — a locale string is wrong. */
-  function untilHhMm(iso: string): string {
-    const d = new Date(iso)
-    const hh = String(d.getHours()).padStart(2, '0')
-    const mm = String(d.getMinutes()).padStart(2, '0')
-    return `${hh}:${mm}`
-  }
 </script>
 
 <div class="account" class:stale={isStale}>

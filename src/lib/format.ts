@@ -50,6 +50,28 @@ export function queriesPerDay(intervalSecs: number | null, accountCount: number)
 }
 
 /**
+ * docs/design.md §7.1 fixes this as "throttled, after HH:MM" — a locale string
+ * is wrong.
+ *
+ * It lives here rather than in `src/widget/AccountRow.svelte` because both
+ * windows say it: the widget row renders §7.1's state, and the settings window
+ * renders §6.4's refusal of a manual refresh. Two copies of a string the spec
+ * pins is the two-sources-disagree hazard §7.1 exists to prevent — the same
+ * reasoning the `AccountView` doc comment in `src-tauri/src/commands.rs` uses
+ * to justify keeping no second copy of `quarantined` on the wire.
+ *
+ * Wall clock in the **user's** zone, which is why `getHours`/`getMinutes` and
+ * not the UTC pair: the instant is transmitted as UTC, but "after 14:05" is
+ * only actionable if it reads off the clock the user is looking at.
+ */
+export function untilHhMm(iso: string): string {
+  const d = new Date(iso)
+  const hh = String(d.getHours()).padStart(2, '0')
+  const mm = String(d.getMinutes()).padStart(2, '0')
+  return `${hh}:${mm}`
+}
+
+/**
  * docs/design.md §8.1. The unit groups are separated by a space and the text is
  * variable width; Task 15 gives the column a fixed width in CSS instead. Zero
  * padding the leading units would produce readings like "0d 00h 00m".

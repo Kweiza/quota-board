@@ -4,12 +4,25 @@ import { clearMocks, mockIPC } from '@tauri-apps/api/mocks'
 import { tick } from 'svelte'
 import { afterEach, describe, expect, it } from 'vitest'
 import Settings from './Settings.svelte'
-import type { AccountView, RawResponse, SettingsView, StoreStatus } from '../lib/types'
+import type {
+  AccountState,
+  AccountView,
+  RawResponse,
+  SettingsView,
+  StoreStatus,
+} from '../lib/types'
 
 type IpcCall = { cmd: string; args: Record<string, unknown> }
 
 interface Backend {
   accounts?: AccountView[]
+  /**
+   * What `refresh_account` answers, one entry per call; the last entry repeats
+   * once the list runs out. A list rather than a single value because §6.4's
+   * refusal is an `Ok` answer, not a rejection, so "refused, then allowed" is
+   * an ordinary two-call sequence and no other field could express it.
+   */
+  refreshStates?: AccountState[]
   /** What `get_settings` answers with. */
   settings?: SettingsView
   /** What `set_settings` answers with — the value the backend *applied*. */
@@ -61,11 +74,17 @@ const store = (kind: StoreStatus['kind'], exists: boolean): StoreStatus => ({
  */
 function mockBackend(b: Backend = {}): IpcCall[] {
   const calls: IpcCall[] = []
+  let refreshes = 0
   mockIPC((cmd, args) => {
     calls.push({ cmd, args: (args ?? {}) as Record<string, unknown> })
     switch (cmd) {
       case 'list_accounts':
         return b.accounts ?? []
+      case 'refresh_account': {
+        // The real command always answers with a state, never with null.
+        const states = b.refreshStates ?? [{ kind: 'loading' } as AccountState]
+        return states[Math.min(refreshes++, states.length - 1)]
+      }
       case 'get_settings':
         return b.settings ?? settings(300)
       case 'set_settings':
@@ -212,6 +231,153 @@ describe('Settings error banner', () => {
 
     expect(screen.getByText('the login timed out')).toBeTruthy()
     expect(screen.getByRole('alert')).toBeTruthy()
+  })
+})
+
+describe('Settings manual refresh', () => {
+  /**
+   * **Always in the future**, because that is the command's contract:
+   * `Scheduler::earliest_manual_refresh` answers `last_attempt_at + floor` only
+   * `.filter(|t| *t > now)`, so a `Throttled { until }` reaching this window
+   * can never already have passed. A fixed literal here was a fixture that the
+   * real API cannot produce, and it went red the moment the window learned to
+   * retire an expired note.
+   *
+   * The expected wall clock is derived from the same `Date`, so this stays
+   * deterministic and zone-independent — `untilHhMm` is deliberately local-time
+   * (§7.1), so a UTC literal would assert the machine's zone instead.
+   */
+  const untilIn = (minutes: number): { iso: string; hhmm: string } => {
+    const d = new Date(Date.now() + minutes * 60_000)
+    const hh = String(d.getHours()).padStart(2, '0')
+    const mm = String(d.getMinutes()).padStart(2, '0')
+    return { iso: d.toISOString(), hhmm: `${hh}:${mm}` }
+  }
+
+  const refreshButtons = async (): Promise<HTMLElement[]> => {
+    // The rows only exist after the awaited `list_accounts` resolves.
+    await waitFor(() =>
+      expect(screen.getAllByRole('button', { name: 'Refresh now' })).toHaveLength(two.length),
+    )
+    return screen.getAllByRole('button', { name: 'Refresh now' })
+  }
+
+  it('says when a refused Refresh now becomes available, on the row that was refused', async () => {
+    // Observed: "Refresh now does not work. I press it and the capture time
+    // never changes. Only the polling interval changes it." §6.1's floor
+    // refuses the button for 180 of every 300 seconds — correctly — and §6.4
+    // requires that be reported. `refresh_account` does report it, as
+    // `Throttled { until }`; this window discarded the return value, so the
+    // press was silent. Re-reading the list cannot recover it either: the
+    // command returns early *without touching the scheduler*, so
+    // `list_accounts` afterwards reports the account's ordinary state.
+    const t = untilIn(3)
+    mockBackend({ accounts: two, refreshStates: [{ kind: 'throttled', until: t.iso }] })
+    render(Settings)
+
+    const buttons = await refreshButtons()
+    await fireEvent.click(buttons[1])
+
+    const note = await screen.findByText(`throttled, available after ${t.hhmm}`)
+    // Per row, not per window: with three accounts a single line above the
+    // list cannot say which press was refused.
+    expect(note.closest('li')?.textContent).toContain('home@example.com')
+    expect(screen.getAllByText(/throttled, available after/)).toHaveLength(1)
+    // Not the `warn` banner. A throttle is the rate limiter working as
+    // designed, and labelling expected behaviour an error is its own kind of
+    // confidently wrong.
+    expect(screen.queryByRole('alert')).toBeNull()
+  })
+
+  it('retires the refusal once the time it named has passed', async () => {
+    // The note is a present-tense claim and this window is hidden rather than
+    // destroyed, so without an expiry it outlives every visit: press Refresh,
+    // close Settings, reopen tomorrow, and the row still says "available after
+    // 09:05". That is the same defect this session fixed three times over.
+    //
+    // Removing it is not the same as announcing availability — the automatic
+    // poll stamps `last_attempt_at` too, so the real floor has moved. Silence
+    // is the honest state between presses.
+    // Seconds, not the usual minutes: the component arms a real `setTimeout`
+    // from the answer, and this test is about it being armed at all. The
+    // rendered HH:MM is whatever minute that lands in.
+    const soon = new Date(Date.now() + 1_200)
+    mockBackend({
+      accounts: two,
+      refreshStates: [{ kind: 'throttled', until: soon.toISOString() }],
+    })
+    render(Settings)
+
+    const buttons = await refreshButtons()
+    await fireEvent.click(buttons[0])
+    expect(await screen.findByText(/throttled, available after/)).toBeTruthy()
+
+    await waitFor(() => expect(screen.queryByText(/throttled, available after/)).toBeNull(), {
+      timeout: 4000,
+      interval: 100,
+    })
+  }, 6000)
+
+  it('does not resurrect a refusal on an account that was removed and added back', async () => {
+    // `account.uuid` is the stable primary key (§9.3), so removing an account
+    // and adding the same one back reuses its uuid. A note keyed by uuid and
+    // never reconciled would reappear on a fresh row, quoting a wall clock from
+    // a session the user does not remember.
+    const t = untilIn(30)
+    const calls = mockBackend({
+      accounts: two,
+      refreshStates: [{ kind: 'throttled', until: t.iso }],
+    })
+    render(Settings)
+
+    const buttons = await refreshButtons()
+    await fireEvent.click(buttons[0])
+    expect(await screen.findByText(`throttled, available after ${t.hhmm}`)).toBeTruthy()
+
+    // Remove it, then add the SAME uuid back. Removing alone proves nothing:
+    // the row disappears with the account, so the note is invisible either way
+    // and the assertion passes against a window that never forgot it —
+    // measured, the first version of this test stayed green with the
+    // reconciliation deleted. The resurrection is the defect.
+    const removed = two.shift() as AccountView
+    try {
+      await whenSubscribed(calls)
+      await waitFor(() => expect(screen.getAllByRole('button', { name: 'Refresh now' }))
+        .toHaveLength(1))
+
+      two.unshift(removed)
+      await whenSubscribed(calls)
+      await waitFor(() => expect(screen.getAllByRole('button', { name: 'Refresh now' }))
+        .toHaveLength(2))
+      expect(screen.queryByText(/throttled, available after/)).toBeNull()
+    } finally {
+      if (!two.some((a) => a.uuid === removed.uuid)) two.unshift(removed)
+    }
+  })
+
+  it('drops the refusal from the row as soon as a later press actually fires', async () => {
+    // The note is cleared by the answer to a press, never by a timer reaching
+    // `until`: `Scheduler::begin_poll` stamps `last_attempt_at` for the
+    // automatic poll too, so the floor moves forward while the note is on
+    // screen and a self-clearing note would offer budget nobody checked for.
+    const first = untilIn(4)
+    mockBackend({
+      accounts: two,
+      refreshStates: [
+        { kind: 'throttled', until: first.iso },
+        { kind: 'ok', windows: [], fetched_at: '2026-07-31T09:05:00Z' },
+      ],
+    })
+    render(Settings)
+
+    const buttons = await refreshButtons()
+    await fireEvent.click(buttons[0])
+    expect(await screen.findByText(`throttled, available after ${first.hhmm}`)).toBeTruthy()
+
+    await fireEvent.click(buttons[0])
+    await waitFor(() => expect(screen.queryByText(/throttled, available after/)).toBeNull())
+    // A press that fired is not a failure either.
+    expect(screen.queryByRole('alert')).toBeNull()
   })
 })
 

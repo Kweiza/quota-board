@@ -34,6 +34,58 @@
    */
   let accounts: AccountView[] = []
   let error: string | null = null
+  /**
+   * §6.4's refusal, per account: uuid → the instant a manual refresh may next
+   * fire. Not in `error`, because that banner is `warn` and reports failures —
+   * a refusal by §6.1's 180-second floor is the rate limiter working, and it is
+   * per-account, which a single line above the list cannot express.
+   *
+   * Written by a press on that row's own button, from the answer to that press.
+   * **Never treated as still true past its own `until`.** The note is a
+   * present-tense claim, this window is hidden rather than destroyed
+   * (`src-tauri/src/main.rs`'s close handler), so the component outlives any
+   * one visit: without an expiry, pressing Refresh, closing Settings and
+   * reopening it tomorrow still shows "available after 09:05". That is the
+   * defect this session already fixed three times over — a line that stayed
+   * after the state it described was gone.
+   *
+   * Dropping an expired note is **not** the same as announcing availability.
+   * `Scheduler::begin_poll` stamps `last_attempt_at` for the automatic poll
+   * too, so the loop pushes the real `until` forward while the note is on
+   * screen, and a note that *claimed* budget at the old instant would be
+   * CLAUDE.md's confidently-wrong display. Removing it claims nothing: the
+   * press stays the only moment the answer is known, and silence is the honest
+   * state between presses.
+   */
+  let throttledUntil: Record<string, string> = {}
+
+  /** Fires once per live note, at its own `until`, and removes just that one. */
+  let expiryTimers: Record<string, ReturnType<typeof setTimeout>> = {}
+
+  function forgetThrottle(uuid: string): void {
+    clearTimeout(expiryTimers[uuid])
+    delete expiryTimers[uuid]
+    if (!(uuid in throttledUntil)) return
+    const next = { ...throttledUntil }
+    delete next[uuid]
+    throttledUntil = next
+  }
+
+  function rememberThrottle(uuid: string, until: string): void {
+    clearTimeout(expiryTimers[uuid])
+    const next = { ...throttledUntil }
+    next[uuid] = until
+    throttledUntil = next
+    // `setTimeout` saturates above ~24.8 days; an `until` that far out would
+    // fire immediately and retire a note that is still true. The floor is 180
+    // seconds, so this only guards a malformed value.
+    const ms = new Date(until).getTime() - Date.now()
+    if (Number.isFinite(ms) && ms > 0 && ms < 2_147_483_647) {
+      expiryTimers[uuid] = setTimeout(() => forgetThrottle(uuid), ms)
+    } else {
+      forgetThrottle(uuid)
+    }
+  }
 
   let view: SettingsView | null = null
   let intervalSecs: number | null = null
@@ -63,6 +115,17 @@
   async function pullAccounts(): Promise<void> {
     try {
       accounts = await listAccounts()
+      // Retire notes for accounts that are gone. `account.uuid` is the stable
+      // primary key (§9.3), so removing an account and adding the same one back
+      // reuses its uuid — without this, a refusal from an earlier session
+      // reappears on a fresh row, quoting a wall clock the user never saw.
+      // Only on a successful read: the `catch` below deliberately keeps the
+      // last good list, and reconciling against a list we failed to fetch would
+      // clear every note instead.
+      const live = new Set(accounts.map((a) => a.uuid))
+      Object.keys(throttledUntil)
+        .filter((uuid) => !live.has(uuid))
+        .forEach(forgetThrottle)
     } catch (e) {
       // A failed read is not a reason to blank the list; the widget branch of
       // src/main.ts set that rule and it holds here for the same reason.
@@ -136,6 +199,10 @@
     destroyed = true
     unlisteners.forEach((fn) => fn())
     unlisteners = []
+    // Same reason the unlisteners are released here: closing this window is a
+    // hide, not a destroy, so anything left armed outlives every visit.
+    Object.values(expiryTimers).forEach(clearTimeout)
+    expiryTimers = {}
   })
 
   async function addAccount(): Promise<void> {
@@ -175,7 +242,20 @@
     // `refresh_account` emits `usage://updated`, which only the widget listens
     // for, so this window re-reads the list itself.
     void guard(async () => {
-      await refreshAccount(uuid)
+      const state = await refreshAccount(uuid)
+      // Observed: "Refresh now does not work — the capture time never
+      // changes." §6.1's floor refuses the button for 180 of every 300
+      // seconds, and §6.4 says report when it will be available. The command
+      // does: it answers `Throttled { until }`. Discarding that answer was the
+      // whole defect — the early return never touches the scheduler, so the
+      // `list_accounts` below reports the account's ordinary state and the
+      // refusal is unrecoverable once this value is dropped.
+      //
+      // Both helpers assign a fresh object rather than mutating: legacy-mode
+      // reactivity is driven by the assignment, so an in-place write would not
+      // repaint.
+      if (state.kind === 'throttled') rememberThrottle(uuid, state.until)
+      else forgetThrottle(uuid)
       await pullAccounts()
     })
   }
@@ -234,7 +314,8 @@
 
   <section>
     <h2>Accounts</h2>
-    <AccountList {accounts} onRemove={(uuid) => void guard(() => removeAccount(uuid))}
+    <AccountList {accounts} {throttledUntil}
+                 onRemove={(uuid) => void guard(() => removeAccount(uuid))}
                  onRename={rename} onMove={move} onRefresh={refresh} />
     {#if accounts.length === 0}
       <p class="hint">No accounts yet.</p>
