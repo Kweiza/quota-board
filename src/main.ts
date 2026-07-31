@@ -4,10 +4,12 @@ import { getCurrentWindow, LogicalSize } from '@tauri-apps/api/window'
 // own window; dropping it silently widens the document past 280px.
 import './app.css'
 import Widget from './widget/Widget.svelte'
+import Settings from './settings/Settings.svelte'
 import {
   inTauri,
   isSettingsWindow,
   listAccounts,
+  onAccountsChanged,
   onUsageUpdated,
   openSettings,
   setWidgetVisible,
@@ -45,35 +47,29 @@ function followContentHeight(root: HTMLElement): void {
   }).observe(root)
 }
 
-/**
- * A click on a remedy must not vanish silently while its owner task is
- * outstanding. **Neither remedy is Task 17's.** Re-login is Task 18's
- * `begin_login`, and Task 18 also owns the unlock prompt — it is the only task
- * with a settings surface to put a passphrase field on (§9.2 asks for one on
- * every run of the fallback store). If Task 18 does not take the unlock prompt,
- * the button must be removed rather than left dead: §7.1 makes that click the
- * only remedy `SECRETS_LOCKED` carries.
- */
-function pending(what: string): void {
-  console.warn(`quoata-board: ${what} is not wired up yet`)
-}
-
 const target = document.getElementById('app')!
 
 // Both windows load index.html; the query string in tauri.conf.json is what
 // tells them apart. An if/else rather than a ternary because only one branch
 // takes props (docs/design.md §8.4).
 if (isSettingsWindow()) {
-  // Task 18 mounts the real settings view here. Until then the window is
-  // routed and visibly identifiable, so the gear can be verified end to end.
-  target.textContent = 'Settings (Task 18)'
+  // Nothing else belongs in this branch. In particular no visibility
+  // reporting: both windows load index.html, and reporting this window's
+  // visibility into the widget's single gate would stop the widget polling the
+  // moment settings is closed (see the widget branch below).
+  mount(Settings, { target })
 } else {
   // The gear is the only route into the settings window (§8.4), so this
   // wiring is what makes that window reachable at all.
   widgetProps.onOpenSettings = () => void openSettings()
-  widgetProps.onRelogin = (uuid: string) => pending(`re-login for account ${uuid} (Task 18)`)
-  widgetProps.onUnlock = (uuid: string) =>
-    pending(`unlocking the token store for account ${uuid} (Task 18)`)
+  // §7.1 makes these clicks the only remedy AUTH_DEAD and SECRETS_LOCKED
+  // carry. Both lead to the settings window rather than acting here: the
+  // re-login needs the consent-screen note beside it (§10.2) and the unlock
+  // needs a passphrase field, and neither belongs in a 280px widget. It also
+  // keeps `opener:allow-open-url` in one capability instead of two —
+  // `src-tauri/capabilities/widget.json` grants it to nobody.
+  widgetProps.onRelogin = () => void openSettings()
+  widgetProps.onUnlock = () => void openSettings()
 
   // `props: widgetProps`, never `{ ...widgetProps }`: a spread copies the
   // values out of the `$state` proxy and the widget stops reacting to any
@@ -95,6 +91,12 @@ if (isSettingsWindow()) {
   if (inTauri()) {
     void pull()
     void onUsageUpdated(() => void pull())
+    // The path that does not go through the poll gate. `usage://updated` only
+    // arrives from a poll, and `due()` returns nothing while the widget is
+    // hidden — see `due()`'s own `!self.visible` early return, cited by name
+    // because this task inserts code above it. That is the state a login leaves
+    // the widget in, because it sends the user to a browser.
+    void onAccountsChanged(() => void pull())
 
     // §6.3. Registered inside the widget branch only. Both windows load
     // index.html (tauri.conf.json), so a listener at module scope would report

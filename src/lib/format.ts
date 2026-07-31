@@ -35,6 +35,21 @@ export function relativeAge(fetchedAt: Date, now: Date): string {
 }
 
 /**
+ * Rough daily query count for the settings window's interval hint.
+ *
+ * The guard is not defensive noise. Svelte's `bind:value` on
+ * `<input type="number">` sets the bound variable to `null` when the field is
+ * cleared (`to_number` returns `null` for `''`), and
+ * `Math.round((86400 / null) * 2)` is `Infinity`. Rendering "roughly Infinity
+ * queries per day" is CLAUDE.md's confidently-wrong-number failure in
+ * miniature.
+ */
+export function queriesPerDay(intervalSecs: number | null, accountCount: number): number {
+  if (!(Number(intervalSecs) > 0) || !(accountCount > 0)) return 0
+  return Math.round((86400 / Number(intervalSecs)) * accountCount)
+}
+
+/**
  * docs/design.md §8.1. The unit groups are separated by a space and the text is
  * variable width; Task 15 gives the column a fixed width in CSS instead. Zero
  * padding the leading units would produce readings like "0d 00h 00m".

@@ -14,6 +14,7 @@ tauri = { version = "2.11.5", features = ["tray-icon", "image-png", "macos-priva
 tauri-plugin-window-state = "2.4.1"
 tauri-plugin-autostart = "2.5.1"
 tauri-plugin-global-shortcut = "2.3.2"
+tauri-plugin-opener = "2"
 serde.workspace = true
 serde_json.workspace = true
 chrono.workspace = true

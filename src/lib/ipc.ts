@@ -2,7 +2,7 @@ import { invoke } from '@tauri-apps/api/core'
 import { listen, type UnlistenFn } from '@tauri-apps/api/event'
 import { getCurrentWindow } from '@tauri-apps/api/window'
 import { WebviewWindow } from '@tauri-apps/api/webviewWindow'
-import type { AccountView } from './types'
+import type { AccountState, AccountView, RawResponse, SettingsView, StoreStatus } from './types'
 
 /**
  * Manual dragging. `data-tauri-drag-region` is deliberately not used:
@@ -66,3 +66,56 @@ export const setWidgetVisible = (visible: boolean): Promise<void> =>
 
 export const onUsageUpdated = (fn: () => void): Promise<UnlistenFn> =>
   listen('usage://updated', fn)
+
+export const refreshAccount = (uuid: string): Promise<AccountState> =>
+  invoke('refresh_account', { uuid })
+
+export const beginLogin = (): Promise<string> => invoke('begin_login')
+
+export const removeAccount = (uuid: string): Promise<void> =>
+  invoke('remove_account', { uuid })
+
+export const renameAccount = (uuid: string, label: string): Promise<void> =>
+  invoke('rename_account', { uuid, label })
+
+export const reorderAccounts = (uuids: string[]): Promise<void> =>
+  invoke('reorder_accounts', { uuids })
+
+export const storeStatus = (): Promise<StoreStatus> => invoke('store_status')
+
+export const unlockSecrets = (passphrase: string): Promise<StoreStatus> =>
+  invoke('unlock_secrets', { passphrase })
+
+export const getSettings = (): Promise<SettingsView> => invoke('get_settings')
+
+/**
+ * The argument key is camelCase: Tauri v2 maps a camelCase key on the JS side
+ * onto the snake_case parameter of the command. The three wrappers above ship
+ * only single-word arguments, so nothing else in this file demonstrates it.
+ */
+export const setSettings = (pollIntervalSecs: number): Promise<SettingsView> =>
+  invoke('set_settings', { pollIntervalSecs })
+
+/**
+ * docs/design.md §5.5's retained body, for the settings window's debug panel.
+ * `null` means nothing has been captured for this account yet — **do not
+ * coerce it**; the panel renders the two differently.
+ */
+export const lastResponse = (uuid: string): Promise<RawResponse | null> =>
+  invoke('last_response', { uuid })
+
+/**
+ * The refresh path that does **not** depend on the visibility gate. The four
+ * mutating commands emit this, and until now nothing listened for it: the
+ * widget refreshes on `usage://updated`, whose poll-loop emitter is behind
+ * `due()`'s own `!self.visible` early return — cited by name rather than by
+ * line, because this task inserts code above it — and `begin_login`
+ * structurally sends the user to a browser, which is exactly the stimulus that
+ * clears that gate.
+ */
+export const onAccountsChanged = (fn: () => void): Promise<UnlistenFn> =>
+  listen('accounts://changed', fn)
+
+/** §10.3's flow completes in the background, so its failures arrive here. */
+export const onAuthFailed = (fn: (message: string) => void): Promise<UnlistenFn> =>
+  listen<string>('auth://failed', (e) => fn(e.payload))

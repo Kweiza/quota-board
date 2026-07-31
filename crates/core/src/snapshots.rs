@@ -66,10 +66,10 @@ pub fn load(path: &Path) -> HashMap<String, CachedSnapshot> {
 /// Reproduced twice: with accounts a and b registered and only a having
 /// succeeded, the rebuilt map was `["a"]`; and against a store answering
 /// `SecretError::Locked` — §9.2's ordinary screen-lock case, which
-/// scheduler.rs:474-491 calls "the normal case, not an edge one" — the file
-/// became literally `{}`. With more than one account, which is the entire
-/// premise of this product, §7.4's restore would only ever work for whichever
-/// account polled first. Removal happens only through `remove`.
+/// `Scheduler::state`'s `SecretsLocked` branch calls "the normal case, not an
+/// edge one" — the file became literally `{}`. With more than one account, the
+/// entire premise of this product, §7.4's restore would only ever work for
+/// whichever account polled first. Removal happens only through `remove`.
 pub fn save(path: &Path, uuid: &str, snap: &CachedSnapshot) -> std::io::Result<()> {
     let mut map = load(path);
     map.insert(uuid.to_string(), snap.clone());
