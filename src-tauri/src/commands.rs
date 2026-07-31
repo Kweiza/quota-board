@@ -1,6 +1,6 @@
 use crate::state::{AppState, StoreKind};
 use quota_core::auth::callback::Callback;
-use quota_core::auth::pkce::{begin, success_redirect};
+use quota_core::auth::pkce::{begin, success_redirect, PendingAuth};
 use quota_core::auth::stored::token_key;
 use quota_core::auth::token::{exchange_code, revoke, TokenSet};
 use quota_core::model::AccountState;
@@ -195,65 +195,77 @@ pub async fn begin_login(app: tauri::AppHandle) -> Result<String, String> {
             return;
         };
 
-        match exchange_code(&state.http, &state.cfg, &pending, code, returned_state).await {
-            Ok((tokens, Some(identity))) => {
-                // Serialization failure fails loudly. Falling through to the
-                // account write would register an account with no credential
-                // behind it: `ensure_fresh` would report `Missing`, that
-                // classifies to AUTH_DEAD, `record()` would persist the
-                // quarantine, and the user would be looking at a dead account
-                // produced by a login that appeared to succeed.
-                let blob = match serde_json::to_vec(&tokens) {
-                    Ok(b) => b,
-                    Err(e) => {
-                        let _ = handle
-                            .emit("auth://failed", format!("the token could not be serialized: {e}"));
-                        return;
-                    }
-                };
-                // Synchronous and able to block a real thread (timeout.rs:144-156),
-                // so it goes on a blocking thread rather than an async worker —
-                // the same principle `refresh_account` applies when it answers
-                // AUTH_EXPIRED instead of waiting on the refresh mutex.
-                let store = state.secrets();
-                let key = token_key(&identity.uuid);
-                let put = tauri::async_runtime::spawn_blocking(move || store.put(&key, &blob)).await;
-                match put {
-                    Ok(Ok(())) => {}
-                    Ok(Err(e)) => {
-                        let _ = handle
-                            .emit("auth://failed", format!("the token could not be stored: {e}"));
-                        return;
-                    }
-                    Err(e) => {
-                        let _ = handle
-                            .emit("auth://failed", format!("the token store task failed: {e}"));
-                        return;
-                    }
-                }
-
-                if let Err(e) = state
-                    .register_authenticated(&identity.uuid, &identity.email)
-                    .await
-                {
-                    let _ =
-                        handle.emit("auth://failed", format!("the account could not be saved: {e}"));
-                    return;
-                }
+        // This path reports both outcomes as events, because nobody is waiting
+        // on its return value — it runs in a detached task.
+        match complete_login(&state, &pending, code, returned_state).await {
+            Ok(()) => {
                 let _ = handle.emit("accounts://changed", ());
             }
-            Ok((_, None)) => {
-                // Without `account.uuid` there is no key. Never substitute the
-                // email (§9.3) — it is display-only and user-editable.
-                let _ = handle.emit("auth://failed", "the token response carried no account block");
-            }
             Err(e) => {
-                let _ = handle.emit("auth://failed", e.to_string());
+                let _ = handle.emit("auth://failed", e);
             }
         }
     });
 
     Ok(url)
+}
+
+/// Exchanges an authorization code, stores the token, and registers the
+/// account.
+///
+/// **Shared by both of §10.3's paths** — the loopback callback and the manual
+/// paste. They differ only in `pending.redirect_uri`, which `exchange_code`
+/// replays exactly as given, so nothing in here branches on which one is
+/// running. One copy is the point: every failure below is a case where doing
+/// the obvious thing instead would register a broken account, and a second copy
+/// would go stale on whichever path its author was not looking at.
+///
+/// **Reports neither outcome itself, and takes no `AppHandle`.** The two
+/// callers need different things: the detached loopback task has no return
+/// value anyone reads and must emit both outcomes, while `submit_manual_code`
+/// is a command whose rejection belongs in its own `Result` so the paste form
+/// can show it beside the field. Keeping `AppHandle` out is also what makes
+/// this function reachable from a test — `src-tauri` has no dev-dependency on
+/// `tauri`'s `test` feature, so anything holding a handle cannot be called
+/// without one.
+pub(crate) async fn complete_login(
+    state: &AppState,
+    pending: &PendingAuth,
+    code: &str,
+    returned_state: &str,
+) -> Result<(), String> {
+    let (tokens, identity) = exchange_code(&state.http, &state.cfg, pending, code, returned_state)
+        .await
+        .map_err(|e| e.to_string())?;
+    // Without `account.uuid` there is no key. Never substitute the email
+    // (§9.3) — it is display-only and user-editable.
+    let identity = identity.ok_or("the token response carried no account block")?;
+
+    // Serialization failure fails loudly. Falling through to the account write
+    // would register an account with no credential behind it: `ensure_fresh`
+    // would report `Missing`, that classifies to AUTH_DEAD, `record()` would
+    // persist the quarantine, and the user would be looking at a dead account
+    // produced by a login that appeared to succeed.
+    let blob = serde_json::to_vec(&tokens)
+        .map_err(|e| format!("the token could not be serialized: {e}"))?;
+
+    // Synchronous and able to block a real thread (timeout.rs:144-156), so it
+    // goes on a blocking thread rather than an async worker — the same
+    // principle `refresh_account` applies when it answers AUTH_EXPIRED instead
+    // of waiting on the refresh mutex.
+    let store = state.secrets();
+    let key = token_key(&identity.uuid);
+    tauri::async_runtime::spawn_blocking(move || store.put(&key, &blob))
+        .await
+        .map_err(|e| format!("the token store task failed: {e}"))?
+        .map_err(|e| format!("the token could not be stored: {e}"))?;
+
+    state
+        .register_authenticated(&identity.uuid, &identity.email)
+        .await
+        .map_err(|e| format!("the account could not be saved: {e}"))?;
+
+    Ok(())
 }
 
 #[tauri::command]
