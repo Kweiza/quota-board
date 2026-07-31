@@ -84,7 +84,7 @@ if (isSettingsWindow()) {
     } catch (e) {
       // A failed command is not a reason to blank the widget: the last list
       // stays on screen. Never demote to an empty or zero state.
-      console.error('quoata-board: list_accounts failed', e)
+      console.error('quota-board: list_accounts failed', e)
     }
   }
 
@@ -114,7 +114,7 @@ if (isSettingsWindow()) {
     // this would have gone unnoticed.
     const report = () =>
       setWidgetVisible(document.visibilityState === 'visible').catch((e: unknown) =>
-        console.error('quoata-board: set_widget_visible failed', e),
+        console.error('quota-board: set_widget_visible failed', e),
       )
     document.addEventListener('visibilitychange', report)
     // `pageshow` covers a restore from the back/forward cache, where

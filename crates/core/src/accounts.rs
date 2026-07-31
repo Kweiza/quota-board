@@ -177,7 +177,7 @@ mod tests {
         rand::fill(&mut rand_bytes[..]);
         let hex: String = rand_bytes.iter().map(|b| format!("{b:02x}")).collect();
         let mut p = std::env::temp_dir();
-        p.push(format!("quoata-accounts-{}-{n}-{hex}.json", std::process::id()));
+        p.push(format!("quota-accounts-{}-{n}-{hex}.json", std::process::id()));
         let _ = std::fs::remove_file(&p);
         p
     }

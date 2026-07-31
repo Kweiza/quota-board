@@ -20,7 +20,7 @@ impl KeychainStore {
     /// after that yields a context-free `NoDefaultStore`. This function catches
     /// and preserves that first error.
     pub fn probe(service: &str) -> Result<Self, SecretError> {
-        let entry = keyring::Entry::new(service, "__quoata_probe__").map_err(map_err)?;
+        let entry = keyring::Entry::new(service, "__quota_probe__").map_err(map_err)?;
         // Canary: only a real store can write, read, and delete successfully.
         entry.set_secret(b"canary").map_err(map_err)?;
         let read = entry.get_secret().map_err(map_err)?;

@@ -11,7 +11,7 @@ use std::sync::Mutex;
 /// A mismatch is silent: `ensure_fresh` returns `StoredTokenError::Missing`,
 /// which classifies to `AuthDead` (scheduler.rs:95) and quarantines every
 /// account on the first tick.
-pub const SERVICE: &str = "quoata-board";
+pub const SERVICE: &str = "quota-board";
 
 #[derive(Debug, thiserror::Error)]
 pub enum SecretError {

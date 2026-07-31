@@ -455,7 +455,7 @@ mod tests {
         let mut rand_bytes = [0u8; 8];
         rand::fill(&mut rand_bytes[..]);
         let mut p = std::env::temp_dir();
-        p.push(format!("quoata-test-{}-{n}-{}.enc", std::process::id(), to_hex(&rand_bytes)));
+        p.push(format!("quota-test-{}-{n}-{}.enc", std::process::id(), to_hex(&rand_bytes)));
         let _ = std::fs::remove_file(&p);
         p
     }

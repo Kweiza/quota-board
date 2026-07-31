@@ -4,7 +4,7 @@
 //!
 //! **This lives in the core, not in `src-tauri`.** Same reasoning as
 //! `snapshots.rs:1-11`: `src-tauri` has no test harness reachable from
-//! `cargo test -p quoata-core`, and this module decides what a display surface
+//! `cargo test -p quota-core`, and this module decides what a display surface
 //! is allowed to show. CLAUDE.md records that the same redaction defect already
 //! shipped twice in this repository, so the masking must sit where it can be
 //! back-tested.
@@ -23,7 +23,7 @@ pub const MAX_BODY_BYTES: usize = 64 * 1024;
 const EMAIL_MASK: &str = "<redacted:email>";
 const TOKEN_MASK: &str = "<redacted:token>";
 const KEY_MASK: &str = "<redacted:by-key-name>";
-const TRUNCATION_MARKER: &str = "\n… truncated by quoata-board";
+const TRUNCATION_MARKER: &str = "\n… truncated by quota-board";
 
 /// One account's last raw usage response, **already masked**.
 ///

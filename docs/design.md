@@ -1,11 +1,11 @@
-# quoata-board — Design
+# quota-board — Design
 
 > Status: settled. Section numbers in §5, §7, §8, and §9 are cited from code
 > comments and are kept stable.
 
 ## 1. Scope
 
-quoata-board is a desktop widget that shows the 5-hour and 7-day usage limits
+quota-board is a desktop widget that shows the 5-hour and 7-day usage limits
 of several Claude accounts at once. This document records the architecture, the
 constraints that shape it, and the terms-of-service position the project takes.
 
@@ -177,7 +177,7 @@ GET https://api.anthropic.com/api/oauth/usage
 Authorization: Bearer <access_token for the account>
 anthropic-beta: oauth-2025-04-20
 Content-Type: application/json
-User-Agent: quoata-board/<version>
+User-Agent: quota-board/<version>
 ```
 
 The following two paths are **explicitly out of scope**:
@@ -196,7 +196,7 @@ termination.
 
 ### 5.2 User-Agent policy (a non-goal)
 
-**We send an honest `quoata-board/<version>`. We never impersonate
+**We send an honest `quota-board/<version>`. We never impersonate
 `claude-code/<version>`.**
 
 The community's standard workaround for the 429 problem is User-Agent

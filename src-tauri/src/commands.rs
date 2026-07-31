@@ -1,12 +1,12 @@
 use crate::state::{AppState, StoreKind};
-use quoata_core::auth::callback::Callback;
-use quoata_core::auth::pkce::{begin, success_redirect};
-use quoata_core::auth::stored::token_key;
-use quoata_core::auth::token::{exchange_code, revoke, TokenSet};
-use quoata_core::model::AccountState;
-use quoata_core::scheduler::PollPolicy;
-use quoata_core::secrets::{encrypted_file::EncryptedFileStore, timeout::TimeoutStore, SecretStore};
-use quoata_core::usage::raw::RawResponse;
+use quota_core::auth::callback::Callback;
+use quota_core::auth::pkce::{begin, success_redirect};
+use quota_core::auth::stored::token_key;
+use quota_core::auth::token::{exchange_code, revoke, TokenSet};
+use quota_core::model::AccountState;
+use quota_core::scheduler::PollPolicy;
+use quota_core::secrets::{encrypted_file::EncryptedFileStore, timeout::TimeoutStore, SecretStore};
+use quota_core::usage::raw::RawResponse;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
@@ -317,7 +317,7 @@ pub async fn remove_account(app: tauri::AppHandle, uuid: String) -> Result<(), S
     let path = state.snapshots_path.clone();
     let id = uuid.clone();
     if let Ok(Err(e)) =
-        tauri::async_runtime::spawn_blocking(move || quoata_core::snapshots::remove(&path, &id))
+        tauri::async_runtime::spawn_blocking(move || quota_core::snapshots::remove(&path, &id))
             .await
     {
         eprintln!("{uuid}: the cached snapshot could not be removed: {e}");
@@ -410,7 +410,7 @@ fn store_status_now(state: &AppState) -> StoreStatus {
     StoreStatus {
         description,
         kind,
-        fallback_file_exists: quoata_core::paths::secrets_file().exists(),
+        fallback_file_exists: quota_core::paths::secrets_file().exists(),
     }
 }
 
@@ -443,7 +443,7 @@ pub async fn unlock_secrets(
         }
         StoreKind::KeychainLocked => {
             return Err("a keychain exists on this machine but did not answer; \
-                        unlock it in the OS and restart quoata-board. A passphrase \
+                        unlock it in the OS and restart quota-board. A passphrase \
                         here would open a different, empty store"
                 .into())
         }
@@ -453,7 +453,7 @@ pub async fn unlock_secrets(
         return Err("a passphrase is required".into());
     }
 
-    let path = quoata_core::paths::secrets_file();
+    let path = quota_core::paths::secrets_file();
     let pass = Passphrase(passphrase);
 
     // Opening derives an Argon2id key (64 MiB, t=3 — encrypted_file.rs:82) and
@@ -466,7 +466,7 @@ pub async fn unlock_secrets(
     // call in `state.rs` does.
     let opened = tauri::async_runtime::spawn_blocking(move || {
         TimeoutStore::spawn(
-            Duration::from_secs(quoata_core::secrets::timeout::DEFAULT_TIMEOUT_SECS),
+            Duration::from_secs(quota_core::secrets::timeout::DEFAULT_TIMEOUT_SECS),
             move || {
                 EncryptedFileStore::open(&path, pass.expose())
                     .map(|s| Box::new(s) as Box<dyn SecretStore>)
