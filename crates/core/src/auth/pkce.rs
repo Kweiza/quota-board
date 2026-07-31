@@ -39,11 +39,37 @@ impl Default for AuthConfig {
 
 /// State that must be held onto while a login is in flight.
 /// **`verifier` and `state` are passed to the token exchange exactly as-is.**
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct PendingAuth {
     pub verifier: String,
     pub state: String,
     pub redirect_uri: String,
+}
+
+/// Redacts `verifier`. A derived `Debug` printed it in full, and the PKCE
+/// verifier is a live credential: with an authorization code it is exchanged
+/// for tokens. §10.3's manual fallback keeps one of these in the application
+/// state for the whole paste window, so the number of paths that could print it
+/// is no longer small.
+///
+/// `state` and `redirect_uri` are deliberately **not** redacted. Neither is a
+/// secret — `state` is a CSRF nonce that already travels in the authorize URL
+/// and in the callback query, and the redirect_uri is the single most useful
+/// value to see when a token exchange is rejected for replaying the wrong one
+/// (§10.3 requires it to match byte for byte). Redacting them would leave a
+/// `Debug` that cannot diagnose the failure it is most likely to be printed
+/// for.
+///
+/// Hand-written, never derived — the same shape as `TokenSet` in
+/// `auth/token.rs`. CLAUDE.md names this because the defect has shipped twice.
+impl std::fmt::Debug for PendingAuth {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PendingAuth")
+            .field("verifier", &"<redacted>")
+            .field("state", &self.state)
+            .field("redirect_uri", &self.redirect_uri)
+            .finish()
+    }
 }
 
 /// `n_bytes` of randomness, encoded as base64url with no padding.
@@ -156,6 +182,32 @@ mod tests {
         assert_eq!(q.get("scope").unwrap(), "user:profile");
         assert!(q.contains_key("code_challenge"));
         assert!(q.contains_key("state"));
+    }
+
+    /// CLAUDE.md: a live credential must never reach `Debug` output, and the
+    /// PKCE verifier is one — combined with an authorization code it is
+    /// exchanged for tokens. Task 23 keeps a `PendingAuth` in the application
+    /// state for the whole manual-paste window, which widens every path that
+    /// could print it. `TokenSet` in `auth/token.rs` is the pattern this
+    /// copies; the same defect has shipped twice in this repository.
+    #[test]
+    fn debug_redacts_the_verifier_but_keeps_the_rest() {
+        let (pending, _url) = begin(&AuthConfig::default(), "http://localhost:1/callback").unwrap();
+        let text = format!("{pending:?}");
+        assert!(
+            !text.contains(&pending.verifier),
+            "the code_verifier reached Debug output: {text}"
+        );
+        assert!(text.contains("<redacted>"), "nothing marks the redaction: {text}");
+        // A `Debug` that prints nothing is not a diagnosis. Neither of these is
+        // a credential: `state` is a CSRF nonce that already travels in the
+        // authorize URL, and the redirect_uri is the thing most worth seeing
+        // when a token exchange is rejected for replaying the wrong one.
+        assert!(text.contains(&pending.state), "state was redacted needlessly: {text}");
+        assert!(
+            text.contains(&pending.redirect_uri),
+            "redirect_uri was redacted needlessly: {text}"
+        );
     }
 
     #[test]
