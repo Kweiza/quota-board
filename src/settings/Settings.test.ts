@@ -7,6 +7,7 @@ import Settings from './Settings.svelte'
 import type {
   AccountState,
   AccountView,
+  LoginUrls,
   RawResponse,
   SettingsView,
   StoreStatus,
@@ -32,6 +33,10 @@ interface Backend {
   unlocked?: StoreStatus
   /** Rejects `begin_login` with this message, as the Rust single-flight does. */
   loginError?: string
+  /** What `begin_login` answers with. §10.3 returns both URLs. */
+  loginUrls?: LoginUrls
+  /** Rejects `submit_manual_code` with this message. */
+  submitError?: string
   raw?: RawResponse | null
 }
 
@@ -97,7 +102,15 @@ function mockBackend(b: Backend = {}): IpcCall[] {
         // A Tauri command error arrives as the serialized message, not an
         // `Error`; the window renders it with `String(e)`.
         if (b.loginError !== undefined) return Promise.reject(b.loginError)
-        return 'https://claude.ai/oauth/authorize?code_challenge=x'
+        return (
+          b.loginUrls ?? {
+            loopback: 'https://claude.com/cai/oauth/authorize?redirect_uri=loopback',
+            manual: 'https://claude.com/cai/oauth/authorize?redirect_uri=manual',
+          }
+        )
+      case 'submit_manual_code':
+        if (b.submitError !== undefined) return Promise.reject(b.submitError)
+        return null
       case 'last_response':
         return b.raw ?? null
       default:
@@ -498,5 +511,126 @@ describe('Settings debug panel', () => {
     await fireEvent.click(screen.getByRole('button', { name: 'Reload' }))
     expect(await screen.findByText(/truncated at 64 KiB/)).toBeTruthy()
     expect(screen.getByText('{"five_hour":{"utilization":41}}')).toBeTruthy()
+  })
+})
+
+/**
+ * docs/design.md §10.3. The paste path is offered **only** once the loopback
+ * half cannot finish, so every one of these starts from a window that is not
+ * showing it.
+ */
+describe('Settings manual login fallback', () => {
+  const MANUAL = 'https://claude.com/cai/oauth/authorize?redirect_uri=manual'
+
+  /**
+   * `whenSubscribed` only proves `accounts://changed` is live, and the window
+   * awaits its three `listen` calls in order — so this one can still be
+   * unsubscribed at that point. Re-emitting until the block appears is the same
+   * shape `whenSubscribed` itself uses, for the same reason.
+   */
+  async function whenFallbackDelivered(reason: string): Promise<void> {
+    await waitFor(async () => {
+      await emit('auth://manual-fallback', { url: MANUAL, reason })
+      expect(screen.getByText(new RegExp(reason))).toBeTruthy()
+    })
+  }
+
+  it('shows nothing about pasting until the loopback path gives up', async () => {
+    mockBackend()
+    render(Settings)
+    await settle()
+    expect(screen.queryByLabelText('Code from the page')).toBeNull()
+  })
+
+  /**
+   * The two background failures — no reply, or an unreadable one — arrive as
+   * `auth://manual-fallback`. The reason is shown verbatim because it is the
+   * only thing telling the user why they are suddenly copying a link.
+   */
+  it('offers the link and a paste box when the background half gives up', async () => {
+    const calls = mockBackend()
+    render(Settings)
+    await whenSubscribed(calls)
+
+    await whenFallbackDelivered('no reply arrived')
+
+    expect(screen.getByText(MANUAL)).toBeTruthy()
+    expect(screen.getByLabelText('Code from the page')).toBeTruthy()
+  })
+
+  /**
+   * A bind failure never reaches Rust's event path — `begin_login` reports it
+   * in its own answer — so this must not wait for an event that will not come.
+   */
+  it('offers the paste path immediately when no loopback port could be bound', async () => {
+    mockBackend({ loginUrls: { loopback: null, manual: MANUAL } })
+    render(Settings)
+    await settle()
+
+    await fireEvent.click(screen.getByText('Add account'))
+    await settle()
+
+    expect(screen.getByText(MANUAL)).toBeTruthy()
+    expect(screen.getByText(/no local port/)).toBeTruthy()
+  })
+
+  it('sends the pasted line to the backend verbatim', async () => {
+    const calls = mockBackend({ loginUrls: { loopback: null, manual: MANUAL } })
+    render(Settings)
+    await settle()
+    await fireEvent.click(screen.getByText('Add account'))
+    await settle()
+
+    await fireEvent.input(screen.getByLabelText('Code from the page'), {
+      target: { value: 'the-code#the-state' },
+    })
+    await fireEvent.click(screen.getByText('Submit'))
+    await settle()
+
+    const sent = calls.find((c) => c.cmd === 'submit_manual_code')
+    expect(sent?.args.pasted).toBe('the-code#the-state')
+  })
+
+  /**
+   * The login is over however it finished, so the form goes with it. Left up,
+   * it invites a code for a login that no longer exists — which the backend
+   * would then refuse as belonging to an older attempt.
+   */
+  it('retires the paste form once the login lands', async () => {
+    const calls = mockBackend()
+    render(Settings)
+    await whenSubscribed(calls)
+
+    await whenFallbackDelivered('no reply arrived')
+    expect(screen.getByLabelText('Code from the page')).toBeTruthy()
+
+    await emit('accounts://changed')
+    await settle()
+    expect(screen.queryByLabelText('Code from the page')).toBeNull()
+  })
+
+  /**
+   * A refusal is not the end of the attempt: the user may have mistyped, and
+   * making them fetch the URL again would be the fix that costs more than the
+   * fault.
+   */
+  it('keeps the form up when the backend refuses the code', async () => {
+    mockBackend({
+      loginUrls: { loopback: null, manual: MANUAL },
+      submitError: 'that code belongs to an older login attempt',
+    })
+    render(Settings)
+    await settle()
+    await fireEvent.click(screen.getByText('Add account'))
+    await settle()
+
+    await fireEvent.input(screen.getByLabelText('Code from the page'), {
+      target: { value: 'stale#code' },
+    })
+    await fireEvent.click(screen.getByText('Submit'))
+    await settle()
+
+    expect(screen.getByText(/older login attempt/)).toBeTruthy()
+    expect(screen.getByLabelText('Code from the page')).toBeTruthy()
   })
 })

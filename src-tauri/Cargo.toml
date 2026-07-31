@@ -28,3 +28,9 @@ serde.workspace = true
 serde_json.workspace = true
 chrono.workspace = true
 tokio.workspace = true
+
+[dev-dependencies]
+# The login completion path had no test at all until Task 23. `AppState.cfg`
+# carries the token URL, so a mock endpoint is the whole seam needed — the same
+# version quota-core already uses.
+wiremock = "0.6.5"

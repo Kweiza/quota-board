@@ -2,7 +2,15 @@ import { invoke } from '@tauri-apps/api/core'
 import { listen, type UnlistenFn } from '@tauri-apps/api/event'
 import { getCurrentWindow } from '@tauri-apps/api/window'
 import { WebviewWindow } from '@tauri-apps/api/webviewWindow'
-import type { AccountState, AccountView, RawResponse, SettingsView, StoreStatus } from './types'
+import type {
+  AccountState,
+  AccountView,
+  LoginUrls,
+  ManualFallback,
+  RawResponse,
+  SettingsView,
+  StoreStatus,
+} from './types'
 
 /**
  * Manual dragging. `data-tauri-drag-region` is deliberately not used:
@@ -70,7 +78,11 @@ export const onUsageUpdated = (fn: () => void): Promise<UnlistenFn> =>
 export const refreshAccount = (uuid: string): Promise<AccountState> =>
   invoke('refresh_account', { uuid })
 
-export const beginLogin = (): Promise<string> => invoke('begin_login')
+export const beginLogin = (): Promise<LoginUrls> => invoke('begin_login')
+
+/** §10.3's paste path. Rejects with a sentence meant for the user. */
+export const submitManualCode = (pasted: string): Promise<void> =>
+  invoke('submit_manual_code', { pasted })
 
 export const removeAccount = (uuid: string): Promise<void> =>
   invoke('remove_account', { uuid })
@@ -119,3 +131,14 @@ export const onAccountsChanged = (fn: () => void): Promise<UnlistenFn> =>
 /** §10.3's flow completes in the background, so its failures arrive here. */
 export const onAuthFailed = (fn: (message: string) => void): Promise<UnlistenFn> =>
   listen<string>('auth://failed', (e) => fn(e.payload))
+
+/**
+ * The loopback half gave up but the login can still be finished by hand.
+ *
+ * Distinct from `onAuthFailed` on purpose: this is not a dead login, and
+ * reporting it as one would hide the half that still works. Only the two
+ * background failures arrive here — a bind that never happened and an `openUrl`
+ * that threw are seen by the webview itself, which already holds `manual`.
+ */
+export const onManualFallback = (fn: (f: ManualFallback) => void): Promise<UnlistenFn> =>
+  listen<ManualFallback>('auth://manual-fallback', (e) => fn(e.payload))
