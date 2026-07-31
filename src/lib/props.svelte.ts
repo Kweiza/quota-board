@@ -2,6 +2,12 @@ import type { AccountView } from './types'
 
 export interface WidgetProps {
   accounts: AccountView[]
+  /**
+   * Set only when the saved accounts could not be read. It replaces the empty
+   * state rather than joining it: "Add an account in Settings" is a false
+   * statement to someone who has accounts the app failed to load.
+   */
+  warning: string | null
   onOpenSettings: () => void
   onRelogin: (uuid: string) => void
   onUnlock: (uuid: string) => void
@@ -23,13 +29,14 @@ export interface WidgetProps {
  * `src/main.ts` is a plain `.ts` (index.html:11 loads it), so the box cannot
  * live there.
  *
- * All four keys exist at creation so nothing is added to the proxy later, and
+ * All keys exist at creation so nothing is added to the proxy later, and
  * `Widget.svelte` keeps its `export let` props unchanged — Svelte 5 forbids
  * mixing runes with `export let`, and the shipped component already reacts to a
  * `$state` proxy passed as the whole props object (measured).
  */
 export const widgetProps = $state<WidgetProps>({
   accounts: [],
+  warning: null,
   onOpenSettings: () => {},
   onRelogin: () => {},
   onUnlock: () => {},

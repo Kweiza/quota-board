@@ -661,7 +661,7 @@ pub(crate) mod tests {
         settings_path: PathBuf,
     ) -> AppState {
         let accounts_path = tmp("accounts");
-        let mut accounts = AccountStore::load(&accounts_path).unwrap();
+        let mut accounts = AccountStore::load(&accounts_path);
         let mut scheduler = Scheduler::new(PollPolicy::with_interval_secs(300), SystemClock);
         for id in ["a", "b"] {
             accounts.upsert(account(id)).unwrap();

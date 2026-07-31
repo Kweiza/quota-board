@@ -30,6 +30,10 @@ pub enum AccountError {
     Io(String),
     #[error("account file parse error: {0}")]
     Parse(String),
+    /// The file on disk could not be read, so this store is serving an empty
+    /// list and **refuses to write**. Returned by every mutating call.
+    #[error("the account file could not be read, so it is not being written: {0}")]
+    Unreadable(String),
 }
 
 /// A single-owner handle to one account metadata file.
@@ -48,19 +52,47 @@ pub enum AccountError {
 pub struct AccountStore {
     path: PathBuf,
     accounts: Vec<Account>,
+    /// Set when the file exists but could not be read. While it is set the
+    /// store serves an empty list and refuses to write, the same shape
+    /// `SettingsStore` uses for a file it cannot interpret.
+    unreadable: Option<String>,
 }
 
 impl AccountStore {
-    pub fn load(path: &Path) -> Result<Self, AccountError> {
-        let accounts = match std::fs::read_to_string(path) {
-            Ok(text) => serde_json::from_str(&text)
-                .map_err(|e| AccountError::Parse(e.to_string()))?,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Vec::new(),
-            Err(e) => return Err(AccountError::Io(e.to_string())),
+    /// **Infallible on purpose**, like `SettingsStore::load`. This used to
+    /// return `Err` for an unparseable file, `main.rs`'s `setup()` propagated
+    /// it, and the process aborted before any window existed — measured, exit
+    /// 134 with `panic in a function that cannot unwind`. With a transparent
+    /// undecorated widget and no Dock icon, one malformed byte in this file
+    /// made the application launch into nothing, with no way for the user to
+    /// learn why.
+    ///
+    /// A file that cannot be read yields an empty list **and** a warning, and
+    /// the store then refuses every write. Serving the empty list without that
+    /// refusal would be worse than the crash: `flush` rewrites the whole file,
+    /// so the first successful poll calling `persist_last_ok` would replace the
+    /// user's real accounts with the empty list this degraded to.
+    pub fn load(path: &Path) -> Self {
+        let (accounts, unreadable) = match std::fs::read_to_string(path) {
+            Ok(text) => match serde_json::from_str::<Vec<Account>>(&text) {
+                Ok(list) => (list, None),
+                Err(e) => (Vec::new(), Some(format!("it is not valid account JSON ({e})"))),
+            },
+            // No file yet is the ordinary first run, not a problem to report.
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => (Vec::new(), None),
+            Err(e) => (Vec::new(), Some(format!("it could not be opened ({e})"))),
         };
-        let mut s = Self { path: path.to_path_buf(), accounts };
+        let mut s = Self { path: path.to_path_buf(), accounts, unreadable };
         s.accounts.sort_by_key(|a| a.sort_order);
-        Ok(s)
+        s
+    }
+
+    /// Why this store is empty, when it is empty for a reason. `None` on the
+    /// ordinary first run — a fresh install must not be shown a problem.
+    pub fn warning(&self) -> Option<String> {
+        self.unreadable
+            .as_ref()
+            .map(|why| format!("your saved accounts could not be read, so {why}"))
     }
 
     pub fn list(&self) -> &[Account] {
@@ -130,6 +162,12 @@ impl AccountStore {
     }
 
     fn flush(&mut self) -> Result<(), AccountError> {
+        // The refusal that makes the degrade in `load` safe rather than
+        // destructive. Checked here, not in each caller, because this is the
+        // one place that overwrites the file.
+        if let Some(why) = &self.unreadable {
+            return Err(AccountError::Unreadable(why.clone()));
+        }
         let text = serde_json::to_string_pretty(&self.accounts)
             .map_err(|e| AccountError::Parse(e.to_string()))?;
         if let Some(dir) = self.path.parent() {
@@ -198,11 +236,11 @@ mod tests {
     fn survives_a_reload_from_disk() {
         let path = tmp();
         {
-            let mut s = AccountStore::load(&path).unwrap();
+            let mut s = AccountStore::load(&path);
             s.upsert(acc("uuid-a", "work")).unwrap();
             s.upsert(acc("uuid-b", "personal")).unwrap();
         }
-        let s = AccountStore::load(&path).unwrap();
+        let s = AccountStore::load(&path);
         assert_eq!(s.list().len(), 2);
         std::fs::remove_file(&path).ok();
     }
@@ -212,7 +250,7 @@ mod tests {
     #[test]
     fn upsert_by_uuid_replaces_rather_than_duplicates() {
         let path = tmp();
-        let mut s = AccountStore::load(&path).unwrap();
+        let mut s = AccountStore::load(&path);
         s.upsert(acc("uuid-a", "work")).unwrap();
         let mut updated = acc("uuid-a", "work-renamed");
         updated.email = "changed@example.com".into();
@@ -227,7 +265,7 @@ mod tests {
     #[test]
     fn same_email_different_uuid_stays_two_accounts() {
         let path = tmp();
-        let mut s = AccountStore::load(&path).unwrap();
+        let mut s = AccountStore::load(&path);
         let mut a = acc("uuid-a", "one");
         let mut b = acc("uuid-b", "two");
         a.email = "same@example.com".into();
@@ -241,7 +279,7 @@ mod tests {
     #[test]
     fn list_is_ordered_by_sort_order() {
         let path = tmp();
-        let mut s = AccountStore::load(&path).unwrap();
+        let mut s = AccountStore::load(&path);
         s.upsert(acc("uuid-a", "a")).unwrap();
         s.upsert(acc("uuid-b", "b")).unwrap();
         s.upsert(acc("uuid-c", "c")).unwrap();
@@ -251,11 +289,63 @@ mod tests {
 
         // Check that the order survives a round trip through disk.
         drop(s);
-        let s = AccountStore::load(&path).unwrap();
+        let s = AccountStore::load(&path);
         let ids: Vec<_> = s.list().iter().map(|a| a.uuid.clone()).collect();
         assert_eq!(ids, vec!["uuid-c", "uuid-a", "uuid-b"], "order must survive a restart");
 
         std::fs::remove_file(&path).ok();
+    }
+
+    /// **Reproduced before this was fixed**: a truncated `accounts.json` made
+    /// `load` return `Err`, `main.rs`'s `setup()` propagated it, and the process
+    /// aborted with exit 134 — `panic in a function that cannot unwind`. The
+    /// widget is transparent and undecorated and the app has no Dock icon, so
+    /// what the user saw was nothing at all: no window, no dialog, and stderr
+    /// going nowhere. One bad byte in this file bricked the application.
+    #[test]
+    fn an_unreadable_file_degrades_instead_of_failing_to_load() {
+        let path = tmp();
+        std::fs::write(&path, br#"[{"uuid":"a","display_label":"x""#).unwrap();
+
+        let s = AccountStore::load(&path);
+        assert!(s.list().is_empty(), "a file that cannot be parsed is not a list of accounts");
+        let w = s.warning().expect("the reason must be reported, not swallowed");
+        assert!(w.contains("could not be read"), "unhelpful warning: {w}");
+        std::fs::remove_file(&path).ok();
+    }
+
+    /// The half that makes the degrade safe. Serving an empty list is only
+    /// tolerable while nothing writes it back: `flush` rewrites the whole file,
+    /// so one successful poll calling `persist_last_ok` would replace a user's
+    /// real accounts with the empty list this store degraded to.
+    #[test]
+    fn a_degraded_store_refuses_to_write_and_leaves_the_file_alone() {
+        let path = tmp();
+        let original = br#"[{"uuid":"a","display_label":"x""#;
+        std::fs::write(&path, original).unwrap();
+
+        let mut s = AccountStore::load(&path);
+        let e = s.upsert(acc("b", "second")).expect_err("a degraded store must refuse to write");
+        assert!(matches!(e, AccountError::Unreadable(_)), "wrong error: {e}");
+
+        assert_eq!(
+            std::fs::read(&path).unwrap(),
+            original,
+            "the refused write still changed the file on disk"
+        );
+        std::fs::remove_file(&path).ok();
+    }
+
+    /// A missing file is the ordinary first run, not a problem to report — the
+    /// two must not collapse into one state, or every fresh install would show
+    /// a scary warning.
+    #[test]
+    fn a_missing_file_is_not_a_warning() {
+        let path = tmp();
+        std::fs::remove_file(&path).ok();
+        let s = AccountStore::load(&path);
+        assert!(s.list().is_empty());
+        assert_eq!(s.warning(), None, "a first run reported a problem");
     }
 
     /// Pin down that `load()` re-sorts by `sort_order` rather than trusting the
@@ -274,7 +364,7 @@ mod tests {
         c.sort_order = 1;
         std::fs::write(&path, serde_json::to_string_pretty(&vec![a, b, c]).unwrap()).unwrap();
 
-        let s = AccountStore::load(&path).unwrap();
+        let s = AccountStore::load(&path);
         let ids: Vec<_> = s.list().iter().map(|x| x.uuid.clone()).collect();
         assert_eq!(ids, vec!["uuid-b", "uuid-c", "uuid-a"], "load() must sort by sort_order");
         std::fs::remove_file(&path).ok();
@@ -283,7 +373,7 @@ mod tests {
     #[test]
     fn remove_returns_whether_it_existed() {
         let path = tmp();
-        let mut s = AccountStore::load(&path).unwrap();
+        let mut s = AccountStore::load(&path);
         s.upsert(acc("uuid-a", "a")).unwrap();
         assert!(s.remove("uuid-a").unwrap());
         assert!(!s.remove("uuid-a").unwrap());
@@ -293,7 +383,7 @@ mod tests {
     #[test]
     fn missing_file_starts_empty() {
         let path = tmp();
-        let s = AccountStore::load(&path).unwrap();
+        let s = AccountStore::load(&path);
         assert!(s.list().is_empty());
     }
 
@@ -301,7 +391,7 @@ mod tests {
     #[test]
     fn serialized_form_has_no_token_fields() {
         let path = tmp();
-        let mut s = AccountStore::load(&path).unwrap();
+        let mut s = AccountStore::load(&path);
         s.upsert(acc("uuid-a", "a")).unwrap();
         let text = std::fs::read_to_string(&path).unwrap();
         for forbidden in ["access_token", "refresh_token", "Bearer"] {

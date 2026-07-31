@@ -1495,14 +1495,14 @@ mod tests {
         path.push(format!("quota-quarantine-{}-{:016x}.json", std::process::id(), rand::random::<u64>()));
         let _ = std::fs::remove_file(&path);
 
-        let mut store = AccountStore::load(&path).unwrap();
+        let mut store = AccountStore::load(&path);
         store.upsert(account("a", false)).unwrap();
 
         assert!(persist_quarantine(&mut store, "a").unwrap(), "the first call must record it");
         assert!(!persist_quarantine(&mut store, "a").unwrap(), "the second call is a no-op");
         assert!(!persist_quarantine(&mut store, "unknown").unwrap(), "an unknown uuid is a no-op");
 
-        let reloaded = AccountStore::load(&path).unwrap();
+        let reloaded = AccountStore::load(&path);
         assert!(
             reloaded.list()[0].quarantined,
             "the quarantine never reached the disk — it dies with the process"
@@ -1522,7 +1522,7 @@ mod tests {
         let _ = std::fs::remove_file(&path);
 
         let at: DateTime<Utc> = "2026-07-31T11:41:03.891055Z".parse().unwrap();
-        let mut store = AccountStore::load(&path).unwrap();
+        let mut store = AccountStore::load(&path);
         let mut renamed = account("a", false);
         renamed.display_label = "work".into();
         store.upsert(renamed).unwrap();
@@ -1533,7 +1533,7 @@ mod tests {
             "an unknown uuid is a no-op"
         );
 
-        let reloaded = AccountStore::load(&path).unwrap();
+        let reloaded = AccountStore::load(&path);
         assert_eq!(
             reloaded.list()[0].last_ok_at,
             Some(at),

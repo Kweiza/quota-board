@@ -72,6 +72,17 @@ pub async fn set_widget_visible(state: State<'_, AppState>, visible: bool) -> Re
     Ok(())
 }
 
+/// §9.1's account file could not be read, so the list is empty for a reason.
+///
+/// A separate command rather than a field on `AccountView`: the answer is about
+/// the whole file, and there is no view to hang it on precisely when it
+/// applies — the list is empty. `None` on the ordinary first run, which must
+/// not be dressed up as a problem.
+#[tauri::command]
+pub async fn accounts_warning(state: State<'_, AppState>) -> Result<Option<String>, String> {
+    Ok(state.accounts.lock().await.warning())
+}
+
 #[tauri::command]
 pub async fn refresh_account(
     app: tauri::AppHandle,

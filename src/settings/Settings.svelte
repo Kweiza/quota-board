@@ -5,6 +5,7 @@
   import AccountList from './AccountList.svelte'
   import { queriesPerDay } from '../lib/format'
   import {
+    accountsWarning,
     beginLogin,
     getAutostart,
     getSettings,
@@ -178,6 +179,21 @@
     }
   }
 
+  /**
+   * §9.1's file could not be read. Kept out of `error`: that banner reports a
+   * failed action, and this is a standing condition the user has to fix on
+   * disk. It also must not be cleared by the next successful command.
+   */
+  let accountsProblem: string | null = null
+
+  async function pullAccountsProblem(): Promise<void> {
+    try {
+      accountsProblem = await accountsWarning()
+    } catch (e) {
+      error = String(e)
+    }
+  }
+
   async function refreshStatus(): Promise<void> {
     try {
       status = await storeStatus()
@@ -198,6 +214,7 @@
 
   onMount(() => {
     void pullAccounts()
+    void pullAccountsProblem()
     void refreshStatus()
     void (async () => {
       try {
@@ -420,6 +437,15 @@
   <h1>Quota Board</h1>
   {#if error}
     <p class="warn" role="alert">{error}</p>
+  {/if}
+  <!-- Above the account list on purpose: the list below it is empty, and
+       without this line that emptiness reads as "you have no accounts". -->
+  {#if accountsProblem}
+    <p class="warn" role="alert">
+      {accountsProblem}. Nothing will be written to that file until it is
+      repaired or removed, so your accounts are not lost — but they cannot be
+      shown, and adding one now would fail.
+    </p>
   {/if}
 
   <section>
