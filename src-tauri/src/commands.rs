@@ -75,8 +75,16 @@ pub async fn refresh_account(
             return Ok(s);
         }
         // §6.4: with no budget, do **not** fire — report when it will be
-        // available. `AccountRow.svelte:58-59` already renders this state as
-        // "throttled, after HH:MM", which is exactly what §6.4 asks for.
+        // available. `AccountRow.svelte`'s `throttled` branch renders this state
+        // as "throttled, after HH:MM", which is exactly what §6.4 asks for, and
+        // `AccountList.svelte` renders the refused press as "throttled,
+        // available after HH:MM". Cited by name: both files move.
+        //
+        // **Both arms above answer with the same shape.** The first is §6.2's
+        // server-ordered wait and this one is §6.1's local floor; on the wire
+        // they are one `Throttled { until }`, so no consumer can tell them
+        // apart, and none needs to — "come back after HH:MM" is the whole
+        // answer either way.
         if let Some(until) = sched.earliest_manual_refresh(&uuid) {
             return Ok(AccountState::Throttled { until });
         }

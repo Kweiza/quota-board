@@ -1,5 +1,12 @@
 import { describe, expect, it } from 'vitest'
-import { barWidth, formatReset, queriesPerDay, relativeAge, severityOf } from './format'
+import {
+  barWidth,
+  formatReset,
+  queriesPerDay,
+  relativeAge,
+  severityOf,
+  untilHhMm,
+} from './format'
 
 describe('severityOf', () => {
   it('changes at the 40/70/90 boundaries', () => {
@@ -71,6 +78,32 @@ describe('queriesPerDay', () => {
     expect(queriesPerDay(-1, 2)).toBe(0)
     expect(queriesPerDay(NaN, 2)).toBe(0)
     expect(queriesPerDay(300, 0)).toBe(0)
+  })
+})
+
+describe('untilHhMm', () => {
+  // Every input here is built from local calendar fields and then serialized,
+  // so the expected string is the same in any zone the suite runs in. Writing
+  // a UTC literal and expecting '14:05' would only pass in UTC+0 — and this
+  // formatter is deliberately local-time, so such a test would be asserting
+  // the machine's zone rather than the format.
+  const iso = (hours: number, minutes: number): string =>
+    new Date(2026, 6, 31, hours, minutes).toISOString()
+
+  it('renders the fixed HH:MM shape §7.1 pins, not a locale string', () => {
+    expect(untilHhMm(iso(14, 5))).toBe('14:05')
+  })
+
+  it('pads a single-digit hour, so the field never narrows to H:MM', () => {
+    // A row that reads "9:05" one moment and "14:05" the next changes width
+    // under the user; §7.1 pins two digits.
+    expect(untilHhMm(iso(9, 5))).toBe('09:05')
+  })
+
+  it('keeps midnight as 00:00 on a 24-hour clock, not 12:00', () => {
+    // `toLocaleTimeString` on an en-US machine answers "12:00 AM" here, which
+    // is the locale string this formatter exists to avoid.
+    expect(untilHhMm(iso(0, 0))).toBe('00:00')
   })
 })
 
