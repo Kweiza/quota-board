@@ -6,21 +6,21 @@ use tauri_plugin_window_state::StateFlags;
 mod commands;
 mod state;
 
-use quoata_core::accounts::AccountStore;
-use quoata_core::auth::pkce::AuthConfig;
-use quoata_core::auth::stored::{token_key, RefreshLocks};
-use quoata_core::auth::token::{ReqwestHttp, TokenSet};
-use quoata_core::scheduler::{register_accounts, Scheduler, SystemClock};
-use quoata_core::secrets::{keychain::KeychainStore, timeout::TimeoutStore, SecretStore, SERVICE};
-/// Named only inside the `QUOATA_FORCE_FALLBACK` block below, which is itself
+use quota_core::accounts::AccountStore;
+use quota_core::auth::pkce::AuthConfig;
+use quota_core::auth::stored::{token_key, RefreshLocks};
+use quota_core::auth::token::{ReqwestHttp, TokenSet};
+use quota_core::scheduler::{register_accounts, Scheduler, SystemClock};
+use quota_core::secrets::{keychain::KeychainStore, timeout::TimeoutStore, SecretStore, SERVICE};
+/// Named only inside the `QUOTA_FORCE_FALLBACK` block below, which is itself
 /// `debug_assertions`-only. Imported unconditionally it is an `unused_imports`
 /// warning in every release build — invisible to `cargo clippy --all-targets`,
 /// which builds the debug profile, and therefore only surfacing at the release
 /// build the installer step runs.
 #[cfg(debug_assertions)]
-use quoata_core::secrets::SecretError;
-use quoata_core::settings::SettingsStore;
-use quoata_core::snapshots::fingerprint;
+use quota_core::secrets::SecretError;
+use quota_core::settings::SettingsStore;
+use quota_core::snapshots::fingerprint;
 use state::{poll_loop, AppState, LockedStore, SecretsHandle, StoreKind};
 use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
@@ -59,9 +59,9 @@ fn main() {
         // state `tauri-plugin-autostart` is in today (Task 20 owns that).
         .plugin(tauri_plugin_opener::init())
         .setup(|app| {
-            // §9.1 + user decision 1: the same file `quoata-cli login` writes.
+            // §9.1 + user decision 1: the same file `quota-cli login` writes.
             // There is one derivation of this path and both binaries call it.
-            let accounts = AccountStore::load(&quoata_core::paths::accounts_file())?;
+            let accounts = AccountStore::load(&quota_core::paths::accounts_file())?;
 
             // §9.2's canary self-check. **Must run exactly once per process**:
             // keyring 4.1.5 flips an internal flag before registering the
@@ -79,7 +79,7 @@ fn main() {
             // that drives the polling loop, and nothing is left running to
             // reclaim it.
             let opened = TimeoutStore::spawn(
-                std::time::Duration::from_secs(quoata_core::secrets::timeout::DEFAULT_TIMEOUT_SECS),
+                std::time::Duration::from_secs(quota_core::secrets::timeout::DEFAULT_TIMEOUT_SECS),
                 || KeychainStore::probe(SERVICE).map(|s| Box::new(s) as Box<dyn SecretStore>),
             );
             // docs/design.md §9.2's real trigger — a Linux box with no Secret
@@ -90,9 +90,9 @@ fn main() {
             // for the URL overrides. It cannot redirect writes: the path comes
             // from `paths::secrets_file()`, never from the environment.
             #[cfg(debug_assertions)]
-            let opened = if std::env::var_os("QUOATA_FORCE_FALLBACK").is_some() {
+            let opened = if std::env::var_os("QUOTA_FORCE_FALLBACK").is_some() {
                 Err(SecretError::NoBackend(
-                    "QUOATA_FORCE_FALLBACK is set: pretending this machine has no keychain".into(),
+                    "QUOTA_FORCE_FALLBACK is set: pretending this machine has no keychain".into(),
                 ))
             } else {
                 opened
@@ -123,12 +123,12 @@ fn main() {
                 .app_cache_dir()
                 .map(|d| d.join("snapshots.json"))
                 .map_err(|e| format!("no cache directory: {e}"))?;
-            let mut cache = quoata_core::snapshots::load(&snapshots_path);
+            let mut cache = quota_core::snapshots::load(&snapshots_path);
 
             // §9.1: settings live beside accounts.json, through the one shared
             // `paths` derivation. Deleting the literal 300 is the guard that
             // keeps the file the only source of the running interval.
-            let settings = SettingsStore::load(&quoata_core::paths::settings_file());
+            let settings = SettingsStore::load(&quota_core::paths::settings_file());
             if let Some(w) = settings.warning() {
                 eprintln!("settings: {w}");
             }
@@ -152,7 +152,7 @@ fn main() {
                     store: secrets,
                     kind: store_kind,
                 }),
-                last_raw: std::sync::Mutex::new(quoata_core::usage::raw::RawLog::default()),
+                last_raw: std::sync::Mutex::new(quota_core::usage::raw::RawLog::default()),
                 http: ReqwestHttp::new()?,
                 cfg: AuthConfig { token_url: token_url(), ..AuthConfig::default() },
                 refresh_locks: RefreshLocks::default(),
@@ -202,7 +202,7 @@ fn main() {
         .expect("failed to build the Tauri application")
         // No manual save on exit either: plugin 2.4.1 already persists from
         // RunEvent::Exit. Measured — quitting wrote the moved position to
-        // ~/Library/Application Support/com.quoata.board/.window-state.json.
+        // ~/Library/Application Support/com.quota.board/.window-state.json.
         .run(|_app, _event| {
             // The two-argument run() form is kept because later tasks need the
             // run-loop closure (Task 19's tray, macOS Reopen).
@@ -216,17 +216,17 @@ fn main() {
 /// switch. Production values are §5.1's URL and `AuthConfig::default()`.
 #[cfg(debug_assertions)]
 fn usage_url() -> String {
-    std::env::var("QUOATA_USAGE_URL")
-        .unwrap_or_else(|_| quoata_core::usage::http::USAGE_URL.to_string())
+    std::env::var("QUOTA_USAGE_URL")
+        .unwrap_or_else(|_| quota_core::usage::http::USAGE_URL.to_string())
 }
 #[cfg(not(debug_assertions))]
 fn usage_url() -> String {
-    quoata_core::usage::http::USAGE_URL.to_string()
+    quota_core::usage::http::USAGE_URL.to_string()
 }
 
 #[cfg(debug_assertions)]
 fn token_url() -> String {
-    std::env::var("QUOATA_TOKEN_URL").unwrap_or_else(|_| AuthConfig::default().token_url)
+    std::env::var("QUOTA_TOKEN_URL").unwrap_or_else(|_| AuthConfig::default().token_url)
 }
 #[cfg(not(debug_assertions))]
 fn token_url() -> String {

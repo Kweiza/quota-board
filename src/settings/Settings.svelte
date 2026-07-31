@@ -212,7 +212,7 @@
 </script>
 
 <main class="settings">
-  <h1>quoata-board</h1>
+  <h1>quota-board</h1>
   {#if error}
     <p class="warn" role="alert">{error}</p>
   {/if}
@@ -277,7 +277,7 @@
       {:else if status.kind === 'keychain_locked'}
         <p class="warn">
           A keychain exists on this machine but did not answer. Unlock it in the
-          OS and restart quoata-board — a passphrase here would open a
+          OS and restart quota-board — a passphrase here would open a
           different, empty store.
         </p>
       {:else}

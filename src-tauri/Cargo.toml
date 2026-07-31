@@ -1,5 +1,5 @@
 [package]
-name = "quoata-board"
+name = "quota-board"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -9,7 +9,7 @@ license.workspace = true
 tauri-build = { version = "2.6.3", features = [] }
 
 [dependencies]
-quoata-core = { path = "../crates/core" }
+quota-core = { path = "../crates/core" }
 tauri = { version = "2.11.5", features = ["tray-icon", "image-png", "macos-private-api"] }
 tauri-plugin-window-state = "2.4.1"
 tauri-plugin-autostart = "2.5.1"

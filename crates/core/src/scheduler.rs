@@ -1379,7 +1379,7 @@ mod tests {
     #[test]
     fn an_auth_dead_poll_writes_the_quarantine_through_to_the_account_file() {
         let mut path = std::env::temp_dir();
-        path.push(format!("quoata-quarantine-{}-{:016x}.json", std::process::id(), rand::random::<u64>()));
+        path.push(format!("quota-quarantine-{}-{:016x}.json", std::process::id(), rand::random::<u64>()));
         let _ = std::fs::remove_file(&path);
 
         let mut store = AccountStore::load(&path).unwrap();

@@ -1,4 +1,4 @@
-# quoata-board
+# quota-board
 
 A desktop widget showing the 5-hour and 7-day usage limits of several Claude
 accounts at once.
@@ -54,7 +54,7 @@ uncertainty.** The honest state of affairs:
   been documented.
 - The one unambiguous prohibition is misrepresenting your identity to
   Anthropic's servers. **This tool does not do that.** It always sends
-  `User-Agent: quoata-board/<version>` and never impersonates Claude Code, even
+  `User-Agent: quota-board/<version>` and never impersonates Claude Code, even
   though impersonation is the community's standard workaround for the rate
   limiting. The price is a much narrower throttle budget, which is why polling
   is floored at 3 minutes per account.
@@ -88,7 +88,7 @@ managers.
 ## Building
 
 ```bash
-cargo test -p quoata-core                  # run the test suite
+cargo test -p quota-core                  # run the test suite
 cargo clippy --all-targets -- -D warnings  # lint
 ```
 

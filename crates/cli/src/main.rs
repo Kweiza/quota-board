@@ -1,18 +1,18 @@
 //! Headless smoke tool. Exercises login, query, and refresh for real, with no GUI.
 //!
 //! Usage:
-//!   quoata-cli login          — add one account via browser OAuth
-//!   quoata-cli show [uuid]    — print usage. With a uuid, only that account
-//!   quoata-cli refresh <uuid> — force-refresh that account's token
+//!   quota-cli login          — add one account via browser OAuth
+//!   quota-cli show [uuid]    — print usage. With a uuid, only that account
+//!   quota-cli refresh <uuid> — force-refresh that account's token
 
-use quoata_core::accounts::{Account, AccountStore};
-use quoata_core::auth::callback::Callback;
-use quoata_core::auth::pkce::{begin, success_redirect, AuthConfig};
-use quoata_core::auth::stored::{ensure_fresh, token_key, RefreshLocks};
-use quoata_core::auth::token::{exchange_code, refresh, ReqwestHttp, TokenSet};
-use quoata_core::paths::accounts_file;
-use quoata_core::secrets::{keychain::KeychainStore, SecretStore, SERVICE};
-use quoata_core::usage::http::fetch_usage;
+use quota_core::accounts::{Account, AccountStore};
+use quota_core::auth::callback::Callback;
+use quota_core::auth::pkce::{begin, success_redirect, AuthConfig};
+use quota_core::auth::stored::{ensure_fresh, token_key, RefreshLocks};
+use quota_core::auth::token::{exchange_code, refresh, ReqwestHttp, TokenSet};
+use quota_core::paths::accounts_file;
+use quota_core::secrets::{keychain::KeychainStore, SecretStore, SERVICE};
+use quota_core::usage::http::fetch_usage;
 
 fn open_store() -> Box<dyn SecretStore> {
     match KeychainStore::probe(SERVICE) {
@@ -137,7 +137,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         Some("show") => cmd_show(args.get(2).map(String::as_str)).await,
         Some("refresh") => cmd_refresh(args.get(2).ok_or("a uuid is required")?).await,
         _ => {
-            eprintln!("usage: quoata-cli [login|show|refresh <uuid>]");
+            eprintln!("usage: quota-cli [login|show|refresh <uuid>]");
             std::process::exit(2);
         }
     }

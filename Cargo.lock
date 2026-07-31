@@ -3277,11 +3277,11 @@ dependencies = [
 ]
 
 [[package]]
-name = "quoata-board"
+name = "quota-board"
 version = "0.1.0"
 dependencies = [
  "chrono",
- "quoata-core",
+ "quota-core",
  "serde",
  "serde_json",
  "tauri",
@@ -3294,17 +3294,17 @@ dependencies = [
 ]
 
 [[package]]
-name = "quoata-cli"
+name = "quota-cli"
 version = "0.1.0"
 dependencies = [
  "chrono",
- "quoata-core",
+ "quota-core",
  "serde_json",
  "tokio",
 ]
 
 [[package]]
-name = "quoata-core"
+name = "quota-core"
 version = "0.1.0"
 dependencies = [
  "argon2",

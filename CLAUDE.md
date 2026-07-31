@@ -4,7 +4,7 @@ Guidance for Claude Code (and any other agent) working in this repository.
 
 ## What this is
 
-quoata-board is a desktop widget that shows the 5-hour and 7-day Claude usage
+quota-board is a desktop widget that shows the 5-hour and 7-day Claude usage
 limits for several accounts at once. It is a single Tauri v2 application: a Rust
 core owns accounts, tokens, polling, and networking, and a Svelte + TypeScript
 webview renders state.
@@ -18,7 +18,7 @@ stable.
 These are not style preferences. Violating any of them is a defect.
 
 - **Never impersonate `User-Agent: claude-code/<version>`.** Always send
-  `quoata-board/<version>`. Misrepresenting identity to Anthropic's servers is
+  `quota-board/<version>`. Misrepresenting identity to Anthropic's servers is
   the one unambiguous prohibition in their terms, and the whole project is built
   around not crossing it. This costs us the generous throttle bucket, and that
   cost is accepted deliberately — see `docs/design.md` §5.2.
@@ -85,10 +85,10 @@ tested headlessly — including on machines with no GTK or WebKit.
 ## Commands
 
 ```bash
-cargo test -p quoata-core                      # full test suite
-cargo test -p quoata-core accounts             # one module
+cargo test -p quota-core                      # full test suite
+cargo test -p quota-core accounts             # one module
 cargo clippy --all-targets -- -D warnings      # lint gate; must be clean
-cargo run -p quoata-core --example probe       # probe the OS keychain backend
+cargo run -p quota-core --example probe       # probe the OS keychain backend
 ```
 
 Both the test suite and clippy must be clean before any commit.

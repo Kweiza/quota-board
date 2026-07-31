@@ -3,7 +3,7 @@ use chrono::{DateTime, TimeDelta, Utc};
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 
-pub const USER_AGENT: &str = concat!("quoata-board/", env!("CARGO_PKG_VERSION"));
+pub const USER_AGENT: &str = concat!("quota-board/", env!("CARGO_PKG_VERSION"));
 /// docs/design.md §5.2: this is the only `anthropic-beta` value we ever send.
 pub const ANTHROPIC_BETA: &str = "oauth-2025-04-20";
 /// docs/design.md §10.5: treat a token as expired 5 minutes ahead of its
@@ -507,7 +507,7 @@ mod tests {
     #[tokio::test]
     async fn user_agent_is_ours_never_claude_code() {
         let http = ReqwestHttp::new().unwrap();
-        assert!(http.user_agent().starts_with("quoata-board/"));
+        assert!(http.user_agent().starts_with("quota-board/"));
         assert!(!http.user_agent().contains("claude"));
     }
 

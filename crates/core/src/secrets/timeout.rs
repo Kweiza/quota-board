@@ -77,7 +77,7 @@ impl TimeoutStore {
         let worker_stuck = Arc::clone(&stuck);
 
         std::thread::Builder::new()
-            .name("quoata-secret-store".into())
+            .name("quota-secret-store".into())
             .spawn(move || {
                 let store = match open() {
                     Ok(s) => {

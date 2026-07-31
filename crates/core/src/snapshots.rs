@@ -3,7 +3,7 @@
 //!
 //! **This lives in the core, not in `src-tauri`.** §4.1 assigns "snapshot
 //! retention" to `scheduler`, and `src-tauri` has no test module, no test
-//! harness, and cannot be reached by `cargo test -p quoata-core` at all — so
+//! harness, and cannot be reached by `cargo test -p quota-core` at all — so
 //! the one part of this task that handles a credential-derived value and writes
 //! a file would otherwise ship with zero coverage, in a repository whose
 //! CLAUDE.md records that the same redaction defect already shipped twice. The
@@ -152,7 +152,7 @@ mod tests {
         rand::fill(&mut rand_bytes[..]);
         let hex: String = rand_bytes.iter().map(|b| format!("{b:02x}")).collect();
         let mut p = std::env::temp_dir();
-        p.push(format!("quoata-snapshots-{}-{n}-{hex}.json", std::process::id()));
+        p.push(format!("quota-snapshots-{}-{n}-{hex}.json", std::process::id()));
         let _ = std::fs::remove_file(&p);
         p
     }

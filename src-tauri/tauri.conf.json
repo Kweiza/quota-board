@@ -1,8 +1,8 @@
 {
   "$schema": "https://schema.tauri.app/config/2",
-  "productName": "quoata-board",
+  "productName": "quota-board",
   "version": "0.1.0",
-  "identifier": "com.quoata.board",
+  "identifier": "com.quota.board",
   "build": {
     "frontendDist": "../dist",
     "devUrl": "http://localhost:5173",
@@ -16,7 +16,7 @@
     "windows": [
       {
         "label": "widget",
-        "title": "quoata-board",
+        "title": "quota-board",
         "url": "index.html",
         "width": 280,
         "height": 200,
@@ -34,7 +34,7 @@
       },
       {
         "label": "settings",
-        "title": "quoata-board Settings",
+        "title": "quota-board Settings",
         "url": "index.html?window=settings",
         "width": 720,
         "height": 560,

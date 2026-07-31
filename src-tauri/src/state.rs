@@ -1,14 +1,14 @@
 use chrono::Utc;
-use quoata_core::accounts::{Account, AccountStore};
-use quoata_core::auth::pkce::AuthConfig;
-use quoata_core::auth::stored::{ensure_fresh, RefreshLocks};
-use quoata_core::auth::token::ReqwestHttp;
-use quoata_core::scheduler::{persist_quarantine, FailureKind, Scheduler, SystemClock};
-use quoata_core::secrets::{SecretError, SecretStore};
-use quoata_core::settings::SettingsStore;
-use quoata_core::snapshots::{fingerprint, save as save_snapshot};
-use quoata_core::usage::http::{fetch_usage_captured_at, UsageError};
-use quoata_core::usage::raw::{RawLog, RawResponse};
+use quota_core::accounts::{Account, AccountStore};
+use quota_core::auth::pkce::AuthConfig;
+use quota_core::auth::stored::{ensure_fresh, RefreshLocks};
+use quota_core::auth::token::ReqwestHttp;
+use quota_core::scheduler::{persist_quarantine, FailureKind, Scheduler, SystemClock};
+use quota_core::secrets::{SecretError, SecretStore};
+use quota_core::settings::SettingsStore;
+use quota_core::snapshots::{fingerprint, save as save_snapshot};
+use quota_core::usage::http::{fetch_usage_captured_at, UsageError};
+use quota_core::usage::raw::{RawLog, RawResponse};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, RwLock};
@@ -317,7 +317,7 @@ impl AppState {
         &self,
         uuid: &str,
         email: &str,
-    ) -> Result<(), quoata_core::accounts::AccountError> {
+    ) -> Result<(), quota_core::accounts::AccountError> {
         // Lock order: scheduler before accounts. See this struct's doc comment.
         let mut sched = self.scheduler.lock().await;
         let mut accounts = self.accounts.lock().await;
@@ -538,10 +538,10 @@ pub async fn poll_loop(handle: tauri::AppHandle) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use quoata_core::accounts::Account;
-    use quoata_core::model::AccountState;
-    use quoata_core::scheduler::PollPolicy;
-    use quoata_core::secrets::timeout::TimeoutStore;
+    use quota_core::accounts::Account;
+    use quota_core::model::AccountState;
+    use quota_core::scheduler::PollPolicy;
+    use quota_core::secrets::timeout::TimeoutStore;
     use std::time::{Duration, Instant};
 
     /// Every `SecretStore` read blocks for `nap`, the way the macOS keychain
@@ -578,7 +578,7 @@ mod tests {
         static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
         let n = COUNTER.fetch_add(1, Ordering::Relaxed);
         let mut p = std::env::temp_dir();
-        p.push(format!("quoata-state-{kind}-{}-{n}.json", std::process::id()));
+        p.push(format!("quota-state-{kind}-{}-{n}.json", std::process::id()));
         let _ = std::fs::remove_file(&p);
         p
     }
@@ -626,7 +626,7 @@ mod tests {
             settings: Mutex::new(SettingsStore::load(&settings_path)),
             secrets: RwLock::new(SecretsHandle { store: secrets, kind }),
             last_raw: std::sync::Mutex::new(RawLog::default()),
-            http: quoata_core::auth::token::ReqwestHttp::new().unwrap(),
+            http: quota_core::auth::token::ReqwestHttp::new().unwrap(),
             // Unreachable in these tests: the store fails before any request.
             cfg: AuthConfig {
                 token_url: "http://127.0.0.1:1/never".into(),
@@ -704,7 +704,7 @@ mod tests {
     async fn a_healthy_store_still_reaches_the_credential_check_through_the_wrapper() {
         let secrets: Arc<dyn SecretStore> = Arc::new(
             TimeoutStore::spawn(Duration::from_secs(5), || {
-                Ok(Box::new(quoata_core::secrets::MemoryStore::default()) as Box<dyn SecretStore>)
+                Ok(Box::new(quota_core::secrets::MemoryStore::default()) as Box<dyn SecretStore>)
             })
             .expect("the store opens promptly"),
         );
@@ -735,7 +735,7 @@ mod tests {
     /// changes its order, change it here too** — that is the whole agreement.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn the_two_stores_are_always_taken_in_the_same_order() {
-        let state = Arc::new(app_state(Arc::new(quoata_core::secrets::MemoryStore::default())));
+        let state = Arc::new(app_state(Arc::new(quota_core::secrets::MemoryStore::default())));
 
         // **Which task starts first is load-bearing, and it is measured.**
         // `register_authenticated` has no await point between its two
@@ -784,7 +784,7 @@ mod tests {
     /// the exact moment the user is recovering a quarantined account.
     #[tokio::test]
     async fn a_re_login_clears_the_quarantine_but_keeps_the_users_rename() {
-        let state = app_state(Arc::new(quoata_core::secrets::MemoryStore::default()));
+        let state = app_state(Arc::new(quota_core::secrets::MemoryStore::default()));
         let created = Utc::now() - chrono::TimeDelta::days(30);
         let last_ok = Utc::now() - chrono::TimeDelta::hours(2);
         {
@@ -852,9 +852,9 @@ mod tests {
     /// three behaviours are one test rather than three.
     #[tokio::test]
     async fn unlocking_installs_the_encrypted_file_store_and_the_poll_path_uses_it() {
-        use quoata_core::auth::stored::token_key;
-        use quoata_core::auth::token::TokenSet;
-        use quoata_core::secrets::encrypted_file::EncryptedFileStore;
+        use quota_core::auth::stored::token_key;
+        use quota_core::auth::token::TokenSet;
+        use quota_core::secrets::encrypted_file::EncryptedFileStore;
 
         let path = tmp("tokens");
         // Not due for a refresh, so `ensure_fresh` answers straight from the
