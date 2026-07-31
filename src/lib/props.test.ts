@@ -24,6 +24,7 @@ const account = (label: string): AccountView => ({
   email: label,
   state: {
     kind: 'ok',
+    credit: null,
     fetched_at: new Date().toISOString(),
     windows: [
       {

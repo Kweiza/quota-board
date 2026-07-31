@@ -9,14 +9,36 @@ export interface UsageWindow {
 }
 
 /**
+ * Mirrors `CreditSpend` in `crates/core/src/model.rs`. Change both together.
+ *
+ * Amounts are **minor units** (cents at `exponent` 2) because the endpoint
+ * sends them that way and never as a decimal; `formatMoney` does the division.
+ *
+ * `percent` is `used_minor / limit_minor` computed in Rust, **not** the
+ * endpoint's `spend.percent`, and it **may exceed 100**. Both facts are
+ * measured — see `parse_credit`'s doc comment.
+ */
+export interface CreditSpend {
+  used_minor: number
+  limit_minor: number
+  currency: string
+  exponent: number
+  percent: number
+}
+
+/**
  * Mirrors `AccountState` in `crates/core/src/model.rs`, which is serialized
  * with `#[serde(tag = "kind", rename_all = "snake_case")]`. That module carries
  * the reciprocal note; the two must be changed together.
+ *
+ * `credit` is `null` for an account with no monthly spending limit — the normal
+ * case, and **not** a zero. It is also null for the whole first poll after a
+ * restart, because the snapshot cache deliberately does not persist it.
  */
 export type AccountState =
   | { kind: 'loading' }
-  | { kind: 'ok'; windows: UsageWindow[]; fetched_at: string }
-  | { kind: 'stale'; windows: UsageWindow[]; fetched_at: string }
+  | { kind: 'ok'; windows: UsageWindow[]; credit: CreditSpend | null; fetched_at: string }
+  | { kind: 'stale'; windows: UsageWindow[]; credit: CreditSpend | null; fetched_at: string }
   | { kind: 'throttled'; until: string }
   | { kind: 'auth_expired' }
   | { kind: 'auth_dead' }

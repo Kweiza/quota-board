@@ -18,7 +18,7 @@ function view(state: AccountView['state']): AccountView {
 }
 
 const ok = (windows: ReturnType<typeof win>[], fetchedAt = NOW.toISOString()) =>
-  view({ kind: 'ok', windows, fetched_at: fetchedAt })
+  view({ kind: 'ok', windows, credit: null, fetched_at: fetchedAt })
 
 describe('AccountRow bars', () => {
   it('draws one bar when the account reports one window', () => {
@@ -75,7 +75,7 @@ describe('AccountRow states', () => {
   it('shows a stale value together with its age', () => {
     const fetched = new Date(NOW.getTime() - 12 * 60_000).toISOString()
     render(AccountRow, {
-      account: view({ kind: 'stale', windows: [win('five_hour', '5h', 20)], fetched_at: fetched }),
+      account: view({ kind: 'stale', windows: [win('five_hour', '5h', 20)], credit: null, fetched_at: fetched }),
       now: NOW,
     })
     expect(screen.getByText('12m ago')).toBeTruthy()
@@ -85,7 +85,7 @@ describe('AccountRow states', () => {
   it('keeps the bar colour at full strength on a stale row', () => {
     const fetched = new Date(NOW.getTime() - 12 * 60_000).toISOString()
     const { unmount } = render(AccountRow, {
-      account: view({ kind: 'stale', windows: [win('five_hour', '5h', 91)], fetched_at: fetched }),
+      account: view({ kind: 'stale', windows: [win('five_hour', '5h', 91)], credit: null, fetched_at: fetched }),
       now: NOW,
     })
     expect(screen.getByRole('meter').className).toContain('red')
@@ -114,7 +114,7 @@ describe('AccountRow states', () => {
       )
 
     const staleRow = render(AccountRow, {
-      account: view({ kind: 'stale', windows: [win('five_hour', '5h', 38)], fetched_at: fetched }),
+      account: view({ kind: 'stale', windows: [win('five_hour', '5h', 38)], credit: null, fetched_at: fetched }),
       now: NOW,
     })
     const stale = opacities(staleRow.container)
@@ -190,5 +190,80 @@ describe('AccountRow states', () => {
       expect(screen.queryAllByRole('meter')).toHaveLength(0)
       unmount()
     }
+  })
+})
+
+/** The measured body: $22.31 spent against a $20.00 monthly limit. */
+const CREDIT = {
+  used_minor: 2231,
+  limit_minor: 2000,
+  currency: 'USD',
+  exponent: 2,
+  percent: 111.55,
+}
+
+describe('AccountRow credit line', () => {
+  const withCredit = (credit: AccountView['state'] extends never ? never : typeof CREDIT | null) =>
+    view({
+      kind: 'ok',
+      windows: [win('five_hour', '5h', 20)],
+      credit,
+      fetched_at: NOW.toISOString(),
+    })
+
+  it('renders the spend against the limit', () => {
+    render(AccountRow, { account: withCredit(CREDIT), now: NOW })
+    expect(screen.getByText('credits')).toBeTruthy()
+    expect(screen.getByText('$22.31 / $20.00')).toBeTruthy()
+  })
+
+  /**
+   * The whole reason `parse_credit` computes the percentage instead of reading
+   * `spend.percent`: the response said 100 for this exact pair. 112 beside
+   * "$22.31 / $20.00" is the only reading that is not self-contradictory.
+   */
+  it('shows the over-limit percentage rather than clamping it to 100', () => {
+    render(AccountRow, { account: withCredit(CREDIT), now: NOW })
+    expect(screen.getByText('112%')).toBeTruthy()
+    expect(screen.queryByText('100%')).toBeNull()
+  })
+
+  it('colours an over-limit percentage red', () => {
+    const { container } = render(AccountRow, { account: withCredit(CREDIT), now: NOW })
+    const pct = container.querySelector('.credit-row .pct') as HTMLElement
+    expect(pct.className).toContain('red')
+  })
+
+  /**
+   * CLAUDE.md's never-demote-to-0% rule at the point the endpoint invites the
+   * mistake: an account that never enabled credits still reports `used` $0.00
+   * and `percent` 0, and `parse_credit` answers `null` for it. Nothing at all
+   * must be drawn — not a zero, and not a "credits off" placeholder.
+   */
+  it('draws no credit line at all when the account has none', () => {
+    const { container } = render(AccountRow, { account: withCredit(null), now: NOW })
+    expect(container.querySelector('.credit-row')).toBeNull()
+    expect(screen.queryByText('credits')).toBeNull()
+  })
+
+  it('dims the amounts when the row goes stale', () => {
+    const fetched = new Date(NOW.getTime() - 12 * 60_000).toISOString()
+    const read = (root: HTMLElement) =>
+      Number(getComputedStyle(root.querySelector('.amounts') as HTMLElement).opacity)
+
+    const staleRow = render(AccountRow, {
+      account: view({
+        kind: 'stale',
+        windows: [win('five_hour', '5h', 20)],
+        credit: CREDIT,
+        fetched_at: fetched,
+      }),
+      now: NOW,
+    })
+    const stale = read(staleRow.container)
+    staleRow.unmount()
+
+    const freshRow = render(AccountRow, { account: withCredit(CREDIT), now: NOW })
+    expect(stale).toBeLessThan(read(freshRow.container))
   })
 })
