@@ -662,7 +662,7 @@ describe('Settings start at login', () => {
     mockBackend({ autostart: { enabled: true, writable: true } })
     render(Settings)
     await settle()
-    expect((screen.getByLabelText(/Launch quota-board/) as HTMLInputElement).checked).toBe(true)
+    expect((screen.getByLabelText(/Launch Quota Board/) as HTMLInputElement).checked).toBe(true)
   })
 
   it('sends the new value', async () => {
@@ -670,7 +670,7 @@ describe('Settings start at login', () => {
     render(Settings)
     await settle()
 
-    await fireEvent.click(screen.getByLabelText(/Launch quota-board/))
+    await fireEvent.click(screen.getByLabelText(/Launch Quota Board/))
     await settle()
 
     expect(calls.find((c) => c.cmd === 'set_autostart')?.args.enabled).toBe(true)
@@ -694,10 +694,10 @@ describe('Settings start at login', () => {
     render(Settings)
     await settle()
 
-    await fireEvent.click(screen.getByLabelText(/Launch quota-board/))
+    await fireEvent.click(screen.getByLabelText(/Launch Quota Board/))
     await settle()
 
-    expect((screen.getByLabelText(/Launch quota-board/) as HTMLInputElement).checked).toBe(false)
+    expect((screen.getByLabelText(/Launch Quota Board/) as HTMLInputElement).checked).toBe(false)
   })
 
   /**
@@ -710,7 +710,7 @@ describe('Settings start at login', () => {
     render(Settings)
     await settle()
 
-    expect((screen.getByLabelText(/Launch quota-board/) as HTMLInputElement).disabled).toBe(true)
+    expect((screen.getByLabelText(/Launch Quota Board/) as HTMLInputElement).disabled).toBe(true)
     expect(screen.getByText(/development build/)).toBeTruthy()
   })
 
@@ -727,10 +727,10 @@ describe('Settings start at login', () => {
     render(Settings)
     await settle()
 
-    await fireEvent.click(screen.getByLabelText(/Launch quota-board/))
+    await fireEvent.click(screen.getByLabelText(/Launch Quota Board/))
     await settle()
 
-    expect((screen.getByLabelText(/Launch quota-board/) as HTMLInputElement).checked).toBe(false)
+    expect((screen.getByLabelText(/Launch Quota Board/) as HTMLInputElement).checked).toBe(false)
     expect(screen.getByText(/development build/)).toBeTruthy()
   })
 })
