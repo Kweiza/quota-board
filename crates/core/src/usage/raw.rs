@@ -250,9 +250,44 @@ const MONEY_KEY_NEEDLES: &[&str] = &["dollars", "credits", "amount", "balance", 
 
 const MONEY_MASK: &str = "<redacted:amount>";
 
+/// The **only** numbers allowed to survive inside a money subtree. Deny stays
+/// the default: this is an exception list of keys that describe how to *read*
+/// an amount, not an allowlist of keys that carry one. Matched whole and
+/// case-insensitively, never as a substring — `amount_decimal_places` is an
+/// amount and must keep failing this check.
+///
+/// Both entries are the same fact under the two spellings the endpoint could
+/// use, and neither is a magnitude — each is a property of the currency, which
+/// the unmasked sibling `currency` string already discloses:
+///
+/// - `exponent`: the minor-unit scale measured beside `amount_minor`
+///   (docs/research/usage-endpoint.md:143-156). Without it `amount_minor` has
+///   no meaning at all, and a silent change from 2 to 3 — cents to mills — is
+///   exactly the encoding drift §12.4 asks this panel to answer. Masking it
+///   produced `"decimal_places": "<redacted:amount>"` in the shipped window.
+/// - `decimal_places`: the same scale as a display-precision spelling.
+///
+/// A key that cannot be justified in these terms is left masked.
+const MONEY_SHAPE_KEYS: &[&str] = &["exponent", "decimal_places"];
+
 fn key_is_money(key: &str) -> bool {
     let k = key.to_ascii_lowercase();
     MONEY_SUBTREES.contains(&k.as_str()) || MONEY_KEY_NEEDLES.iter().any(|n| k.contains(n))
+}
+
+/// A bare number under a shape-describing key inside a money subtree.
+///
+/// Three conjuncts, each load-bearing: `key_is_money` is checked *first* so a
+/// future money needle that collides with one of these names keeps masking;
+/// the value must be a `Number`, so hanging a subtree off `exponent` later
+/// cannot open an unmasked island in the middle of `spend{}`; and the name
+/// must match a [`MONEY_SHAPE_KEYS`] entry whole.
+fn is_money_shape_metadata(key: &str, value: &Value) -> bool {
+    if key_is_money(key) || !value.is_number() {
+        return false;
+    }
+    let k = key.to_ascii_lowercase();
+    MONEY_SHAPE_KEYS.contains(&k.as_str())
 }
 
 /// Layer 1b: inside a money subtree, replace **numbers only**.
@@ -263,11 +298,19 @@ fn key_is_money(key: &str) -> bool {
 /// magnitude, which the app never reads (`usage::parse` touches none of these
 /// keys) and which is the one thing in this body that is nobody's business in a
 /// screenshot pasted into a public issue.
+///
+/// [`MONEY_SHAPE_KEYS`] is the single, narrow exception: the scale that says
+/// how to read an amount is not itself an amount.
 fn mask_money(v: &Value, in_money: bool) -> Value {
     match v {
         Value::Object(map) => Value::Object(
             map.iter()
-                .map(|(k, child)| (k.clone(), mask_money(child, in_money || key_is_money(k))))
+                .map(|(k, child)| {
+                    if in_money && is_money_shape_metadata(k, child) {
+                        return (k.clone(), child.clone());
+                    }
+                    (k.clone(), mask_money(child, in_money || key_is_money(k)))
+                })
                 .collect(),
         ),
         Value::Array(a) => Value::Array(a.iter().map(|c| mask_money(c, in_money)).collect()),
@@ -587,5 +630,112 @@ mod tests {
         // displays must not be collateral damage.
         assert!(text.contains("\"percent\": 39"), "a limits[] percentage was masked: {text}");
         assert!(text.contains("\"utilization\": 7.0"), "five_hour.utilization was masked: {text}");
+    }
+
+    /// The measured body encodes money as a minor-unit integer plus a scale
+    /// (docs/research/usage-endpoint.md:143-156 — `amount_minor` beside
+    /// `exponent`). Masking the scale as if it were an amount is what produced
+    /// `"decimal_places": "<redacted:amount>"` in the shipped panel: the one
+    /// number that says *how to read* the amounts was the one number the panel
+    /// could not show, so a change from cents to mills is undiagnosable.
+    #[test]
+    fn money_shape_metadata_survives_because_it_is_scale_not_magnitude() {
+        let v = serde_json::json!({
+            "five_hour": null,
+            "spend": {
+                "used": { "amount_minor": 8375, "currency": "USD", "exponent": 2,
+                          "decimal_places": 2 }
+            }
+        });
+        let text = RawResponse::capture(200, &v).body().to_string();
+        assert!(!text.contains("8375"), "the amount survived: {text}");
+        assert!(text.contains("\"exponent\": 2"), "the minor-unit scale was masked: {text}");
+        assert!(
+            text.contains("\"decimal_places\": 2"),
+            "the display scale was masked: {text}"
+        );
+    }
+
+    /// The exception is an explicit list of two keys, matched whole — not a
+    /// posture change. Anything else inside a money subtree is still masked,
+    /// including a key that merely *contains* one of the two names, because
+    /// `amount_decimal_places` is an amount.
+    #[test]
+    fn a_number_inside_a_money_subtree_that_is_not_shape_metadata_is_still_masked() {
+        let v = serde_json::json!({
+            "five_hour": null,
+            "spend": {
+                "used": { "exponent": 2, "rounding_step": 5, "amount_decimal_places": 7 },
+                "granted": 41
+            }
+        });
+        let text = RawResponse::capture(200, &v).body().to_string();
+        assert!(text.contains("\"exponent\": 2"), "the exception itself broke: {text}");
+        for masked in ["rounding_step", "amount_decimal_places", "granted"] {
+            assert!(
+                text.contains(&format!("\"{masked}\": \"{MONEY_MASK}\"")),
+                "{masked} was left visible inside a money subtree: {text}"
+            );
+        }
+    }
+
+    /// Isolates the **whole-name** conjunct, which nothing else can fail on.
+    ///
+    /// The test above reaches for `amount_decimal_places`, but that name also
+    /// contains the `amount` money needle, so it stays masked whether the match
+    /// is whole or substring — it proves the outcome without pinning the rule.
+    /// `scale_exponent` contains no needle, so `key_is_money` lets it through
+    /// and the whole-name check is the only thing standing between it and the
+    /// panel. Loosen `MONEY_SHAPE_KEYS.contains` to a `.iter().any(|s|
+    /// k.contains(s))` and this is the assertion that goes red.
+    #[test]
+    fn a_key_merely_containing_a_shape_name_is_not_the_shape_key() {
+        let v = serde_json::json!({
+            "five_hour": null,
+            "spend": { "scale_exponent": 3, "decimal_places_hint": 4, "exponent": 2 }
+        });
+        let text = RawResponse::capture(200, &v).body().to_string();
+        assert!(text.contains("\"exponent\": 2"), "the exception itself broke: {text}");
+        for masked in ["scale_exponent", "decimal_places_hint"] {
+            assert!(
+                text.contains(&format!("\"{masked}\": \"{MONEY_MASK}\"")),
+                "a substring of a shape key was treated as one: {masked} in {text}"
+            );
+        }
+    }
+
+    /// Isolates the **`key_is_money` first** conjunct.
+    ///
+    /// That guard exists for a collision that does not exist yet: no current
+    /// [`MONEY_SHAPE_KEYS`] entry matches a money needle, so no fixture can
+    /// exercise the ordering through `capture`. What *is* checkable — and what
+    /// makes the ordering safe rather than merely present — is that the two
+    /// lists stay disjoint. Add `exponent` to `MONEY_KEY_NEEDLES`, or a
+    /// needle-matching name like `credits_exponent` to `MONEY_SHAPE_KEYS`, and
+    /// this fails; without it that change would silently turn an amount key
+    /// into an exempt one, which is the only way this exception list can leak.
+    #[test]
+    fn no_shape_key_is_also_a_money_key() {
+        for shape in MONEY_SHAPE_KEYS {
+            assert!(
+                !key_is_money(shape),
+                "`{shape}` is on both lists — `key_is_money` runs first, so it stays masked, but \
+                 the exception silently stops meaning anything. Rename it or drop the needle."
+            );
+        }
+    }
+
+    /// The exception is scoped to a bare number directly under the key. A
+    /// subtree hung off `exponent` later must not become an unmasked island in
+    /// the middle of a money subtree.
+    #[test]
+    fn a_shape_key_carrying_a_subtree_does_not_unmask_what_is_under_it() {
+        let v = serde_json::json!({
+            "five_hour": null,
+            "spend": { "exponent": { "base": 10, "value": 2 } }
+        });
+        let text = RawResponse::capture(200, &v).body().to_string();
+        assert!(!text.contains("10"), "a number under a shape-key subtree survived: {text}");
+        assert!(text.contains("base"), "the surrounding shape must still be readable: {text}");
     }
 }
