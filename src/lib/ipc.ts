@@ -70,6 +70,12 @@ export function inTauri(): boolean {
 
 export const listAccounts = (): Promise<AccountView[]> => invoke('list_accounts')
 
+/**
+ * Why the account list is empty, when it is empty for a reason (docs/design.md
+ * §9.1). `null` on the ordinary first run — never render that as a problem.
+ */
+export const accountsWarning = (): Promise<string | null> => invoke('accounts_warning')
+
 export const setWidgetVisible = (visible: boolean): Promise<void> =>
   invoke('set_widget_visible', { visible })
 

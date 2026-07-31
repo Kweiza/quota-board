@@ -96,7 +96,15 @@ fn main() {
         .setup(|app| {
             // §9.1 + user decision 1: the same file `quota-cli login` writes.
             // There is one derivation of this path and both binaries call it.
-            let accounts = AccountStore::load(&quota_core::paths::accounts_file())?;
+            // Infallible: a file that cannot be read yields an empty list and a
+            // warning rather than ending the process. This used to be `?`, and a
+            // truncated `accounts.json` aborted before any window existed —
+            // measured, exit 134 — which on a transparent widget with no Dock
+            // icon is indistinguishable from the app simply not launching.
+            let accounts = AccountStore::load(&quota_core::paths::accounts_file());
+            if let Some(w) = accounts.warning() {
+                eprintln!("accounts: {w}");
+            }
 
             // §9.2's canary self-check. **Must run exactly once per process**:
             // keyring 4.1.5 flips an internal flag before registering the
@@ -242,6 +250,7 @@ fn main() {
         })
         .invoke_handler(tauri::generate_handler![
             commands::list_accounts,
+            commands::accounts_warning,
             commands::refresh_account,
             commands::set_widget_visible,
             commands::begin_login,

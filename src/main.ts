@@ -6,6 +6,7 @@ import './app.css'
 import Widget from './widget/Widget.svelte'
 import Settings from './settings/Settings.svelte'
 import {
+  accountsWarning,
   inTauri,
   isSettingsWindow,
   listAccounts,
@@ -85,6 +86,14 @@ if (isSettingsWindow()) {
       // A failed command is not a reason to blank the widget: the last list
       // stays on screen. Never demote to an empty or zero state.
       console.error('quota-board: list_accounts failed', e)
+    }
+    try {
+      // Read after the list, and separately: an empty list is only meaningful
+      // once this says whether it is empty because there is nothing yet or
+      // because the file could not be read.
+      widgetProps.warning = await accountsWarning()
+    } catch (e) {
+      console.error('quota-board: accounts_warning failed', e)
     }
   }
 

@@ -5,6 +5,7 @@
   import type { AccountView } from '../lib/types'
 
   export let accounts: AccountView[] = []
+  export let warning: string | null = null
   export let onOpenSettings: () => void = () => {}
   // §7.1 makes clicking these the only remedy AUTH_DEAD and SECRETS_LOCKED
   // have, so the row's callbacks must reach the mount site rather than stop
@@ -38,7 +39,13 @@
       onUnlock={() => onUnlock(a.uuid)}
     />
   {/each}
-  {#if accounts.length === 0}
+  {#if warning}
+    <!-- Never both, and never the empty state instead of this: an unreadable
+         account file produces an empty list, and telling that user to add an
+         account is the confidently-wrong display this project treats as its
+         worst failure mode. -->
+    <div class="empty warn">{warning}</div>
+  {:else if accounts.length === 0}
     <div class="empty">Add an account in Settings</div>
   {/if}
 </div>
@@ -62,4 +69,5 @@
           font-size: 12px; padding: 0; line-height: 1; }
   .gear:hover { color: #e5e7eb; }
   .empty { font-size: 11px; opacity: .6; padding: .5em 0; }
+  .empty.warn { color: #fbbf24; opacity: .9; }
 </style>
