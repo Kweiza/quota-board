@@ -112,12 +112,22 @@ dismiss it, every account reads as locked until the next launch you do approve.
 
 ### Linux
 
-- **An X11 session is strongly preferred.** The app forces `GDK_BACKEND=x11`.
-  Under a pure Wayland session with no XWayland, always-on-top, hiding from the
-  taskbar and the global shortcut all stop working, and the tray is then the
-  only way to get the widget back.
-- **`libayatana-appindicator3-1` must be installed** or the tray icon silently
-  never appears. The `.deb` declares it; the `.rpm` does not.
+- **An X server is required — X11 or XWayland.** The app sets
+  `GDK_BACKEND=x11` before GTK starts, so a Wayland session needs XWayland
+  present; a session without it is untested and expected to fail at launch
+  rather than to degrade. The price of forcing it is slight blurriness on HiDPI
+  displays, taken deliberately: staying on top and remembering its position is
+  what makes this a widget rather than a window, and Wayland supports neither.
+- **The global shortcut needs a real X11 connection of its own** and does not
+  follow `GDK_BACKEND`, so it can fail even where the rest of the app works.
+  When it does, the tray menu is the only way to get a hidden widget back —
+  which is why every action is in that menu rather than on the icon's click.
+- **An appindicator library must be installed** or the tray icon silently never
+  appears — and with no Dock icon and no menu bar, the tray is where Quit lives.
+  Both packages now declare it (`libayatana-appindicator3-1` on Debian,
+  `libappindicator-gtk3` on Fedora), but **the `.rpm` has never been
+  install-tested**, so treat a failed install there as a name to correct rather
+  than as a missing library.
 - **A Secret Service provider** (GNOME Keyring, KWallet) holds your tokens if
   one is running. Without one — headless boxes, bare window managers — the app
   falls back to a passphrase-encrypted file that has to be unlocked once per
@@ -178,6 +188,13 @@ so run it with `--features custom-protocol` if you want to launch it directly.
 
 The version lives in the workspace `Cargo.toml` and nowhere else — the installer
 version and the `User-Agent` this app sends are both derived from it.
+
+## Reporting problems
+
+Include the version, your platform, and — for a wrong or missing number — the
+body from **Settings → Debug → Reload**, which is masked when it is captured.
+For anything involving credentials, report it privately: see
+[SECURITY.md](SECURITY.md).
 
 ## License
 
