@@ -4,7 +4,7 @@
 set -euo pipefail
 
 CREDS="${CLAUDE_CREDS:-$HOME/.claude/.credentials.json}"
-UA="quoata-board/0.1.0-spike"
+UA="quota-board/0.1.0-spike"
 
 if [ ! -f "$CREDS" ]; then
   echo "credential file not found: $CREDS" >&2
@@ -20,8 +20,8 @@ if [ -z "$TOKEN" ]; then
 fi
 
 echo "=== request User-Agent: $UA ==="
-curl -sS -D /tmp/quoata-spike-headers.txt \
-  -o /tmp/quoata-spike-body.json \
+curl -sS -D /tmp/quota-spike-headers.txt \
+  -o /tmp/quota-spike-body.json \
   -w 'HTTP %{http_code}  %{time_total}s\n' \
   https://api.anthropic.com/api/oauth/usage \
   -H "Authorization: Bearer $TOKEN" \
@@ -30,14 +30,14 @@ curl -sS -D /tmp/quoata-spike-headers.txt \
   -H "User-Agent: $UA"
 
 echo; echo "=== response headers ==="
-cat /tmp/quoata-spike-headers.txt
+cat /tmp/quota-spike-headers.txt
 
 echo; echo "=== top-level keys ==="
-jq -r 'keys[]' /tmp/quoata-spike-body.json 2>/dev/null || cat /tmp/quoata-spike-body.json
+jq -r 'keys[]' /tmp/quota-spike-body.json 2>/dev/null || cat /tmp/quota-spike-body.json
 
 echo; echo "=== is seven_day present? ==="
-jq '.seven_day' /tmp/quoata-spike-body.json 2>/dev/null || true
+jq '.seven_day' /tmp/quota-spike-body.json 2>/dev/null || true
 
 echo; echo "=== limits[] summary ==="
 jq -c '.limits // [] | .[] | {kind, group, percent, resets_at, scope}' \
-  /tmp/quoata-spike-body.json 2>/dev/null || true
+  /tmp/quota-spike-body.json 2>/dev/null || true

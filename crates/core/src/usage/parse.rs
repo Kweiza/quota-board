@@ -1,4 +1,4 @@
-use crate::model::UsageWindow;
+use crate::model::{CreditSpend, UsageWindow};
 use chrono::{DateTime, Utc};
 use serde_json::Value;
 
@@ -171,6 +171,82 @@ pub fn parse_usage(raw: &Value) -> Result<Vec<UsageWindow>, ParseError> {
     }
 
     Ok(out)
+}
+
+/// One `{amount_minor, currency, exponent}` object. `currency` is optional
+/// because `spend.cap.credits` omits it; the two amounts this module reads
+/// both carry one, and `parse_credit` refuses them if they do not.
+struct Money {
+    minor: i64,
+    currency: Option<String>,
+    exponent: u32,
+}
+
+/// Beyond this, `10^exponent` stops being exactly representable everywhere it
+/// is divided (here, and again in the webview's formatter). No real currency
+/// comes close; a value this large means the field no longer means what we
+/// think, which is a reason to report nothing rather than a huge wrong number.
+const MAX_MONEY_EXPONENT: u32 = 8;
+
+fn parse_money(v: &Value) -> Option<Money> {
+    let obj = v.as_object()?;
+    let exponent = u32::try_from(obj.get("exponent")?.as_u64()?).ok()?;
+    if exponent > MAX_MONEY_EXPONENT {
+        return None;
+    }
+    Some(Money {
+        minor: obj.get("amount_minor")?.as_i64()?,
+        currency: obj.get("currency").and_then(Value::as_str).map(str::to_string),
+        exponent,
+    })
+}
+
+/// The monthly credit spend, or `None` when this account has no spending limit
+/// to report against.
+///
+/// **The gate is `spend.limit`, never `spend.used` and never `spend.percent`.**
+/// Measured 2026-07-31 on an account that had never enabled credits: the
+/// endpoint still sends `used: {amount_minor: 0, currency: "USD", exponent: 2}`
+/// and `percent: 0`, with only `limit` null. Gating on either of the first two
+/// paints "0% · $0.00" on an account that has no credit concept — CLAUDE.md's
+/// never-demote-a-missing-value-to-0% rule, in the one place the endpoint
+/// actively invites the mistake.
+///
+/// **`percent` is computed here, not read from `spend.percent`.** The same
+/// measurement had `used` $22.31 against a `limit` of $20.00 while the response
+/// reported `percent: 100`; the server appears to clamp once
+/// `spend_limit_reached` is set. Both numbers come from this one response, so
+/// this is a derived value and not §7.1's two-sources hazard — and printing the
+/// server's 100 next to "$22.31 / $20.00" would read as a bug while hiding an
+/// overspend that already happened.
+pub fn parse_credit(raw: &Value) -> Option<CreditSpend> {
+    let spend = raw.get("spend")?;
+    let limit = parse_money(spend.get("limit")?)?;
+    let used = parse_money(spend.get("used")?)?;
+
+    // A limit of zero has no percentage: the division is undefined, and both 0%
+    // and infinity would be inventions.
+    if limit.minor <= 0 || used.minor < 0 {
+        return None;
+    }
+    // Two amounts on different scales or in different currencies are neither a
+    // ratio nor a printable pair.
+    if used.exponent != limit.exponent {
+        return None;
+    }
+    let currency = limit.currency?;
+    if used.currency.as_deref() != Some(currency.as_str()) {
+        return None;
+    }
+
+    Some(CreditSpend {
+        used_minor: used.minor,
+        limit_minor: limit.minor,
+        currency,
+        exponent: limit.exponent,
+        // Not clamped: spending past the limit is what this line exists to show.
+        percent: used.minor as f64 / limit.minor as f64 * 100.0,
+    })
 }
 
 #[cfg(test)]
@@ -368,5 +444,109 @@ mod tests {
         assert_eq!(w[1].window_id, "weekly:Fable");
         assert_eq!(w[1].percent, 39.0);
         assert_eq!(w[1].scope.as_deref(), Some("Fable"));
+    }
+
+    /// Both credit fixtures are the real bodies measured on 2026-07-31, not
+    /// invented shapes. `credits_limit_reached` is an account whose credits were
+    /// switched off *by hitting the limit*, which is the state that carries
+    /// live values; `credits_never_enabled` is an account that never had them.
+    #[test]
+    fn credit_is_read_from_the_measured_body() {
+        let c = parse_credit(&fixture("credits_limit_reached")).expect("this body has a limit");
+        assert_eq!(c.used_minor, 2231);
+        assert_eq!(c.limit_minor, 2000);
+        assert_eq!(c.currency, "USD");
+        assert_eq!(c.exponent, 2);
+    }
+
+    /// **The endpoint's own `spend.percent` is not what we display.** The
+    /// measured body carries `spend.percent: 100` while reporting $22.31 spent
+    /// against a $20.00 limit — the server clamps once `spend_limit_reached` is
+    /// set. Rendering 100 beside "$22.31 / $20.00" reads as a bug, and hides an
+    /// overspend the user has already incurred.
+    #[test]
+    fn percent_is_computed_from_the_amounts_not_taken_from_the_response() {
+        let body = fixture("credits_limit_reached");
+        assert_eq!(
+            body["spend"]["percent"].as_f64(),
+            Some(100.0),
+            "fixture drifted: this test is only meaningful while the response disagrees"
+        );
+        let c = parse_credit(&body).unwrap();
+        assert!(
+            (c.percent - 111.55).abs() < 1e-9,
+            "expected 2231/2000 = 111.55%, got {}",
+            c.percent
+        );
+    }
+
+    /// CLAUDE.md: never demote a missing value to 0%. An account that never
+    /// enabled credits still reports `spend.used` as $0.00 **and
+    /// `spend.percent` as 0** — reading either without checking the limit
+    /// paints a credit line reading "0% · $0.00" on an account that has no
+    /// credit concept at all.
+    #[test]
+    fn an_account_that_never_enabled_credits_reports_no_credit() {
+        let body = fixture("credits_never_enabled");
+        assert_eq!(
+            body["spend"]["used"]["amount_minor"].as_i64(),
+            Some(0),
+            "fixture drifted: the trap this test guards is that `used` is present and zero"
+        );
+        assert_eq!(body["spend"]["percent"].as_f64(), Some(0.0));
+        assert_eq!(parse_credit(&body), None);
+    }
+
+    #[test]
+    fn a_body_with_no_spend_key_at_all_reports_no_credit() {
+        assert_eq!(parse_credit(&fixture("both_windows")), None);
+    }
+
+    /// A limit of zero has no percentage — the division is undefined, and
+    /// reporting 0% or infinity would both be inventions.
+    #[test]
+    fn a_zero_limit_is_not_a_percentage() {
+        let body = serde_json::json!({
+            "spend": {
+                "used": { "amount_minor": 500, "currency": "USD", "exponent": 2 },
+                "limit": { "amount_minor": 0, "currency": "USD", "exponent": 2 }
+            }
+        });
+        assert_eq!(parse_credit(&body), None);
+    }
+
+    /// Two amounts on different scales cannot be divided, and cannot be printed
+    /// as a pair. Degrade to "no credit line" rather than to a wrong ratio.
+    #[test]
+    fn amounts_on_different_scales_are_refused() {
+        let body = serde_json::json!({
+            "spend": {
+                "used": { "amount_minor": 2231, "currency": "USD", "exponent": 3 },
+                "limit": { "amount_minor": 2000, "currency": "USD", "exponent": 2 }
+            }
+        });
+        assert_eq!(parse_credit(&body), None);
+    }
+
+    /// Same reasoning for the currency: "$22.31 / €20.00" is not a ratio and
+    /// not a sentence.
+    #[test]
+    fn amounts_in_different_currencies_are_refused() {
+        let body = serde_json::json!({
+            "spend": {
+                "used": { "amount_minor": 2231, "currency": "EUR", "exponent": 2 },
+                "limit": { "amount_minor": 2000, "currency": "USD", "exponent": 2 }
+            }
+        });
+        assert_eq!(parse_credit(&body), None);
+    }
+
+    /// `used` absent is not `used` zero.
+    #[test]
+    fn a_limit_without_a_used_amount_reports_no_credit() {
+        let body = serde_json::json!({
+            "spend": { "limit": { "amount_minor": 2000, "currency": "USD", "exponent": 2 } }
+        });
+        assert_eq!(parse_credit(&body), None);
     }
 }

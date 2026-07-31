@@ -1,0 +1,36 @@
+[package]
+name = "quota-board"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[features]
+# Serves the frontend from the asset store embedded in the binary instead of
+# fetching `devUrl`. **Without this the shipped app loads http://localhost:5173**
+# — a dev server that does not exist on a user's machine — and the widget window
+# is transparent with no decorations, so it renders as nothing at all, with no
+# error anywhere. Measured: a `tauri build` of the tree before this feature
+# existed produced a binary containing `localhost:5173` and none of the bundle.
+custom-protocol = ["tauri/custom-protocol"]
+
+[build-dependencies]
+tauri-build = { version = "2.6.3", features = [] }
+
+[dependencies]
+quota-core = { path = "../crates/core" }
+tauri = { version = "2.11.5", features = ["tray-icon", "image-png", "macos-private-api"] }
+tauri-plugin-window-state = "2.4.1"
+tauri-plugin-autostart = "2.5.1"
+tauri-plugin-global-shortcut = "2.3.2"
+tauri-plugin-opener = "2"
+serde.workspace = true
+serde_json.workspace = true
+chrono.workspace = true
+tokio.workspace = true
+
+[dev-dependencies]
+# The login completion path had no test at all until Task 23. `AppState.cfg`
+# carries the token URL, so a mock endpoint is the whole seam needed — the same
+# version quota-core already uses.
+wiremock = "0.6.5"
