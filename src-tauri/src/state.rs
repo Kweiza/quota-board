@@ -345,6 +345,15 @@ impl AppState {
         // Drop the entry and rebuild it.
         sched.remove(uuid);
         sched.add(uuid);
+        // ...which hands the rebuilt entry `add`'s startup stagger, and — since
+        // it goes to the end of `order` — the largest offset of the lot.
+        // Measured on the device: the third account added through the settings
+        // window sat on `Loading` for 30 seconds, the fourth for 45, and a
+        // re-login (§7.2's remedy, with the user watching) always draws the
+        // worst case. §6.1's stagger is about startup and about staying
+        // de-synchronised over time; one deliberate registration is neither, and
+        // §6.1's floor is untouched — see `make_due_now`.
+        sched.make_due_now(uuid);
         Ok(())
     }
 
@@ -950,5 +959,33 @@ mod tests {
             "a setting that was never saved was applied to the running scheduler anyway"
         );
         std::fs::remove_file(&blocker).ok();
+    }
+
+    /// The wiring, not the scheduler. `Scheduler::make_due_now` being correct
+    /// says nothing about whether the login path calls it, and this is the one
+    /// path where the user is watching a spinner: `add` gives the new entry
+    /// `order.len() * 15s`, so with a and b already registered the account just
+    /// added waits 30 seconds, and a re-login — rebuilt at the end of `order` —
+    /// waits the longest of all.
+    #[tokio::test]
+    async fn an_account_registered_through_the_login_flow_is_polled_at_once() {
+        let state = app_state(Arc::new(LockedStore));
+        let b_before = state.scheduler.lock().await.next_wake("b").unwrap();
+
+        state.register_authenticated("c", "c@example.invalid").await.unwrap();
+
+        let sched = state.scheduler.lock().await;
+        assert!(
+            sched.next_wake("c").unwrap() <= Utc::now(),
+            "the account the user just added waits out the startup stagger"
+        );
+        // Single-account by design: §6.1's stagger is what buys the deliberate
+        // decision not to implement jitter, so registering one account must not
+        // flatten the schedule of the others.
+        assert_eq!(
+            sched.next_wake("b").unwrap(),
+            b_before,
+            "registering one account moved another account's schedule"
+        );
     }
 }
