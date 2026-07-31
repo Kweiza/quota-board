@@ -1,0 +1,121 @@
+name: build
+
+# The default branch is `main`. An earlier draft watched `master`, which does
+# not exist here — pull requests would still have run, so the gap would have
+# shown up as "main is never built" rather than as a failure.
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+  pull_request:
+  workflow_dispatch:
+
+# A public repository's workflow gets no more than it needs. `contents: write`
+# is granted per-job, only to the job that creates a release.
+permissions:
+  contents: read
+
+# A second push to the same branch cancels the first. Tags are excluded: a
+# release run that is cancelled half way leaves a partial release.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ !startsWith(github.ref, 'refs/tags/') }}
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  # The same gate a developer runs, whole. Running a subset here is worse than
+  # running nothing, because it reports green for the parts it never looked at:
+  # `-p quota-core` alone skips `quota-board`, where every test of the login
+  # completion path lives.
+  gate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      # No toolchain action. `rust-toolchain.toml` pins 1.95.0 with clippy and
+      # rustfmt, and the runners' rustup installs that on the first cargo call —
+      # so naming a version here would be a second place to bump, and installing
+      # `stable` first would download a toolchain nothing then uses. Printed so a
+      # pin that failed to apply is legible in the log rather than inferred from
+      # a later error.
+      - run: rustc --version && cargo clippy --version
+      - uses: Swatinem/rust-cache@v2
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: npm
+      - name: Tauri Linux dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libwebkit2gtk-4.1-dev libxdo-dev libssl-dev \
+            libayatana-appindicator3-dev librsvg2-dev
+      - run: npm ci
+      - run: cargo test --workspace
+      - run: cargo clippy --all-targets -- -D warnings
+      # The feature is off by default, so the default lint above never compiles
+      # the code path that actually ships. It is what makes the built app serve
+      # its own frontend instead of fetching a dev server that is not there.
+      - run: cargo clippy --all-targets --features custom-protocol -- -D warnings
+      - run: npm test -- --run
+      - run: npm run check
+
+  bundle:
+    needs: gate
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - run: rustc --version
+      - uses: Swatinem/rust-cache@v2
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: npm
+      - name: Tauri Linux dependencies
+        if: matrix.os == 'ubuntu-latest'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libwebkit2gtk-4.1-dev libxdo-dev libssl-dev \
+            libayatana-appindicator3-dev librsvg2-dev
+      - run: npm ci
+      - run: npm run tauri build
+      # `src-tauri` is a workspace member, so its output goes to the workspace
+      # target directory, not to `src-tauri/target`. An earlier draft pointed at
+      # the latter; `upload-artifact` defaults to `if-no-files-found: warn`, so
+      # that job would have passed on all three runners having uploaded nothing.
+      - uses: actions/upload-artifact@v4
+        with:
+          name: bundle-${{ matrix.os }}
+          if-no-files-found: error
+          path: |
+            target/release/bundle/deb/*.deb
+            target/release/bundle/rpm/*.rpm
+            target/release/bundle/appimage/*.AppImage
+            target/release/bundle/dmg/*.dmg
+            target/release/bundle/msi/*.msi
+
+  # Tag pushes only. CI artifacts need a signed-in GitHub account and expire, so
+  # they are a check that the build works, not a way for anyone to install it.
+  release:
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: bundle
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: artifacts/**/*
+          draft: true
+          fail_on_unmatched_files: true
+          # Drafted rather than published: nothing here is signed, so the
+          # release notes have to carry the Gatekeeper and SmartScreen
+          # instructions before anyone downloads it.
+          generate_release_notes: true
