@@ -264,6 +264,39 @@ impl Entry {
         self.in_flight_since
             .is_some_and(|t| now < t + TimeDelta::seconds(IN_FLIGHT_RECLAIM_SECS))
     }
+
+    /// Moves this entry's next poll to the earliest moment §6.1 allows — or
+    /// leaves it exactly where it is, when §7.2 or §6.2 says it must not be
+    /// polled at all.
+    ///
+    /// Every pull-forward path goes through here: visibility (§6.3), the unlock
+    /// remedy (§9.2) and a fresh registration (§10.3). The floor arithmetic
+    /// below is the thing that must never be re-derived by a second caller, and
+    /// there are now three of them.
+    fn pull_forward(&mut self, now: DateTime<Utc>, floor: TimeDelta) {
+        // §7.2's one strike and §6.2's server-ordered wait both outrank any
+        // local reason to poll sooner.
+        if self.quarantined || self.throttled_until.is_some_and(|t| t > now) {
+            return;
+        }
+        // Pull the poll forward, but never inside §6.1's per-account floor.
+        //
+        // The floor is the whole reason this arithmetic is in one place. Three
+        // callers reach it — §6.3's visibility flip, §9.2's unlock remedy and
+        // §10.3's registration — and each of them is a plausible place for a
+        // second author to write `next_due_at = now` instead.
+        //
+        // **The visibility caller is where that was measured.** Setting this to
+        // `now` unconditionally let a widget that is hidden and shown every
+        // five seconds poll every five seconds — the floor simply was not
+        // enforced on this path — and it reset the failure backoff on every
+        // flip. Focus changes and workspace switches are not rare deliberate
+        // acts. `min` keeps §6.3's "refresh the moment it becomes visible"
+        // intact for any realistic hidden duration, and the other two callers
+        // inherit the same protection rather than restating it.
+        let earliest = self.last_attempt_at.map_or(now, |t| t + floor);
+        self.next_due_at = self.next_due_at.min(now.max(earliest));
+    }
 }
 
 pub struct Scheduler<C: Clock> {
@@ -366,24 +399,13 @@ impl<C: Clock> Scheduler<C> {
 
     /// Pulls every eligible account's next poll forward to the earliest moment
     /// §6.1 allows. Extracted from `set_visible` so the visibility path and the
-    /// remedy path cannot drift; the floor arithmetic below is the thing that
-    /// must never be re-derived by a second caller.
+    /// remedy path cannot drift; `Entry::pull_forward` holds the arithmetic and
+    /// the two exclusions, so `make_due_now` cannot drift from either.
     fn pull_forward(&mut self) {
         let now = self.clock.now();
         let floor = TimeDelta::seconds(PollPolicy::MIN_INTERVAL_SECS);
         for e in self.entries.values_mut() {
-            if !e.quarantined && e.throttled_until.is_none_or(|t| t <= now) {
-                // Pull the poll forward, but never inside §6.1's per-account
-                // floor. Setting this to `now` unconditionally let a widget
-                // that is hidden and shown every five seconds poll every
-                // five seconds — the floor simply was not enforced on this
-                // path — and it reset the failure backoff on every flip.
-                // Focus changes and workspace switches are not rare
-                // deliberate acts. `min` keeps §6.3's "refresh the moment it
-                // becomes visible" intact for any realistic hidden duration.
-                let earliest = e.last_attempt_at.map_or(now, |t| t + floor);
-                e.next_due_at = e.next_due_at.min(now.max(earliest));
-            }
+            e.pull_forward(now, floor);
         }
     }
 
@@ -406,6 +428,46 @@ impl<C: Clock> Scheduler<C> {
     /// §7.2's quarantine is untouched: `pull_forward` skips `e.quarantined`.
     pub fn retry_all_now(&mut self) {
         self.pull_forward();
+    }
+
+    /// §10.3. One named account — the one the user just registered — becomes
+    /// due as soon as §6.1 allows, instead of waiting out `add`'s startup
+    /// stagger.
+    ///
+    /// **Single-account rather than a variant of `retry_all_now`, because the
+    /// stagger has to survive.** §6.1 asks for the stagger at startup, and the
+    /// jitter note under it explains why it also has to persist: each account
+    /// is anchored to its own last fetch, so accounts that start staggered stay
+    /// de-synchronised without a randomness source the injected clock could not
+    /// model. Pulling every account forward here would flatten that. One
+    /// deliberate registration is neither of those cases — after its first poll
+    /// the new account anchors to its own fetch time and lands de-synchronised
+    /// anyway — while `add`'s offset made it wait: measured, the third account
+    /// added through the settings window sat on `Loading` for 30 seconds and
+    /// the fourth for 45. A re-login is worse still: it is §7.2's remedy, the
+    /// user is watching, and `remove` + `add` rebuilds the entry at the end of
+    /// `order`, so it inherits the largest offset of all.
+    ///
+    /// **§6.1's floor is not loosened here.** `Entry::pull_forward` re-applies
+    /// it and `due()` re-checks it independently. A freshly registered account
+    /// is due immediately only because `add` builds the entry with
+    /// `last_attempt_at: None` and it has therefore never been polled — that is
+    /// pre-existing behaviour of `add`, not something this method relaxes.
+    ///
+    /// **A nudge, not a remedy.** `backoff_level`, `last_failure` and
+    /// `throttled_until` are untouched, so a server-ordered `Retry-After` still
+    /// wins (§6.2) and a row §7.1 requires to stay dimmed is not promoted — the
+    /// same reasoning `retry_all_now` records. §7.2's quarantine is skipped for
+    /// the same reason: on the only call path there is,
+    /// `register_authenticated` has already cleared the quarantine before it
+    /// gets here, so that exclusion is defence in depth against a future caller
+    /// rather than a case this one can reach.
+    pub fn make_due_now(&mut self, uuid: &str) {
+        let now = self.clock.now();
+        let floor = TimeDelta::seconds(PollPolicy::MIN_INTERVAL_SECS);
+        if let Some(e) = self.entries.get_mut(uuid) {
+            e.pull_forward(now, floor);
+        }
     }
 
     /// Accounts that should be polled right now. **At most one** — global
@@ -1581,5 +1643,128 @@ mod tests {
 
         c.advance_secs(PollPolicy::MIN_INTERVAL_SECS);
         assert_eq!(s.due(), vec!["a"], "the account never became due again after the remedy");
+    }
+
+    /// §10.3. `add`'s stagger is right for startup and wrong for the one path
+    /// where the user is watching: measured on the device, the third account
+    /// registered through the settings window showed `Loading` for 30 seconds
+    /// and the fourth for 45.
+    #[test]
+    fn a_newly_registered_account_is_due_immediately_even_behind_other_accounts() {
+        let (mut s, c) = sched();
+        for id in ["a", "b", "c"] {
+            s.add(id);
+            assert!(s.begin_poll(id));
+            s.end_poll(id);
+            s.record_success(id, win(10.0));
+        }
+        assert!(s.due().is_empty(), "premise: no existing account is due, so due() below is about the new one");
+
+        s.add("d");
+        assert_eq!(
+            s.next_wake("d").unwrap(),
+            c.now() + PollPolicy::default().stagger() * 3,
+            "premise: add() puts the fourth account three staggers out"
+        );
+
+        s.make_due_now("d");
+        assert_eq!(s.next_wake("d").unwrap(), c.now(), "the new account still waits out the stagger");
+        assert_eq!(s.due(), vec!["d"], "the account the user just added was not polled");
+
+        // A re-login is the same defect on a worse path:
+        // `register_authenticated` does `remove` + `add`, so the rebuilt entry
+        // goes to the end of `order` and inherits the largest offset there is.
+        s.remove("a");
+        s.add("a");
+        s.make_due_now("a");
+        assert_eq!(
+            s.next_wake("a").unwrap(),
+            c.now(),
+            "a re-login — §7.2's remedy, with the user watching — inherited the largest stagger"
+        );
+    }
+
+    /// The other half of the same change: only the account named by
+    /// `make_due_now` moves. §6.1's stagger is what buys the deliberate
+    /// decision not to implement jitter (the note under §6.1), so the bulk
+    /// startup path must keep every offset it installs.
+    #[test]
+    fn registering_accounts_at_startup_still_staggers_them() {
+        let (mut s, c) = sched();
+        let mut cache = HashMap::new();
+        let accounts = [account("a", false), account("b", false), account("c", false)];
+        register_accounts(&mut s, &accounts, &mut cache, &|_| None);
+
+        let stagger = PollPolicy::default().stagger();
+        assert!(stagger > TimeDelta::zero(), "a zero stagger would make this test catch nothing");
+        assert_eq!(s.next_wake("a").unwrap(), c.now());
+        assert_eq!(s.next_wake("b").unwrap(), c.now() + stagger, "the startup burst is back");
+        assert_eq!(s.next_wake("c").unwrap(), c.now() + stagger * 2, "the startup burst is back");
+    }
+
+    /// §7.2 is one strike, and a nudge is not a remedy. On the only shipped
+    /// call path `register_authenticated` has already cleared the quarantine,
+    /// so this pins the exclusion for whatever calls it next.
+    ///
+    /// The assertion is on `next_wake`, **not** on `due()`: `due()` re-checks
+    /// `quarantined` itself, so it answers "empty" even with the exclusion in
+    /// `Entry::pull_forward` deleted — the same blind spot
+    /// `a_remedy_makes_a_backed_off_account_due_again_without_breaking_the_floor`
+    /// records. The backoff earned below is what makes the move visible at all:
+    /// `record_failure(AuthDead)` returns before touching `next_due_at`, so
+    /// without the preceding network failures the schedule is already at `now`
+    /// and nothing could move.
+    #[test]
+    fn a_quarantined_account_is_not_made_due_by_the_registration_nudge() {
+        let (mut s, c) = sched();
+        s.add("a");
+        for _ in 0..4 {
+            assert!(s.begin_poll("a"));
+            s.record_failure("a", FailureKind::Network);
+            s.end_poll("a");
+        }
+        s.record_failure("a", FailureKind::AuthDead);
+        let before = s.next_wake("a").unwrap();
+        assert!(
+            before > c.now() + TimeDelta::seconds(PollPolicy::MIN_INTERVAL_SECS),
+            "premise: the backoff must sit beyond the floor, or the nudge could not move it"
+        );
+
+        s.make_due_now("a");
+
+        assert_eq!(s.next_wake("a").unwrap(), before, "a quarantined account was rescheduled");
+        c.advance_secs(100_000);
+        assert!(s.due().is_empty(), "a quarantined account was polled again");
+    }
+
+    /// §6.2: the wait after a 429 is the server's, not a local preference. The
+    /// nudge is a scheduling hint, so it loses — the same rule
+    /// `changing_the_interval_does_not_shorten_a_server_ordered_backoff` pins
+    /// for the settings path.
+    #[test]
+    fn a_server_ordered_throttle_outlasts_the_registration_nudge() {
+        let (mut s, c) = sched();
+        s.add("a");
+        assert!(s.begin_poll("a"));
+        s.end_poll("a");
+        let started = c.now();
+        s.record_throttle("a", 300);
+
+        s.make_due_now("a");
+
+        // Again on `next_wake`: `due()` re-checks `throttled_until` on its own,
+        // so it cannot see this schedule being dragged inside the server's wait.
+        assert_eq!(
+            s.next_wake("a").unwrap(),
+            started + TimeDelta::seconds(300),
+            "the nudge overrode the server's Retry-After"
+        );
+        assert_eq!(
+            s.state("a"),
+            Some(AccountState::Throttled { until: started + TimeDelta::seconds(300) }),
+            "the throttle itself must survive too"
+        );
+        c.advance_secs(301);
+        assert_eq!(s.due(), vec!["a"], "and the account must come back once the wait expires");
     }
 }
