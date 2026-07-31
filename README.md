@@ -3,17 +3,15 @@
 A desktop widget showing the 5-hour and 7-day usage limits of several Claude
 accounts at once.
 
-> **Status: work in progress. There is no release to install.**
+> **Status: complete but unreleased. Build it yourself — see [Installing](#installing).**
 >
-> The headless core is implemented and tested: account metadata, token storage
-> (OS keychain with an encrypted-file fallback), the OAuth flow with per-account
-> refresh serialization, usage-response parsing, the live usage fetch, and the
-> polling-policy state machine. A headless CLI exercises all of it end to end
-> against real accounts.
+> The widget, the settings window, the tray, start-at-login and both login
+> routes are implemented, and the whole thing has been run against real
+> accounts. What is missing is distribution: nothing is code-signed and no
+> version has been tagged, so there is no download.
 >
-> **The Tauri desktop UI is not written yet** — that is the remaining work.
-> `crates/core` is deliberately Tauri-unaware, so everything above builds and
-> tests with no GTK or WebKit present.
+> `crates/core` is deliberately Tauri-unaware, so the core builds and tests with
+> no GTK or WebKit present.
 
 ## Why it exists
 
@@ -68,9 +66,10 @@ rate-limit circumvention.
 
 Anthropic has no third-party OAuth client registration program, so this app has
 to reuse Claude Code's public client_id. **The OAuth consent screen therefore
-displays "Claude Code" rather than this application's name.** The client_id is
-overridable via configuration, so if third-party registration ever becomes
-available it can be switched immediately.
+displays "Claude Code" rather than this application's name.** It is a single
+constant in one file, so if third-party registration ever becomes available,
+switching is a one-line change and a rebuild — there is no setting for it
+today.
 
 ### One machine will hold all your tokens
 
@@ -85,16 +84,100 @@ with a passphrase you choose (Argon2id + XChaCha20-Poly1305) when it is not —
 which is the common case on headless Linux, over SSH, and under minimal window
 managers.
 
+## Installing
+
+There is no signed release yet, so building it is the only way to install it.
+You need [Rust](https://rustup.rs) and Node 24; the pinned toolchain installs
+itself from `rust-toolchain.toml`.
+
+```bash
+npm ci
+npm run tauri build
+```
+
+The installers land in `target/release/bundle/` — `.dmg` on macOS, `.msi` on
+Windows, `.deb`/`.rpm`/`.AppImage` on Linux. Prefer the `.deb` or `.rpm` on
+Linux: they are a few megabytes, while the AppImage carries its own copy of
+WebKitGTK and is an order of magnitude larger.
+
+**Nothing is code-signed.** macOS will refuse the first launch; open it once
+from Finder's right-click → Open, or clear the quarantine flag with
+`xattr -dr com.apple.quarantine "/Applications/Quota Board.app"`. Windows
+SmartScreen will warn; the bypass is *More info* → *Run anyway*.
+
+**On macOS an unsigned build changes identity every time you rebuild it**, and
+keychain items are bound to that identity. The system will ask again for
+permission to read your stored tokens after an update, once per account. If you
+dismiss it, every account reads as locked until the next launch you do approve.
+
+### Linux
+
+- **An X11 session is strongly preferred.** The app forces `GDK_BACKEND=x11`.
+  Under a pure Wayland session with no XWayland, always-on-top, hiding from the
+  taskbar and the global shortcut all stop working, and the tray is then the
+  only way to get the widget back.
+- **`libayatana-appindicator3-1` must be installed** or the tray icon silently
+  never appears. The `.deb` declares it; the `.rpm` does not.
+- **A Secret Service provider** (GNOME Keyring, KWallet) holds your tokens if
+  one is running. Without one — headless boxes, bare window managers — the app
+  falls back to a passphrase-encrypted file that has to be unlocked once per
+  boot, in Settings.
+- **Do not expect a 30MB tray app.** That figure is quoted for Tauri often and
+  is not true on Linux, where the webview is a separate WebKitGTK process tree.
+  Published measurements of a *default* Tauri app on Ubuntu put it around 185MB
+  PSS, comparable to Electron. This project has not measured its own footprint,
+  so that is the neighbourhood rather than a number for this app.
+
+## Using it
+
+The widget is a small always-on-top card. It has no Dock icon and no menu bar of
+its own; **everything that is not a usage row lives in two places.**
+
+- **The gear on the widget** opens Settings — add and remove accounts, rename
+  them, set the polling interval, unlock the encrypted token store, and inspect
+  the last raw response.
+- **The tray icon** shows or hides the widget and quits the app. `Ctrl+Alt+Q`
+  toggles the widget too, where the OS allows it.
+
+To add an account, press **Add account** in Settings and approve in the browser
+that opens. If the browser cannot be opened, or is on another machine, the
+window falls back to a link you can copy anywhere and a box to paste the
+resulting code into.
+
+## Uninstalling
+
+Removing the application leaves three things behind, and none of them are
+removed for you:
+
+- **Your tokens**, in the OS keychain under the service name `quota-board`, one
+  entry per account. Delete them in Keychain Access on macOS, `seahorse` or
+  `secret-tool` on Linux, or Credential Manager on Windows. Removing an account
+  in Settings first also revokes it server-side, which is the tidier route.
+- **Account metadata and settings**, in `quota-board/` under your platform's
+  config directory — no tokens are in there.
+- **A login item**, if you enabled start-at-login: `Quota Board.plist` in
+  `~/Library/LaunchAgents`, an XDG autostart entry, or an HKCU `Run` value.
+
 ## Building
 
 ```bash
-cargo test -p quota-core                  # run the test suite
-cargo clippy --all-targets -- -D warnings  # lint
+cargo test --workspace                                        # Rust tests
+cargo clippy --all-targets -- -D warnings                     # lint
+cargo clippy --all-targets --features custom-protocol -- -D warnings
+npm test -- --run                                             # front-end tests
+npm run check                                                 # type gate
 ```
 
-The core library is Tauri-unaware and builds and tests headlessly, with no GTK
-or WebKit needed. The desktop application will additionally require the Tauri
-v2 system dependencies.
+The second clippy run is not redundant: `custom-protocol` is off by default, and
+it is the feature that makes a built app serve its own frontend instead of
+fetching a dev server. Code behind it is not compiled otherwise.
+
+`npm run tauri dev` runs the app against the Vite dev server. A plain
+`cargo build -p quota-board` produces a binary that still expects that server,
+so run it with `--features custom-protocol` if you want to launch it directly.
+
+The version lives in the workspace `Cargo.toml` and nowhere else — the installer
+version and the `User-Agent` this app sends are both derived from it.
 
 ## License
 
