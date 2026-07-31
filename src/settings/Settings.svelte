@@ -11,15 +11,24 @@
     listAccounts,
     onAccountsChanged,
     onAuthFailed,
+    onManualFallback,
     refreshAccount,
     removeAccount,
     renameAccount,
     reorderAccounts,
     setSettings,
     storeStatus,
+    submitManualCode,
     unlockSecrets,
   } from '../lib/ipc'
-  import type { AccountView, RawResponse, SettingsView, StoreStatus } from '../lib/types'
+  import type {
+    AccountView,
+    LoginUrls,
+    ManualFallback,
+    RawResponse,
+    SettingsView,
+    StoreStatus,
+  } from '../lib/types'
 
   /**
    * The settings window owns every command; `AccountList` only reports clicks.
@@ -180,10 +189,19 @@
           // The two events do not race for one outcome — they report different
           // ones.
           error = null
+          // The login is over, however it finished, so the paste form goes with
+          // it — leaving it up would invite a code for a login that is done.
+          fallback = null
           void pullAccounts()
         }),
         await onAuthFailed((message) => {
           error = message
+        }),
+        // The other two of §10.3's four loopback failures: both are seen only
+        // by the background task, and neither ends the login.
+        await onManualFallback((f) => {
+          fallback = f
+          error = null
         }),
       ]
       // Closing this window is a hide, not a destroy
@@ -212,11 +230,60 @@
     // to prevent — with the extra failure that success arrives on
     // `accounts://changed`, so a flag cleared only on `auth://failed` would
     // disable the button for the life of the process.
+    let urls: LoginUrls
     try {
-      await openUrl(await beginLogin())
-      error = null
+      urls = await beginLogin()
     } catch (e) {
+      // `begin_login` refused outright — a login is already in progress, or the
+      // authorize URL is misconfigured (§10.2). There is no manual URL to fall
+      // back to, because none was built.
       error = String(e)
+      return
+    }
+    error = null
+
+    // Two of §10.3's four loopback failures are visible only here, and the Rust
+    // side never learns about either, so neither can arrive as an event.
+    if (urls.loopback === null) {
+      fallback = {
+        url: urls.manual,
+        reason: 'no local port could be opened for the browser to reply to',
+      }
+      return
+    }
+    try {
+      await openUrl(urls.loopback)
+    } catch (e) {
+      fallback = { url: urls.manual, reason: `the browser could not be opened (${String(e)})` }
+    }
+  }
+
+  /**
+   * §10.3's paste path, offered only once the loopback half cannot finish.
+   *
+   * Not an `error`: this is a login that can still succeed, and putting it in
+   * the warning banner would say the opposite. The banner stays for things that
+   * are actually over.
+   */
+  let fallback: ManualFallback | null = null
+  let pasted = ''
+  let submitting = false
+
+  async function submitCode(): Promise<void> {
+    if (submitting || pasted.trim() === '') return
+    submitting = true
+    try {
+      await submitManualCode(pasted)
+      error = null
+      pasted = ''
+      // The block itself is cleared by `accounts://changed`, which is also what
+      // re-reads the list — the login is not finished until that arrives.
+    } catch (e) {
+      // Every refusal from `submit_manual_code` is a different sentence naming
+      // what to do next, so it is shown as-is.
+      error = String(e)
+    } finally {
+      submitting = false
     }
   }
 
@@ -321,6 +388,39 @@
       <p class="hint">No accounts yet.</p>
     {/if}
     <button on:click={addAccount}>Add account</button>
+
+    <!-- docs/design.md §10.3. Shown only after the automatic half has given up;
+         until then this whole block is absent, which is the decision recorded
+         in the plan (a permanently visible "can't open a browser?" disclosure
+         would be clutter for everyone who never needs it). -->
+    {#if fallback}
+      {@const fb = fallback}
+      <div class="fallback">
+        <p class="warn">{fb.reason}.</p>
+        <p class="hint">
+          Open the link below in any browser — it does not have to be this
+          machine — approve there, then paste the <code>code#state</code> line
+          the page shows you.
+        </p>
+        <!-- Selectable, and that is the point: the case this exists for is a
+             machine that cannot open a browser at all, where a button is
+             useless and copying the address elsewhere is the only way through.
+             The button is for the narrower case where a browser exists but
+             could not be launched automatically. -->
+        <p class="url">{fb.url}</p>
+        <button on:click={() => void openUrl(fb.url)}>Open in browser</button>
+        <label for="manual-code">Code from the page</label>
+        <input
+          id="manual-code"
+          placeholder="code#state"
+          bind:value={pasted}
+          disabled={submitting}
+        />
+        <button on:click={submitCode} disabled={submitting || pasted.trim() === ''}>
+          Submit
+        </button>
+      </div>
+    {/if}
     <!-- Reworded from the note on `pkce::begin` in
          `crates/core/src/auth/pkce.rs`. The two must not drift: if that comment
          changes, change this sentence. -->
@@ -479,6 +579,16 @@
   .hint { font-size: 11px; opacity: .7; margin: .5em 0 0; }
   .note { font-size: 11px; opacity: .85; margin: .5em 0 0; }
   .warn { font-size: 11px; color: #fbbf24; margin: .5em 0 0; }
+  .fallback { margin-top: .75em; padding: .6em .7em; border-radius: 6px;
+              background: rgba(255, 255, 255, .04); }
+  /* `user-select: text` is load-bearing, not cosmetic — see the note above the
+     element. `break-all` because an authorize URL is one long unbreakable run
+     and would otherwise push this panel wider than the window. */
+  .settings .url { user-select: text; font-size: 11px; margin: .5em 0;
+                   font-family: ui-monospace, monospace; word-break: break-all;
+                   background: rgba(0, 0, 0, .35); padding: .4em; border-radius: 4px; }
+  .settings .fallback input { width: 100%; box-sizing: border-box; padding: .25em .35em;
+                              margin-bottom: .5em; }
   /* Selectable on purpose: copying this into an issue is the panel's reason to
      exist, which is also why the masking behind it is more aggressive than
      anywhere else in the app. */

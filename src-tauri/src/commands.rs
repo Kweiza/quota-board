@@ -1,6 +1,8 @@
 use crate::state::{AppState, StoreKind};
 use quota_core::auth::callback::Callback;
-use quota_core::auth::pkce::{begin, success_redirect, PendingAuth};
+use quota_core::auth::pkce::{
+    authorize_url_for, begin, manual_redirect_uri, parse_manual_code, success_redirect, PendingAuth,
+};
 use quota_core::auth::stored::token_key;
 use quota_core::auth::token::{exchange_code, revoke, TokenSet};
 use quota_core::model::AccountState;
@@ -132,11 +134,36 @@ impl Drop for LoginGuard {
     }
 }
 
-/// Starts a login. Returns the authorize URL; the callback is awaited in the
-/// background. On completion an `accounts://changed` event is emitted, and on
-/// any failure an `auth://failed` event carrying a message.
+/// The two authorize URLs one login has (§10.3: "Always construct both URLs").
+///
+/// Mirrors `LoginUrls` in `src/lib/types.ts`. Change both together.
+#[derive(serde::Serialize)]
+pub struct LoginUrls {
+    /// `None` when no loopback socket could be bound, which is not fatal: the
+    /// manual redirect needs no local port, so the login continues with the
+    /// paste path alone.
+    pub loopback: Option<String>,
+    pub manual: String,
+}
+
+/// Payload of `auth://manual-fallback`. Mirrors `ManualFallback` in
+/// `src/lib/types.ts`. Change both together.
+#[derive(Clone, serde::Serialize)]
+pub struct ManualFallback {
+    pub url: String,
+    /// Why the loopback path is not going to finish. Shown verbatim, so it is
+    /// written for the user, not for a log.
+    pub reason: String,
+}
+
+/// Starts a login. Returns both authorize URLs; the loopback callback, when
+/// there is one, is awaited in the background.
+///
+/// Events: `accounts://changed` on success, `auth://failed` when a login
+/// definitely cannot be recovered, and `auth://manual-fallback` when the
+/// loopback path gave up but §10.3's paste path still can finish it.
 #[tauri::command]
-pub async fn begin_login(app: tauri::AppHandle) -> Result<String, String> {
+pub async fn begin_login(app: tauri::AppHandle) -> Result<LoginUrls, String> {
     if LOGIN_IN_FLIGHT
         .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
         .is_err()
@@ -150,12 +177,45 @@ pub async fn begin_login(app: tauri::AppHandle) -> Result<String, String> {
     // Bind before building the authorize URL: `redirect_uri` must carry the
     // real port, and that exact string is replayed at token exchange
     // (auth/callback.rs:25-27, pkce.rs `PendingAuth::redirect_uri`).
-    let cb = Callback::bind().await.map_err(|e| e.to_string())?;
+    //
+    // **A bind failure is no longer fatal.** It used to end the login; §10.3's
+    // manual redirect needs no socket of our own, so the only thing lost is the
+    // automatic half.
+    let cb = Callback::bind().await;
     // `begin` returns a `Result` because `authorize_url` is user-overridable
     // (§10.2), so a bad config value surfaces here instead of crashing a login
     // in progress (pkce.rs:75-81).
-    let (pending, url) = begin(&cfg, &cb.redirect_uri()).map_err(|e| e.to_string())?;
+    let (pending, loopback) = match &cb {
+        Ok(cb) => {
+            let (p, u) = begin(&cfg, &cb.redirect_uri()).map_err(|e| e.to_string())?;
+            (p, Some(u))
+        }
+        // The PKCE pair still has to exist for the paste path, and this one is
+        // born with the manual redirect_uri because it will never be exchanged
+        // against any other.
+        Err(_) => (begin(&cfg, manual_redirect_uri()).map_err(|e| e.to_string())?.0, None),
+    };
 
+    let manual = authorize_url_for(&cfg, &pending, manual_redirect_uri()).map_err(|e| e.to_string())?;
+
+    // Stored before either path runs — see `AppState::pending_manual`. Only the
+    // redirect_uri differs from `pending`; sharing the verifier and state is
+    // what lets a code issued for either URL be exchanged here.
+    *app.state::<AppState>().pending_manual.lock().unwrap() = Some(PendingAuth {
+        verifier: pending.verifier.clone(),
+        state: pending.state.clone(),
+        redirect_uri: manual_redirect_uri().to_string(),
+    });
+
+    let Ok(cb) = cb else {
+        // Nothing to wait on, so `guard` drops here and releases the
+        // single-flight flag rather than stranding it behind a task that does
+        // not exist. The webview sees `loopback: None` and goes straight to the
+        // paste form.
+        return Ok(LoginUrls { loopback: None, manual });
+    };
+
+    let fallback_url = manual.clone();
     let handle = app.clone();
     tauri::async_runtime::spawn(async move {
         // Moved in, so the single-flight flag is released whichever way this
@@ -178,20 +238,40 @@ pub async fn begin_login(app: tauri::AppHandle) -> Result<String, String> {
         )
         .await;
 
+        // Everything up to holding a code is a *loopback* failure, and §10.3's
+        // paste path can still finish the same login — the PKCE pair is shared
+        // and already stored. So these three report `auth://manual-fallback`
+        // rather than `auth://failed`, which would tell the user a login had
+        // ended when the half that can still work has not been offered yet.
+        //
+        // Each reason is a different sentence on purpose: "no callback arrived"
+        // and "the callback was unreadable" send the user to different places,
+        // and the first is the ordinary outcome of authorising in a browser on
+        // another machine, which is the case this whole path exists for.
+        let fallback = |reason: &str| {
+            let _ = handle.emit(
+                "auth://manual-fallback",
+                ManualFallback { url: fallback_url.clone(), reason: reason.to_string() },
+            );
+        };
+
         let params = match waited {
             Ok(Ok(p)) => p,
             Ok(Err(e)) => {
-                let _ = handle.emit("auth://failed", e.to_string());
+                fallback(&format!("the browser reached this app but the reply could not be read ({e})"));
                 return;
             }
             Err(_) => {
-                let _ = handle.emit("auth://failed", "the login timed out");
+                fallback(
+                    "no reply arrived from the browser. If it opened on another machine, \
+                     it could not have reached this one",
+                );
                 return;
             }
         };
 
         let (Some(code), Some(returned_state)) = (params.get("code"), params.get("state")) else {
-            let _ = handle.emit("auth://failed", "the callback carried no code or no state");
+            fallback("the browser replied without an authorization code");
             return;
         };
 
@@ -207,7 +287,54 @@ pub async fn begin_login(app: tauri::AppHandle) -> Result<String, String> {
         }
     });
 
-    Ok(url)
+    Ok(LoginUrls { loopback, manual })
+}
+
+/// §10.3's paste path: finishes a login whose loopback half did not.
+///
+/// Every refusal is a different sentence. "There is no login waiting", "that is
+/// not the right shape" and "that belongs to an older attempt" need three
+/// different actions from the user, and one shared message would leave them
+/// guessing which.
+#[tauri::command]
+pub async fn submit_manual_code(app: tauri::AppHandle, pasted: String) -> Result<(), String> {
+    finish_manual_login(&app.state::<AppState>(), &pasted).await?;
+    let _ = app.emit("accounts://changed", ());
+    Ok(())
+}
+
+/// The whole of `submit_manual_code` except the event, so that it can be
+/// tested: `src-tauri` has no dev-dependency on tauri's `test` feature, and a
+/// function holding an `AppHandle` cannot be called without one. Same split as
+/// `complete_login`, for the same reason.
+pub(crate) async fn finish_manual_login(state: &AppState, pasted: &str) -> Result<(), String> {
+    let (code, returned_state) = parse_manual_code(pasted).ok_or(
+        "that is not a code#state line. Copy the whole line from the page, \
+         including the # and everything after it",
+    )?;
+
+    // Cloned out from under the lock rather than held across the exchange: this
+    // is a `std::sync` guard and `complete_login` awaits.
+    let pending = state
+        .pending_manual
+        .lock()
+        .unwrap()
+        .clone()
+        .ok_or("no login is waiting for a code. Press Add account to start one")?;
+
+    // **Advisory, not the enforcement.** `exchange_code` performs this same
+    // comparison before it touches the network (auth/token.rs:226-231) and is
+    // the authority; if the two ever disagreed, that one still refuses. This
+    // exists only because its message — "state mismatch, the callback cannot be
+    // trusted" — is written for the loopback path and says nothing a user
+    // holding a pasted line can act on.
+    if returned_state != pending.state {
+        return Err("that code belongs to an older login attempt. Press Add account \
+                    and use the link it gives you"
+            .into());
+    }
+
+    complete_login(state, &pending, code, returned_state).await
 }
 
 /// Exchanges an authorization code, stores the token, and registers the
@@ -264,6 +391,13 @@ pub(crate) async fn complete_login(
         .register_authenticated(&identity.uuid, &identity.email)
         .await
         .map_err(|e| format!("the account could not be saved: {e}"))?;
+
+    // The login is over, so §10.3's paste copy of it is a dead value. Left
+    // behind, the next loopback failure would hand the user a form that refuses
+    // every code as belonging to an older attempt. Cleared here rather than in
+    // `submit_manual_code` so a login finished through the loopback clears it
+    // too — both routes end here.
+    *state.pending_manual.lock().unwrap() = None;
 
     Ok(())
 }
@@ -606,4 +740,138 @@ pub async fn last_response(
     uuid: String,
 ) -> Result<Option<RawResponse>, String> {
     Ok(state.last_raw_for(&uuid))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::state::tests::app_state;
+    use quota_core::auth::pkce::PendingAuth;
+    use quota_core::secrets::MemoryStore;
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    /// The manual pending a `begin_login` would have left behind.
+    fn armed(state: &AppState) -> PendingAuth {
+        let pending = PendingAuth {
+            verifier: "v-verifier".into(),
+            state: "s-state".into(),
+            redirect_uri: manual_redirect_uri().to_string(),
+        };
+        *state.pending_manual.lock().unwrap() = Some(pending.clone());
+        pending
+    }
+
+    fn token_body(account: Option<serde_json::Value>) -> serde_json::Value {
+        let mut body = serde_json::json!({
+            "access_token": "at-1",
+            "refresh_token": "rt-1",
+            "expires_in": 3600,
+            "refresh_token_expires_in": 86400,
+            "scope": "user:profile",
+        });
+        if let Some(a) = account {
+            body["account"] = a;
+        }
+        body
+    }
+
+    async fn state_against(server: &MockServer) -> AppState {
+        let mut state = app_state(Arc::new(MemoryStore::default()));
+        state.cfg.token_url = format!("{}/v1/oauth/token", server.uri());
+        state
+    }
+
+    #[tokio::test]
+    async fn a_paste_with_no_login_waiting_is_refused_by_name() {
+        let state = app_state(Arc::new(MemoryStore::default()));
+        let e = finish_manual_login(&state, "code#s-state").await.unwrap_err();
+        assert!(e.contains("no login is waiting"), "{e}");
+    }
+
+    /// The paste is refused **before** the pending is consulted, so a user who
+    /// pasted the URL instead of the code is told which of the two they got
+    /// wrong.
+    #[tokio::test]
+    async fn a_paste_that_is_not_code_hash_state_is_refused_by_name() {
+        let state = app_state(Arc::new(MemoryStore::default()));
+        armed(&state);
+        for bad in ["justacode", "#s-state", "a#b#c", ""] {
+            let e = finish_manual_login(&state, bad).await.unwrap_err();
+            assert!(e.contains("code#state"), "{bad:?} produced the wrong message: {e}");
+        }
+    }
+
+    /// A code from a login that has since been replaced. `exchange_code` would
+    /// also refuse this, but with a sentence about a callback the user never
+    /// saw — hence the advisory check ahead of it.
+    #[tokio::test]
+    async fn a_code_from_an_older_attempt_is_refused_by_name() {
+        let state = app_state(Arc::new(MemoryStore::default()));
+        armed(&state);
+        let e = finish_manual_login(&state, "the-code#a-different-state").await.unwrap_err();
+        assert!(e.contains("older login attempt"), "{e}");
+    }
+
+    /// The whole point of the task: a pasted code registers the account and
+    /// stores its token. Nothing in this repository covered this path before.
+    #[tokio::test]
+    async fn a_good_paste_stores_the_token_and_registers_the_account() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/oauth/token"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(token_body(Some(
+                serde_json::json!({ "uuid": "u-42", "email_address": "who@example.invalid" }),
+            ))))
+            .mount(&server)
+            .await;
+
+        let state = state_against(&server).await;
+        armed(&state);
+
+        finish_manual_login(&state, "  the-code#s-state \n").await.unwrap();
+
+        let stored = state.secrets().get(&token_key("u-42")).unwrap();
+        assert!(stored.is_some(), "the token never reached the store");
+        let tokens: TokenSet = serde_json::from_slice(&stored.unwrap()).unwrap();
+        assert_eq!(tokens.access_token, "at-1");
+
+        let accounts = state.accounts.lock().await;
+        let a = accounts.list().iter().find(|a| a.uuid == "u-42").expect("account not registered");
+        assert_eq!(a.email, "who@example.invalid");
+
+        // The login is over; the paste form must not stay armed with a value
+        // that would refuse every later code as belonging to an older attempt.
+        assert!(
+            state.pending_manual.lock().unwrap().is_none(),
+            "the finished login was left armed"
+        );
+    }
+
+    /// §9.3: `account.uuid` is the primary key and the email is display-only,
+    /// so a response with no account block has no key to store under. It must
+    /// fail rather than substitute the email — and it must not leave a token
+    /// behind under some other name.
+    #[tokio::test]
+    async fn a_response_without_an_account_block_is_refused_and_stores_nothing() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/oauth/token"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(token_body(None)))
+            .mount(&server)
+            .await;
+
+        let state = state_against(&server).await;
+        armed(&state);
+
+        let e = finish_manual_login(&state, "the-code#s-state").await.unwrap_err();
+        assert!(e.contains("no account block"), "{e}");
+        assert!(
+            state.accounts.lock().await.list().iter().all(|a| a.email != "who@example.invalid"),
+            "an account was registered from a response that carried no uuid"
+        );
+        // Still armed: the user may paste again, and a refused attempt must not
+        // cost them the URL.
+        assert!(state.pending_manual.lock().unwrap().is_some(), "a refusal disarmed the form");
+    }
 }

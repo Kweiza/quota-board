@@ -1,6 +1,6 @@
 use chrono::Utc;
 use quota_core::accounts::{Account, AccountStore};
-use quota_core::auth::pkce::AuthConfig;
+use quota_core::auth::pkce::{AuthConfig, PendingAuth};
 use quota_core::auth::stored::{ensure_fresh, RefreshLocks};
 use quota_core::auth::token::ReqwestHttp;
 use quota_core::scheduler::{
@@ -74,6 +74,27 @@ pub struct AppState {
     /// Same `std::sync` rule as `secrets`: taken and released inside one
     /// statement, never across an `await`.
     pub(crate) last_raw: std::sync::Mutex<RawLog>,
+    /// §10.3's manual-paste login, waiting for the user to bring a code back.
+    ///
+    /// Its `redirect_uri` is always the manual one, so `complete_login` needs no
+    /// branch: `exchange_code` replays whatever is in here.
+    ///
+    /// **Written on every `begin_login`, not only when the loopback fails.**
+    /// Two of the four ways the loopback can fail are detected in the webview —
+    /// a `Callback::bind` that never happened and an `openUrl` that threw — and
+    /// the webview cannot reach this field. Storing it up front is what lets
+    /// all four failures share one paste path.
+    ///
+    /// Holding a login here does **not** hold `LOGIN_IN_FLIGHT`. Nothing is
+    /// waiting once the loopback is abandoned, and a flag with no task behind it
+    /// is the state `LoginGuard`'s comment exists to prevent. A second
+    /// `begin_login` therefore replaces this value, and a code pasted from the
+    /// replaced login is refused on its `state` — which is the correct answer,
+    /// not a bug.
+    ///
+    /// Same `std::sync` rule as `secrets`: taken and released inside one
+    /// statement, never across an `await`.
+    pub(crate) pending_manual: std::sync::Mutex<Option<PendingAuth>>,
     pub http: ReqwestHttp,
     pub cfg: AuthConfig,
     /// Per-account refresh locks (Task 10b). **Exactly one instance may exist
@@ -562,7 +583,7 @@ pub async fn poll_loop(handle: tauri::AppHandle) {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use quota_core::accounts::Account;
     use quota_core::model::AccountState;
@@ -628,13 +649,13 @@ mod tests {
     /// The healthy default: a keychain-kind store and a throwaway settings
     /// file. Kept as its own function so the two polling tests that predate
     /// Task 18 read exactly as they did.
-    fn app_state(secrets: Arc<dyn SecretStore>) -> AppState {
+    pub(crate) fn app_state(secrets: Arc<dyn SecretStore>) -> AppState {
         app_state_with(secrets, StoreKind::Keychain, tmp("settings"))
     }
 
     /// The real builder, for the tests that need to say which kind of store is
     /// installed or where the settings file lives.
-    fn app_state_with(
+    pub(crate) fn app_state_with(
         secrets: Arc<dyn SecretStore>,
         kind: StoreKind,
         settings_path: PathBuf,
@@ -652,6 +673,7 @@ mod tests {
             settings: Mutex::new(SettingsStore::load(&settings_path)),
             secrets: RwLock::new(SecretsHandle { store: secrets, kind }),
             last_raw: std::sync::Mutex::new(RawLog::default()),
+            pending_manual: std::sync::Mutex::new(None),
             http: quota_core::auth::token::ReqwestHttp::new().unwrap(),
             // Unreachable in these tests: the store fails before any request.
             cfg: AuthConfig {

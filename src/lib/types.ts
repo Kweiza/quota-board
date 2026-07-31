@@ -106,3 +106,23 @@ export interface RawResponse {
   truncated: boolean
   body: string
 }
+
+/**
+ * Mirrors `LoginUrls` in `src-tauri/src/commands.rs`. Change both together.
+ *
+ * docs/design.md §10.3 builds both URLs for one login; they share the PKCE pair
+ * and differ only in `redirect_uri`, so a code issued for either can be
+ * exchanged. `loopback` is null when no local socket could be bound — not a
+ * failure, just the automatic half being unavailable.
+ */
+export interface LoginUrls {
+  loopback: string | null
+  manual: string
+}
+
+/** Mirrors `ManualFallback` in `src-tauri/src/commands.rs`. Change both together. */
+export interface ManualFallback {
+  url: string
+  /** Shown verbatim: it is written for the user, not for a log. */
+  reason: string
+}
