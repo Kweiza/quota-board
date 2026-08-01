@@ -104,11 +104,17 @@ WebKitGTK and is an order of magnitude larger.
 ad-hoc signed, which is enough for the app to run but not enough for Gatekeeper
 to admit it unaided.
 
-- **macOS** — clear the quarantine flag:
-  `xattr -dr com.apple.quarantine "/Applications/Quota Board.app"`.
+- **macOS** — copy the app to `/Applications` first, then clear the quarantine
+  flag: `xattr -dr com.apple.quarantine "/Applications/Quota Board.app"`.
   Finder's right-click → *Open* is **not** an alternative on macOS 15 and later;
   Apple removed that bypass. There the other route is to let the launch be
   blocked, then System Settings → *Privacy & Security* → *Open Anyway*.
+
+  The message you should expect is **"Apple could not verify 'Quota Board.app'
+  is free of malware…"** — measured on macOS 26. That one is the ordinary
+  unnotarized-app refusal and both routes above clear it. If you instead see
+  **"…is damaged and can't be opened"**, you have a 0.1.0 or 0.2.0 build; see
+  the note below.
 - **Windows** — SmartScreen will warn; the bypass is *More info* →
   *Run anyway*.
 
