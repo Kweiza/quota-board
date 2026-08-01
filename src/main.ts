@@ -13,6 +13,7 @@ import {
   onAccountsChanged,
   onUsageUpdated,
   openSettings,
+  refreshAccount,
   setWidgetVisible,
 } from './lib/ipc'
 import { widgetProps } from './lib/props.svelte'
@@ -71,6 +72,31 @@ if (isSettingsWindow()) {
   // `src-tauri/capabilities/widget.json` grants it to nobody.
   widgetProps.onRelogin = () => void openSettings()
   widgetProps.onUnlock = () => void openSettings()
+
+  // §6.4's manual refresh, and the one handler that acts here instead of
+  // deferring to the settings window: there is nothing to ask the user, and
+  // sending them to another window to press a button is the friction this
+  // control removes.
+  //
+  // `pull()` runs whatever the command answered, and that is not redundant with
+  // `usage://updated`. A press the server has throttled (§6.2) returns the
+  // current state early without polling and therefore without emitting, so the
+  // event alone would leave the row unchanged with no sign the press was heard.
+  //
+  // The promise is returned, not `void`-ed: `AccountRow` awaits it to keep its
+  // button disabled for the duration, and the press can wait on §6.1's global
+  // permit. A failure is logged and swallowed — never allowed to reject into
+  // the row, which would leave the button disabled forever.
+  widgetProps.onRefresh = async (uuid: string) => {
+    try {
+      await refreshAccount(uuid)
+    } catch (e) {
+      console.error('quota-board: refresh_account failed', e)
+    }
+    // `pull` is a hoisted function declaration below; this closure only runs
+    // once the user presses the button.
+    await pull()
+  }
 
   // `props: widgetProps`, never `{ ...widgetProps }`: a spread copies the
   // values out of the `$state` proxy and the widget stops reacting to any

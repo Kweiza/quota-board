@@ -8,6 +8,39 @@
   export let now: Date = new Date()
   export let onRelogin: () => void = () => {}
   export let onUnlock: () => void = () => {}
+  /**
+   * §6.4's manual refresh, on the row the user is already looking at. Returning
+   * a promise is optional but is what drives `busy` below; a caller that
+   * returns nothing simply never disables the button.
+   */
+  export let onRefresh: () => void | Promise<void> = () => {}
+
+  /**
+   * True from the press until the refresh it started settles. It exists because
+   * `refresh_account` waits for §6.1's global permit rather than giving up when
+   * the polling loop holds it, so a press can legitimately take a while — and
+   * on a row with nothing else to show, an undisabled button gives no sign the
+   * click landed at all.
+   *
+   * Local to the component on purpose. The alternative — a uuid-keyed pending
+   * map in `widgetProps` — would put per-row transient state in the box that
+   * `usage://updated` replaces wholesale.
+   */
+  let busy = false
+
+  async function refresh(): Promise<void> {
+    // Not merely `disabled`: the guard is what makes a second press cost
+    // nothing even if the button is somehow reachable.
+    if (busy) return
+    busy = true
+    try {
+      await onRefresh()
+    } finally {
+      // `finally`, so a rejected refresh does not leave the row's only control
+      // disabled for the life of the widget.
+      busy = false
+    }
+  }
 
   $: state = account.state
   // Spec §5.3: the weekly window count is 0, 1 or N — never assumed.
@@ -34,6 +67,21 @@
     {#if isStale && state.kind === 'stale'}
       <span class="age">{relativeAge(new Date(state.fetched_at), now)}</span>
     {/if}
+    <!-- Outside the state branches below, unlike the re-login and unlock
+         buttons: those are one state's remedy, this applies to every row.
+         `aria-label` rather than visible text because the glyph is the whole
+         control at this size; the name matches the settings window's button
+         verbatim so the two cannot drift. `enableDrag` in Widget.svelte skips
+         `closest('button')`, which is what keeps this clickable inside a card
+         that is itself the drag handle. -->
+    <button
+      class="refresh"
+      class:busy
+      type="button"
+      aria-label="Refresh now"
+      title="Refresh now"
+      disabled={busy}
+      on:click={refresh}>↻</button>
   </div>
 
   <!-- The bar branch is explicit rather than the {:else} fallback: an
@@ -111,9 +159,31 @@
   .account.stale :global(.amounts),
   .account.stale :global(.reset) { opacity: .45; }
   .head { display: flex; justify-content: space-between; align-items: baseline; gap: .5em; }
-  .name { font-size: 11px; font-weight: 600; white-space: nowrap;
+  /* `flex: 1` so the name takes the slack and the age and the refresh button
+     sit together against the right edge. Without it, `space-between` spreads
+     three children evenly and strands the age in the middle of the row.
+     `min-width: 0` is what still lets the name ellipsise: a flex item's default
+     `min-width: auto` refuses to shrink below its content. */
+  .name { flex: 1; min-width: 0;
+          font-size: 11px; font-weight: 600; white-space: nowrap;
           overflow: hidden; text-overflow: ellipsis; }
   .age  { font-size: 10px; opacity: .8; white-space: nowrap; }
+  /* Deliberately matched to `.gear` in Widget.svelte — same colour, same hover,
+     same borderless glyph. They are the widget's only two chrome controls and
+     must read as one family. `flex-shrink: 0` keeps it whole when a long
+     account name squeezes the row. */
+  .refresh { flex-shrink: 0; background: none; border: none; color: #9ca3af;
+             cursor: pointer; font-size: 11px; padding: 0; line-height: 1; }
+  .refresh:hover:not(:disabled) { color: #e5e7eb; }
+  .refresh:disabled { cursor: default; }
+  .refresh.busy { animation: spin 900ms linear infinite; }
+  @keyframes spin { to { transform: rotate(360deg); } }
+  /* On a `network` or `loading` row the spin is the *only* evidence the press
+     landed, so reduced motion substitutes a dim rather than removing the
+     feedback outright. */
+  @media (prefers-reduced-motion: reduce) {
+    .refresh.busy { animation: none; opacity: .5; }
+  }
   .note { font-size: 11px; opacity: .85; padding: .15em 0; }
   .note.small { font-size: 10px; opacity: .7; }
   .action { background: none; border: none; color: #f87171; cursor: pointer;

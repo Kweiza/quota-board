@@ -109,10 +109,11 @@ pub struct AppState {
     /// loop and the manual path meet.
     ///
     /// **`pub(crate)` only so `main.rs` can build the struct — never lock it
-    /// directly.** `poll_one` and `try_poll_one` are the two entry points, and
-    /// the difference between them (blocking versus `try_lock`) is the whole
-    /// reason the permit exists. A third caller taking it by hand would
-    /// reintroduce the case they exist to separate.
+    /// directly.** `poll_one` is the sole entry point. There used to be a
+    /// second, `try_poll_one`, which `try_lock`ed so a manual refresh would
+    /// never wait behind a poll; §6.4 removed it, because "did not run" reached
+    /// the user as a press that silently changed nothing. A caller taking this
+    /// by hand would bring that case straight back.
     pub(crate) poll_permit: Mutex<()>,
     /// §9.1's OS cache directory, resolved once in `setup()`. Resolving it per
     /// call would need an `AppHandle` the poll path does not have — which is
@@ -384,20 +385,6 @@ impl AppState {
     pub async fn poll_one(&self, uuid: &str) {
         let _permit = self.poll_permit.lock().await;
         self.poll_guarded(uuid).await;
-    }
-
-    /// The manual path's entry point. `try_lock` rather than `lock`: blocking a
-    /// UI command behind a poll that can legitimately run 150 seconds (the
-    /// `IN_FLIGHT_RECLAIM_SECS` derivation in scheduler.rs) is the other
-    /// failure mode. `false` means "did not run".
-    pub async fn try_poll_one(&self, uuid: &str) -> bool {
-        match self.poll_permit.try_lock() {
-            Ok(_permit) => {
-                self.poll_guarded(uuid).await;
-                true
-            }
-            Err(_) => false,
-        }
     }
 
     async fn poll_guarded(&self, uuid: &str) {
@@ -696,8 +683,10 @@ pub(crate) mod tests {
     /// `SecKeychainFindGenericPassword -> mach_msg` forever. Because that call
     /// is made from the single task driving `poll_loop`, `poll_one` held
     /// `poll_permit` for the life of the process — so no other account was ever
-    /// polled and every manual refresh got `false` from `try_poll_one` and
-    /// answered with an unchanged state, with no diagnostic anywhere.
+    /// polled, and no manual refresh could produce a fresh number either: back
+    /// then it gave up on the permit and answered with an unchanged state, and
+    /// since §6.4 it waits on the permit instead, which here means forever.
+    /// Neither shape left a diagnostic anywhere.
     ///
     /// The assertion is therefore about **both** accounts and about elapsed
     /// time, not just about account a's own state.
@@ -732,10 +721,14 @@ pub(crate) mod tests {
             );
         }
         // And the loop can still claim work afterwards — the permit was
-        // released, not merely bypassed.
+        // released, not merely bypassed. Bounded rather than a bare `await`:
+        // an unreleased permit would park this forever, and a test that hangs
+        // reports nothing. This assertion has to be able to fail out loud.
         drop(sched);
         assert!(
-            state.try_poll_one("a").await,
+            tokio::time::timeout(Duration::from_secs(5), state.poll_one("a"))
+                .await
+                .is_ok(),
             "the global poll permit was never released"
         );
     }

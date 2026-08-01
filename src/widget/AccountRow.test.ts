@@ -1,4 +1,4 @@
-import { render, screen } from '@testing-library/svelte'
+import { render, screen, waitFor } from '@testing-library/svelte'
 import { describe, expect, it } from 'vitest'
 import AccountRow from './AccountRow.svelte'
 import type { AccountView } from '../lib/types'
@@ -190,6 +190,111 @@ describe('AccountRow states', () => {
       expect(screen.queryAllByRole('meter')).toHaveLength(0)
       unmount()
     }
+  })
+})
+
+describe('AccountRow refresh', () => {
+  /**
+   * Every state carries the button, and the ones with no numbers to show carry
+   * it for the strongest reason: `network` and `throttled` are precisely the
+   * rows worth retrying. Hiding the control there would withhold it exactly
+   * when it is wanted, and the only other "Refresh now" in the app is two
+   * clicks and a second window away.
+   */
+  const EVERY_STATE: AccountView['state'][] = [
+    { kind: 'ok', windows: [win('five_hour', '5h', 20)], credit: null, fetched_at: NOW.toISOString() },
+    { kind: 'stale', windows: [win('five_hour', '5h', 20)], credit: null, fetched_at: NOW.toISOString() },
+    { kind: 'loading' },
+    { kind: 'throttled', until: '2026-07-29T14:05:00Z' },
+    { kind: 'auth_expired' },
+    { kind: 'auth_dead' },
+    { kind: 'oauth_not_allowed' },
+    { kind: 'secrets_locked' },
+    { kind: 'unknown_shape' },
+    { kind: 'network' },
+  ]
+
+  it('offers a refresh button whatever the row is showing', () => {
+    for (const state of EVERY_STATE) {
+      const { unmount } = render(AccountRow, { account: view(state), now: NOW })
+      // `auth_dead` and `secrets_locked` draw their own buttons, so this is
+      // matched by accessible name rather than by role alone. The name is the
+      // settings window's wording verbatim: one control, one label.
+      expect(
+        screen.getByRole('button', { name: 'Refresh now' }),
+        `${state.kind} must offer a refresh`,
+      ).toBeTruthy()
+      unmount()
+    }
+  })
+
+  it('reports the click to the parent', () => {
+    let calls = 0
+    render(AccountRow, {
+      account: ok([win('five_hour', '5h', 20)]),
+      now: NOW,
+      onRefresh: () => {
+        calls += 1
+      },
+    })
+    screen.getByRole('button', { name: 'Refresh now' }).click()
+    expect(calls).toBe(1)
+  })
+
+  /**
+   * `refresh_account` now waits for §6.1's global permit instead of giving up
+   * when the polling loop holds it, so a press can legitimately take a while.
+   * On a row with nothing else to show — `network`, `loading` — an undisabled
+   * button gives no sign the click landed at all, which is the same
+   * press-does-nothing defect §6.4's note was added to fix in the settings
+   * window. The guard also stops a second press queueing a second poll behind
+   * the first.
+   */
+  it('disables the button until the refresh it started finishes', async () => {
+    let release = (): void => {}
+    const pending = new Promise<void>((resolve) => {
+      release = resolve
+    })
+    let starts = 0
+    render(AccountRow, {
+      account: view({ kind: 'network' }),
+      now: NOW,
+      onRefresh: () => {
+        starts += 1
+        return pending
+      },
+    })
+    const button = screen.getByRole('button', { name: 'Refresh now' }) as HTMLButtonElement
+
+    button.click()
+    await waitFor(() => expect(button.disabled).toBe(true))
+    button.click()
+    expect(starts, 'a second press must not start a second refresh').toBe(1)
+
+    release()
+    await waitFor(() => expect(button.disabled).toBe(false))
+  })
+
+  /**
+   * The stale row dims its text (§7.3), and this button is deliberately not
+   * part of that: staleness is the state in which the user most wants to press
+   * it, so dimming the one remedy the row offers points the affordance the
+   * wrong way.
+   */
+  it('keeps the button at full strength on a stale row', () => {
+    const opacity = (root: HTMLElement) =>
+      getComputedStyle(root.querySelector('.refresh') as HTMLElement).opacity
+    const fetched = new Date(NOW.getTime() - 12 * 60_000).toISOString()
+
+    const staleRow = render(AccountRow, {
+      account: view({ kind: 'stale', windows: [win('five_hour', '5h', 20)], credit: null, fetched_at: fetched }),
+      now: NOW,
+    })
+    const stale = opacity(staleRow.container)
+    staleRow.unmount()
+
+    const freshRow = render(AccountRow, { account: ok([win('five_hour', '5h', 20)]), now: NOW })
+    expect(stale).toBe(opacity(freshRow.container))
   })
 })
 

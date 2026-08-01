@@ -50,8 +50,14 @@
   /**
    * §6.4's refusal, per account: uuid → the instant a manual refresh may next
    * fire. Not in `error`, because that banner is `warn` and reports failures —
-   * a refusal by §6.1's 180-second floor is the rate limiter working, and it is
-   * per-account, which a single line above the list cannot express.
+   * a refusal is §6.2's server-ordered wait being obeyed, which is the rate
+   * limiter working, and it is per-account, which a single line above the list
+   * cannot express.
+   *
+   * **Only the server refuses now.** §6.1's client-side floor used to refuse
+   * presses as well and was by far the commoner cause of this note; §6.4
+   * dropped it, so a note here means a 429 was received and `Retry-After` has
+   * not run out. Rarer, and correspondingly more worth saying.
    *
    * Written by a press on that row's own button, from the answer to that press.
    * **Never treated as still true past its own `until`.** The note is a
@@ -63,12 +69,11 @@
    * after the state it described was gone.
    *
    * Dropping an expired note is **not** the same as announcing availability.
-   * `Scheduler::begin_poll` stamps `last_attempt_at` for the automatic poll
-   * too, so the loop pushes the real `until` forward while the note is on
-   * screen, and a note that *claimed* budget at the old instant would be
-   * CLAUDE.md's confidently-wrong display. Removing it claims nothing: the
-   * press stays the only moment the answer is known, and silence is the honest
-   * state between presses.
+   * The server can re-throttle on the very next request, and the polling loop
+   * keeps making requests while the note is on screen, so a note that *claimed*
+   * budget at the old instant would be CLAUDE.md's confidently-wrong display.
+   * Removing it claims nothing: the press stays the only moment the answer is
+   * known, and silence is the honest state between presses.
    */
   let throttledUntil: Record<string, string> = {}
 
@@ -90,8 +95,8 @@
     next[uuid] = until
     throttledUntil = next
     // `setTimeout` saturates above ~24.8 days; an `until` that far out would
-    // fire immediately and retire a note that is still true. The floor is 180
-    // seconds, so this only guards a malformed value.
+    // fire immediately and retire a note that is still true. `record_throttle`
+    // caps every wait at one hour, so this only guards a malformed value.
     const ms = new Date(until).getTime() - Date.now()
     if (Number.isFinite(ms) && ms > 0 && ms < 2_147_483_647) {
       expiryTimers[uuid] = setTimeout(() => forgetThrottle(uuid), ms)
@@ -371,10 +376,11 @@
     void guard(async () => {
       const state = await refreshAccount(uuid)
       // Observed: "Refresh now does not work — the capture time never
-      // changes." §6.1's floor refuses the button for 180 of every 300
-      // seconds, and §6.4 says report when it will be available. The command
-      // does: it answers `Throttled { until }`. Discarding that answer was the
-      // whole defect — the early return never touches the scheduler, so the
+      // changes." The cause then was §6.1's client-side floor, which §6.4 has
+      // since dropped; what remains is §6.2's server-ordered wait, and §6.4
+      // still requires reporting when it will be available. The command does:
+      // it answers `Throttled { until }`. Discarding that answer was the whole
+      // defect — the early return never touches the scheduler, so the
       // `list_accounts` below reports the account's ordinary state and the
       // refusal is unrecoverable once this value is dropped.
       //

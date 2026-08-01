@@ -19,10 +19,10 @@
    * line above the list cannot say which row was refused.
    *
    * It is **not** derived from `AccountView.state`: `refresh_account` returns
-   * §6.1's client-side refusal early, without touching the scheduler, so the
-   * account's own state is whatever it was and re-reading the list cannot
-   * recover the refusal. It exists only in that command's return value, which
-   * is why the parent hands it down separately.
+   * §6.2's refusal early, without touching the scheduler, so re-reading the
+   * list races the state it would have to read back. It exists in that
+   * command's return value at the moment of the press, which is why the parent
+   * hands it down separately.
    */
   export let throttledUntil: Record<string, string> = {}
 </script>
@@ -49,14 +49,14 @@
         <span class="email">{a.email}</span>
         <!-- §6.4's exact wording for a refused manual refresh, in its own
              quiet class rather than the parent's `.warn` banner: it is normal,
-             expected behaviour — the 180-second floor doing its job — and
+             expected behaviour — §6.2's server-ordered wait being obeyed — and
              painting it as an error would be its own confidently-wrong
              display. The clock string comes from the shared formatter so this
              window and the widget cannot drift on it.
 
-             `role="status"` because this is the only answer a press gets: the
-             button is otherwise inert for up to 180 seconds, which is the
-             defect this note exists to fix. -->
+             `role="status"` because this is the only answer a press gets: a
+             refused button is otherwise inert until `Retry-After` runs out,
+             which is the defect this note exists to fix. -->
         {#if throttledUntil[a.uuid]}
           <span class="throttle" role="status">
             throttled, available after {untilHhMm(throttledUntil[a.uuid])}

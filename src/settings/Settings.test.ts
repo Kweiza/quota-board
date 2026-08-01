@@ -271,11 +271,11 @@ describe('Settings error banner', () => {
 describe('Settings manual refresh', () => {
   /**
    * **Always in the future**, because that is the command's contract:
-   * `Scheduler::earliest_manual_refresh` answers `last_attempt_at + floor` only
-   * `.filter(|t| *t > now)`, so a `Throttled { until }` reaching this window
-   * can never already have passed. A fixed literal here was a fixture that the
-   * real API cannot produce, and it went red the moment the window learned to
-   * retire an expired note.
+   * `Scheduler::state` yields `Throttled { until }` only through
+   * `throttled_until.filter(|t| *t > now)`, so one reaching this window can
+   * never already have passed. A fixed literal here was a fixture that the real
+   * API cannot produce, and it went red the moment the window learned to retire
+   * an expired note.
    *
    * The expected wall clock is derived from the same `Date`, so this stays
    * deterministic and zone-independent — `untilHhMm` is deliberately local-time
@@ -298,13 +298,13 @@ describe('Settings manual refresh', () => {
 
   it('says when a refused Refresh now becomes available, on the row that was refused', async () => {
     // Observed: "Refresh now does not work. I press it and the capture time
-    // never changes. Only the polling interval changes it." §6.1's floor
-    // refuses the button for 180 of every 300 seconds — correctly — and §6.4
-    // requires that be reported. `refresh_account` does report it, as
-    // `Throttled { until }`; this window discarded the return value, so the
-    // press was silent. Re-reading the list cannot recover it either: the
-    // command returns early *without touching the scheduler*, so
-    // `list_accounts` afterwards reports the account's ordinary state.
+    // never changes. Only the polling interval changes it." The cause then was
+    // §6.1's client-side floor, refusing the button for 180 of every 300
+    // seconds; §6.4 has since dropped it, and §6.2's server-ordered wait is now
+    // the only refusal — rarer, and reported the same way. `refresh_account`
+    // does report it, as `Throttled { until }`; this window discarded the
+    // return value, so the press was silent. Re-reading the list cannot recover
+    // it either: the command returns early *without touching the scheduler*.
     const t = untilIn(3)
     mockBackend({ accounts: two, refreshStates: [{ kind: 'throttled', until: t.iso }] })
     render(Settings)
