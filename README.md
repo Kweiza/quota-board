@@ -123,10 +123,13 @@ to admit it unaided.
 > gets past it — the `xattr` command above is the only way to run them. Fixed in
 > 0.2.1.
 
-**On macOS an unsigned build changes identity every time you rebuild it**, and
-keychain items are bound to that identity. The system will ask again for
-permission to read your stored tokens after an update, once per account. If you
-dismiss it, every account reads as locked until the next launch you do approve.
+**On macOS the build's signing identity changes with every release**, and
+keychain items are bound to that identity. After an update the system asks again
+for permission to read your stored tokens, **once per account** — measured on
+the 0.2.0 → 0.2.1 upgrade with three accounts, where all three were asked.
+Approving each one restores every account. Dismissing instead is expected to
+leave that account reading as locked until the next launch you do approve; that
+branch has not been measured.
 
 ### Linux
 
