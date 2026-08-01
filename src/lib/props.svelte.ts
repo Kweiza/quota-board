@@ -11,6 +11,12 @@ export interface WidgetProps {
   onOpenSettings: () => void
   onRelogin: (uuid: string) => void
   onUnlock: (uuid: string) => void
+  /**
+   * Returns a promise so `AccountRow` can disable its own button until the
+   * refresh settles — the press waits for §6.1's global permit, so it is not
+   * instantaneous.
+   */
+  onRefresh: (uuid: string) => void | Promise<void>
 }
 
 /**
@@ -40,4 +46,5 @@ export const widgetProps = $state<WidgetProps>({
   onOpenSettings: () => {},
   onRelogin: () => {},
   onUnlock: () => {},
+  onRefresh: () => {},
 })

@@ -376,8 +376,41 @@ becomes visible again.** Burning budget while nobody is looking means taking a
 
 ### 6.4 Manual refresh
 
-Manual refresh is also rate-limited client-side. When there is no budget,
-instead of firing the request, display **"throttled, available after HH:MM."**
+**Manual refresh fires immediately. It is not rate-limited client-side, and it
+waits for the global permit rather than giving up on it.** Every account row —
+in the widget and in the settings window — carries its own refresh control.
+
+The one thing that still refuses a press is §6.2's server-ordered wait. When a
+429's `Retry-After` has not run out, do not fire; display **"throttled,
+available after HH:MM"** instead.
+
+> **This reverses an earlier draft, which applied §6.1's 180-second floor to the
+> manual path as well.** Three things were wrong with it.
+>
+> The floor exists to bound *unattended* traffic. §6.1 sets the polling interval
+> at 5 minutes and §6.2.1 measures the sustainable rate at roughly one request
+> per 120 seconds, so the automatic schedule already runs well under budget; a
+> press is one extra request against that headroom, at the one moment the user
+> has said the number matters. The floor was buying protection the schedule had
+> already bought.
+>
+> It also refused the button for 180 of every 300 seconds — the majority of the
+> time, for the ordinary case of pressing after a poll. A control that usually
+> declines is a control the user stops trusting, and the shipped bug report was
+> exactly that: *"Refresh now does not work. I press it and the capture time
+> never changes."*
+>
+> Third, the manual path used to give up whenever the polling loop held §6.1's
+> global concurrency permit, returning the current state unchanged. That is a
+> click that vanishes with nothing on screen to explain it. It now waits for the
+> permit; the wait is bounded by one poll, and the row disables its button for
+> the duration so the press is visibly in progress.
+>
+> **What is *not* relaxed:** the server's `Retry-After` (§6.2), the automatic
+> schedule's floor (§6.1, enforced structurally inside `Scheduler::due`), and
+> global concurrency of 1. Re-hitting a server that has just sent `Retry-After`
+> spends a request without shortening the block by a second (§6.2, measured),
+> so that refusal is the one worth keeping.
 
 ## 7. Failure states
 
@@ -476,16 +509,16 @@ follows content.
 ```
 ┌──────────────────────────────┐
 │                            ⚙ │
-│  work@example.com            │
+│  work@example.com          ↻ │
 │  5h  ███████░░░  72%   1h23m │   ← yellow
 │  7d  ████░░░░░░  41%   4d12h │   ← teal
 │                              │
-│  personal@example.com        │
+│  personal@example.com      ↻ │
 │  5h  ██░░░░░░░░  18%   2h05m │   ← green
 │  weekly (Opus) █████████░ 91%│   ← per-model weekly window
 │  weekly (Sonnet) ███░░░░░ 27%│
 │                              │
-│  side@example.com    12m ago │
+│  side@example.com   12m ago ↻│
 │  5h  ████░░░░░░  38%   0h47m │   ← entire row dimmed
 │  weekly not reported         │
 └──────────────────────────────┘
@@ -493,6 +526,12 @@ follows content.
 
 **The fact that the number of bars can differ per account is the central
 constraint of this layout** (§5.3).
+
+**Every account row carries its own `↻`, on every state** — including the ones
+with no numbers to show, which are the rows most worth retrying. It fires
+immediately (§6.4). It stays at full strength on a dimmed stale row: staleness
+is when the user most wants to press it, so dimming the one remedy the row
+offers would point the affordance the wrong way.
 
 ### 8.2 Color warning steps
 

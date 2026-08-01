@@ -91,23 +91,19 @@ pub async fn refresh_account(
 ) -> Result<AccountState, String> {
     {
         let sched = state.scheduler.lock().await;
-        // Already throttled by the server (§6.2).
+        // Already throttled by the server (§6.2), and this is now the **only**
+        // thing that refuses a press. §6.1's client-side floor used to refuse
+        // one too; §6.4 dropped it, because the moment a user asks is the
+        // moment the number matters and the server's own bucket is the real
+        // limit. This arm is a different question and it stays: re-hitting a
+        // server that has just sent `Retry-After` spends the request without
+        // shortening the block by a second (§6.2, measured).
+        //
+        // `AccountRow.svelte`'s `throttled` branch renders this state as
+        // "throttled, after HH:MM" and `AccountList.svelte` renders it as
+        // "throttled, available after HH:MM". Cited by name: both files move.
         if let Some(s @ AccountState::Throttled { .. }) = sched.state(&uuid) {
             return Ok(s);
-        }
-        // §6.4: with no budget, do **not** fire — report when it will be
-        // available. `AccountRow.svelte`'s `throttled` branch renders this state
-        // as "throttled, after HH:MM", which is exactly what §6.4 asks for, and
-        // `AccountList.svelte` renders the refused press as "throttled,
-        // available after HH:MM". Cited by name: both files move.
-        //
-        // **Both arms above answer with the same shape.** The first is §6.2's
-        // server-ordered wait and this one is §6.1's local floor; on the wire
-        // they are one `Throttled { until }`, so no consumer can tell them
-        // apart, and none needs to — "come back after HH:MM" is the whole
-        // answer either way.
-        if let Some(until) = sched.earliest_manual_refresh(&uuid) {
-            return Ok(AccountState::Throttled { until });
         }
     }
     // The braces above are load-bearing: a `MutexGuard` created in an `if let`
@@ -122,11 +118,15 @@ pub async fn refresh_account(
         return Ok(AccountState::AuthExpired);
     }
 
-    // Returns false when the global permit is held by the polling loop; the
-    // current state is then returned unchanged rather than queueing.
-    if state.try_poll_one(&uuid).await {
-        let _ = app.emit("usage://updated", ());
-    }
+    // `poll_one`, not `try_poll_one`: §6.4 requires the press to load, and
+    // `try_poll_one` gives up whenever the polling loop happens to hold §6.1's
+    // global permit — a click that vanishes with nothing on screen to say so,
+    // which is the whole defect this path exists to avoid. Waiting is bounded
+    // by one poll (`IN_FLIGHT_RECLAIM_SECS`, derived in scheduler.rs), and this
+    // is an async command, so the wait costs a task and not the UI thread.
+    // `AccountRow.svelte` disables its button for the duration.
+    state.poll_one(&uuid).await;
+    let _ = app.emit("usage://updated", ());
     state
         .scheduler
         .lock()

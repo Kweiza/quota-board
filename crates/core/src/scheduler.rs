@@ -747,22 +747,6 @@ impl<C: Clock> Scheduler<C> {
         })
     }
 
-    /// §6.4. The earliest instant a manual refresh may fire. `None` means "now".
-    ///
-    /// §6.1's 180-second floor is enforced inside `due()`'s `last_attempt_at`
-    /// check and inside `set_visible`'s pull-forward, and deliberately **not**
-    /// inside `begin_poll`: the shipped test
-    /// `a_second_poll_cannot_start_while_one_is_in_flight` requires a re-claim
-    /// immediately after `end_poll` with the clock unmoved. Manual refresh never
-    /// goes through `due()` (`begin_poll`'s own doc says so), so it has to ask.
-    /// Measured: begin_poll/end_poll/record_success can be cycled once per
-    /// simulated second while `due()` allows zero.
-    pub fn earliest_manual_refresh(&self, uuid: &str) -> Option<DateTime<Utc>> {
-        let e = self.entries.get(uuid)?;
-        let floor = TimeDelta::seconds(PollPolicy::MIN_INTERVAL_SECS);
-        e.last_attempt_at.map(|t| t + floor).filter(|t| *t > self.clock.now())
-    }
-
     /// Spec §6.2. `retry_after_secs == 0` means budget exhausted — sit out an
     /// entire window. `u64`, not `i64`, to line up with `UsageError::Throttled`
     /// — Task 12 made that field `u64` so a negative `Retry-After` cannot parse
@@ -1925,37 +1909,6 @@ mod tests {
             "recording the poll time changed the quarantine flag"
         );
         std::fs::remove_file(&path).ok();
-    }
-
-    /// §6.4. The 180-second floor lives inside `due()`, and manual refresh
-    /// never goes through `due()` — so the manual path has to ask. Measured:
-    /// cycling begin_poll/end_poll/record_success once per simulated second
-    /// sends ten requests in ten seconds while `due()` allows zero.
-    #[test]
-    fn a_manual_refresh_inside_the_floor_is_refused() {
-        let (mut s, c) = sched();
-        s.add("a");
-        assert_eq!(s.earliest_manual_refresh("a"), None, "an account never polled may refresh now");
-
-        assert!(s.begin_poll("a"));
-        s.end_poll("a");
-        s.record_success("a", win(10.0), None);
-
-        let until = s.earliest_manual_refresh("a").expect("inside the floor, refresh must be refused");
-        assert_eq!(until, c.now() + TimeDelta::seconds(PollPolicy::MIN_INTERVAL_SECS));
-    }
-
-    #[test]
-    fn a_manual_refresh_is_allowed_after_the_floor() {
-        let (mut s, c) = sched();
-        s.add("a");
-        assert!(s.begin_poll("a"));
-        s.end_poll("a");
-
-        c.advance_secs(PollPolicy::MIN_INTERVAL_SECS - 1);
-        assert!(s.earliest_manual_refresh("a").is_some(), "still inside the floor");
-        c.advance_secs(2);
-        assert_eq!(s.earliest_manual_refresh("a"), None, "the floor has passed");
     }
 
     /// The ceiling exists because chrono panics: measured on 0.4.45,
