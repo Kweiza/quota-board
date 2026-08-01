@@ -1126,6 +1126,9 @@ In summary:
 | Whether our refresh disturbs a Claude Code session (§10.7) | **observational** — chains are per grant; it does not. Not an experiment; see below |
 | Whether `user:profile` alone passes server-side (§10.4) | **confirmed** — it does; `user:inference` dropped |
 | Whether 429 budgets are independent per account (§12.8) | **confirmed** — independent, for N=3 on one IP |
+| An unsigned bundle reads as *"damaged"*, an ad-hoc signed one as *"could not verify"* (§15) | **confirmed** — both seen on macOS 26, one evening apart |
+| Upgrading re-prompts for keychain access **once per account** | **confirmed** — N=3, on the 0.2.0 → 0.2.1 upgrade that also changed the bundle identifier |
+| Dismissing that prompt leaves every account reading as `SECRETS_LOCKED` | **not measured** — every prompt was approved |
 
 **One row is graded differently, and the difference is the point.** Every other
 row above was measured on the wire, in a run written down with its method in the
