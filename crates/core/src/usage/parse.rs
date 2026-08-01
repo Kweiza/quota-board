@@ -253,11 +253,67 @@ pub fn parse_credit(raw: &Value) -> Option<CreditSpend> {
 mod tests {
     use super::*;
 
+    /// The eight fixtures, compiled into the test binary rather than read from
+    /// disk at run time.
+    ///
+    /// `include_str!` and not `read_to_string`, because the filesystem the test
+    /// binary can see is not always the filesystem it was built on. Running
+    /// these tests on an iOS simulator or an Android device — which is how the
+    /// mobile port checks that the parser survives an FFI boundary — puts the
+    /// binary somewhere with no `CARGO_MANIFEST_DIR` and no source tree, and
+    /// every fixture-backed test fails on `No such file or directory` for a
+    /// reason that has nothing to do with parsing.
+    ///
+    /// The trade is deliberate: a missing or renamed fixture is now a **compile
+    /// error** instead of a run-time panic, so the failure arrives at the moment
+    /// someone breaks it rather than the next time the suite runs.
     fn fixture(name: &str) -> serde_json::Value {
-        let path = format!("{}/tests/fixtures/{}.json", env!("CARGO_MANIFEST_DIR"), name);
-        let text = std::fs::read_to_string(&path)
-            .unwrap_or_else(|e| panic!("failed to read fixture {path}: {e}"));
-        serde_json::from_str(&text).unwrap()
+        let text = match name {
+            "alien_shape" => include_str!("../../tests/fixtures/alien_shape.json"),
+            "both_windows" => include_str!("../../tests/fixtures/both_windows.json"),
+            "credits_limit_reached" => {
+                include_str!("../../tests/fixtures/credits_limit_reached.json")
+            }
+            "credits_never_enabled" => {
+                include_str!("../../tests/fixtures/credits_never_enabled.json")
+            }
+            "no_weekly" => include_str!("../../tests/fixtures/no_weekly.json"),
+            "spike_observed" => include_str!("../../tests/fixtures/spike_observed.json"),
+            "unknown_fields" => include_str!("../../tests/fixtures/unknown_fields.json"),
+            "weekly_scoped" => include_str!("../../tests/fixtures/weekly_scoped.json"),
+            // Not a silent miss: an unlisted name means a fixture was added to
+            // the directory and not to this table, and the test that wanted it
+            // would otherwise pass against nothing.
+            other => panic!(
+                "no fixture named {other:?} is compiled in — add it to the table \
+                 in parse.rs's test module alongside the file"
+            ),
+        };
+        serde_json::from_str(text).unwrap()
+    }
+
+    /// Back-stop for the table above: every `.json` in the fixtures directory
+    /// must be reachable through `fixture()`. Without this, adding a ninth
+    /// fixture and forgetting the table would go unnoticed until someone
+    /// happened to ask for it by name.
+    #[test]
+    fn every_fixture_on_disk_is_compiled_in() {
+        let dir = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures");
+        let mut missing = Vec::new();
+        for entry in std::fs::read_dir(dir).expect("fixtures directory") {
+            let path = entry.expect("dir entry").path();
+            if path.extension().and_then(|e| e.to_str()) != Some("json") {
+                continue;
+            }
+            let stem = path.file_stem().unwrap().to_str().unwrap().to_string();
+            if std::panic::catch_unwind(|| fixture(&stem)).is_err() {
+                missing.push(stem);
+            }
+        }
+        assert!(
+            missing.is_empty(),
+            "fixtures on disk but not compiled into parse.rs's table: {missing:?}"
+        );
     }
 
     #[test]
