@@ -1,5 +1,16 @@
+// Both stores are optional; the `SecretStore` trait below is not. A host that
+// implements the trait itself — which is how a mobile build reaches the iOS
+// Keychain and the Android Keystore, neither of which `keyring` serves — needs
+// neither module, and compiling them out is what keeps Argon2's 64 MiB
+// allocation out of binaries that cannot survive it. See this crate's
+// `[features]`.
+#[cfg(feature = "encrypted-file")]
 pub mod encrypted_file;
+#[cfg(feature = "os-keychain")]
 pub mod keychain;
+// Unconditional: it wraps any `SecretStore` in a timeout and touches no backend
+// of its own. Its only mention of keyring is in a doc comment tracing a call
+// path.
 pub mod timeout;
 
 use std::collections::HashMap;
