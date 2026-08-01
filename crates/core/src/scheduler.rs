@@ -52,9 +52,11 @@ pub enum FailureKind {
     /// invalid_grant. Permanently dead.
     AuthDead,
     SecretsLocked,
-    /// The organization disabled OAuth. Permanent, and unlike `AuthDead` a
-    /// re-login does not fix it.
-    OrgOauthDisabled,
+    /// The server is refusing OAuth for this account right now. **Not
+    /// permanent**, so not quarantined — it recovers when whatever caused it
+    /// is resolved, and the exponential backoff below is what keeps the retry
+    /// cheap in the meantime.
+    OauthNotAllowed,
 }
 
 /// The classification of the two error types a poll can produce lives here, in
@@ -81,7 +83,7 @@ impl FailureKind {
             // for a refresh to rescue it. The token here is fine, so the
             // refresh succeeds and the next poll gets the same 403 — a spinner
             // that never resolves, which is the display §7.1 calls out by name.
-            UsageError::OrgOauthDisabled => Some(FailureKind::OrgOauthDisabled),
+            UsageError::OauthNotAllowed => Some(FailureKind::OauthNotAllowed),
             UsageError::UnknownShape => Some(FailureKind::UnknownShape),
             UsageError::Transport(_) => Some(FailureKind::Network),
             // **A 5xx is not a network error, and calling it one is a
@@ -637,13 +639,18 @@ impl<C: Clock> Scheduler<C> {
         let interval = self.policy.interval;
         if let Some(e) = self.entries.get_mut(uuid) {
             e.last_failure = Some(kind);
-            // Both are permanent, so both quarantine on the first strike. They
-            // differ only in what the user is told and offered.
-            if kind == FailureKind::AuthDead || kind == FailureKind::OrgOauthDisabled {
+            if kind == FailureKind::AuthDead {
                 // One-strike quarantine. Never retried.
                 e.quarantined = true;
                 return;
             }
+            // `OauthNotAllowed` deliberately does NOT quarantine, and an
+            // earlier revision had it wrong. Quarantine means "never polled
+            // again", so an account whose subscription lapsed would keep
+            // showing the refusal after the user renewed, with removing and
+            // re-adding it as the only escape. It falls through to the backoff
+            // below instead, which reaches 64x the interval — cheap enough to
+            // leave running, frequent enough to notice a fix within hours.
             e.backoff_level = (e.backoff_level + 1).min(MAX_BACKOFF_LEVEL);
             let factor = 1i32 << e.backoff_level; // 2, 4, 8, ... up to 64x
             // `TimeDelta`'s `Mul` and `DateTime`'s `Add` both **panic** on
@@ -865,19 +872,7 @@ impl<C: Clock> Scheduler<C> {
         let now = self.clock.now();
 
         if e.quarantined {
-            // Written arm by arm rather than with a `_` fallback: a third
-            // quarantining kind added later must be given a display here
-            // deliberately, not inherit `AuthDead`'s clickable "re-login
-            // required" — the one affordance that is wrong for this state.
-            return Some(match e.last_failure {
-                Some(FailureKind::OrgOauthDisabled) => AccountState::OrgOauthDisabled,
-                Some(FailureKind::AuthDead)
-                | Some(FailureKind::Network)
-                | Some(FailureKind::UnknownShape)
-                | Some(FailureKind::AuthExpired)
-                | Some(FailureKind::SecretsLocked)
-                | None => AccountState::AuthDead,
-            });
+            return Some(AccountState::AuthDead);
         }
         if let Some(until) = e.throttled_until.filter(|t| *t > now) {
             return Some(AccountState::Throttled { until });
@@ -900,6 +895,15 @@ impl<C: Clock> Scheduler<C> {
         if e.last_failure == Some(FailureKind::SecretsLocked) {
             return Some(AccountState::SecretsLocked);
         }
+        // Same reasoning as `SECRETS_LOCKED` immediately above, for the same
+        // reason it was added: without this the state is unreachable the moment
+        // an account has succeeded once, and every later refusal renders as a
+        // dimmed old reading. "≥28%, 3h old" says "we could not reach the
+        // server just now"; this is the server saying it will not serve this
+        // account, and last week's number is not an answer to that.
+        if e.last_failure == Some(FailureKind::OauthNotAllowed) {
+            return Some(AccountState::OauthNotAllowed);
+        }
 
         match (&e.last_windows, e.last_fetched_at) {
             (Some(w), Some(at)) => {
@@ -920,7 +924,7 @@ impl<C: Clock> Scheduler<C> {
                 Some(FailureKind::AuthExpired) => AccountState::AuthExpired,
                 Some(FailureKind::SecretsLocked) => AccountState::SecretsLocked,
                 Some(FailureKind::AuthDead) => AccountState::AuthDead,
-                Some(FailureKind::OrgOauthDisabled) => AccountState::OrgOauthDisabled,
+                Some(FailureKind::OauthNotAllowed) => AccountState::OauthNotAllowed,
             }),
         }
     }
@@ -1295,33 +1299,62 @@ mod tests {
         assert!(s.due().is_empty(), "a quarantined account is never polled again");
     }
 
-    /// A 403 naming the organization policy is permanent like `AuthDead`, and
-    /// must **not** render as `AuthDead` — the two differ in the only thing
-    /// §7.1 says a failure state is for, which is the remedy it offers. Telling
-    /// a user to re-login when re-logging in is guaranteed to be refused is the
-    /// confusing failure that section exists to prevent.
+    /// The refusal must be its own state and must **not** be `AuthExpired`,
+    /// whose display is "refreshing…" — the token is fine, so the refresh
+    /// succeeds and the next poll is refused identically, leaving a spinner
+    /// that never resolves.
+    ///
+    /// It must also not be `AuthDead`, whose only remedy is a clickable
+    /// "re-login required" that would be refused again.
     #[test]
-    fn an_org_oauth_denial_is_quarantined_but_is_not_auth_dead() {
-        let (mut s, c) = sched();
+    fn an_oauth_refusal_is_neither_a_spinner_nor_a_dead_grant() {
+        let (mut s, _c) = sched();
         s.add("a");
-        s.record_failure("a", FailureKind::OrgOauthDisabled);
+        s.record_failure("a", FailureKind::OauthNotAllowed);
 
-        assert_eq!(s.state("a"), Some(AccountState::OrgOauthDisabled));
-        assert_ne!(
-            s.state("a"),
-            Some(AccountState::AuthDead),
-            "re-login is the one affordance that cannot work here"
-        );
-        c.advance_secs(100_000);
-        assert!(s.due().is_empty(), "permanent, so never polled again");
+        assert_eq!(s.state("a"), Some(AccountState::OauthNotAllowed));
+        assert_ne!(s.state("a"), Some(AccountState::AuthExpired), "not a spinner");
+        assert_ne!(s.state("a"), Some(AccountState::AuthDead), "not a dead grant");
     }
 
-    /// The quarantine branch runs before the cached-snapshot branch, so an
-    /// account that worked yesterday and is denied today must show the denial
-    /// rather than a dimmed old reading. Without this the state would be
-    /// reachable only on an account that had never once succeeded.
+    /// **It is not permanent, and an earlier revision had this wrong.** The
+    /// wire code names an organization, but the observed case was a lapsed
+    /// subscription on an ordinary account and the server's own message says
+    /// "currently". Quarantine means never polled again, so the account would
+    /// keep showing the refusal after the user had already renewed — with
+    /// removing and re-adding it as the only way out.
     #[test]
-    fn an_org_oauth_denial_beats_a_cached_snapshot() {
+    fn an_oauth_refusal_recovers_on_its_own_and_is_never_quarantined() {
+        let (mut s, c) = sched();
+        s.add("a");
+        s.record_failure("a", FailureKind::OauthNotAllowed);
+
+        // Backed off, not quarantined: it comes back, just not soon.
+        assert!(s.due().is_empty(), "must back off rather than hammer");
+        c.advance_secs(100_000);
+        assert_eq!(
+            s.due(),
+            vec!["a"],
+            "a quarantined account would never be due again; this one must be"
+        );
+
+        // And once the server relents, the account is simply well again — no
+        // re-login, no remove-and-re-add.
+        s.begin_poll("a");
+        s.record_success("a", win(12.0), None);
+        assert!(
+            matches!(s.state("a"), Some(AccountState::Ok { .. })),
+            "recovery must need no user action"
+        );
+    }
+
+    /// The refusal outranks the cached snapshot, so an account that worked
+    /// yesterday and is refused today shows the refusal rather than a dimmed
+    /// old reading. Without that precedence the state would be reachable only
+    /// on an account that had never once succeeded — the same trap
+    /// `SECRETS_LOCKED` fell into before it was given the same treatment.
+    #[test]
+    fn an_oauth_refusal_beats_a_cached_snapshot() {
         let (mut s, c) = sched();
         s.add("a");
         s.begin_poll("a");
@@ -1329,10 +1362,10 @@ mod tests {
         assert!(matches!(s.state("a"), Some(AccountState::Ok { .. })));
 
         c.advance_secs(10);
-        s.record_failure("a", FailureKind::OrgOauthDisabled);
+        s.record_failure("a", FailureKind::OauthNotAllowed);
         assert_eq!(
             s.state("a"),
-            Some(AccountState::OrgOauthDisabled),
+            Some(AccountState::OauthNotAllowed),
             "a stale reading with an age would imply this is transient"
         );
     }

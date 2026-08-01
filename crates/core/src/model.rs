@@ -70,15 +70,28 @@ pub enum AccountState {
     AuthExpired,
     /// invalid_grant. Only re-login fixes this.
     AuthDead,
-    /// This account's Anthropic organization has OAuth turned off.
+    /// The server is refusing OAuth for this account **right now**.
     ///
-    /// Permanent like `AuthDead`, but **its remedy is different and that is why
-    /// it is not `AuthDead`**: re-logging in cannot help, because the grant
-    /// would be refused again. Offering the one affordance that cannot work is
-    /// the confusing failure §7.1 exists to prevent. Only an administrator of
-    /// that organization can clear it, which is an action this application
-    /// cannot take and must not pretend to offer.
-    OrgOauthDisabled,
+    /// Distinct from `AuthExpired` because the token is fine: a refresh
+    /// succeeds and the next poll is refused identically, so `AUTH_EXPIRED`'s
+    /// "refreshing…" is a spinner that never resolves — the waiting-shaped
+    /// permanent failure §7.1 exists to separate.
+    ///
+    /// Distinct from `AuthDead` because **it is not permanent**, which is the
+    /// part an earlier revision of this enum got wrong. The wire code names an
+    /// organization (`oauth_not_allowed_for_organization`), but the one case
+    /// observed was a **lapsed subscription** on an ordinary personal account,
+    /// and the server's own message says "currently". So the account recovers
+    /// on its own when whatever caused it is resolved, and this state must be
+    /// retried rather than quarantined — a quarantine would keep showing the
+    /// error after the user had already fixed it, with removing and re-adding
+    /// the account as the only way out.
+    ///
+    /// It still wins over a cached reading. A dimmed old percentage with an age
+    /// implies "we could not reach the server just now"; this is the server
+    /// telling us plainly that it will not serve this account, and last week's
+    /// number is not a useful answer to that.
+    OauthNotAllowed,
     SecretsLocked,
     /// The response could not be parsed. **Not 0%.**
     UnknownShape,

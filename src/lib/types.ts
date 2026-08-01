@@ -43,14 +43,17 @@ export type AccountState =
   | { kind: 'auth_expired' }
   | { kind: 'auth_dead' }
   /**
-   * The account's Anthropic organization has OAuth turned off. Permanent, like
-   * `auth_dead` — but **it must not offer the re-login affordance**, because
-   * the grant would be refused again. Only an administrator of that
-   * organization can clear it, which is not an action this app can take.
-   * Measured on a real account 2026-08-01: a 403 carrying
+   * The server is refusing OAuth for this account right now. Measured on a
+   * real account 2026-08-01: a 403 carrying
    * `error.details.error_code = "oauth_not_allowed_for_organization"`.
+   *
+   * **Not permanent**, despite the wire code naming an organization — the case
+   * observed was a lapsed subscription on an ordinary account, and the message
+   * itself says "currently". So it carries no re-login affordance (which would
+   * be refused) and no removal prompt: the account recovers by itself once the
+   * cause is resolved, and the scheduler keeps retrying with backoff.
    */
-  | { kind: 'org_oauth_disabled' }
+  | { kind: 'oauth_not_allowed' }
   | { kind: 'secrets_locked' }
   | { kind: 'unknown_shape' }
   | { kind: 'network' }

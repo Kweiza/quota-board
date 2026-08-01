@@ -10,7 +10,7 @@ pub const USAGE_URL: &str = "https://api.anthropic.com/api/oauth/usage";
 pub enum UsageError {
     #[error("access token was rejected")]
     Unauthorized,
-    /// The account's Anthropic organization has OAuth turned off entirely.
+    /// The server is refusing OAuth for this account right now.
     ///
     /// Split out from `Unauthorized` because the two need opposite handling and
     /// arrive with the same status. Measured on a real account, 2026-08-01:
@@ -22,10 +22,15 @@ pub enum UsageError {
     /// ```
     ///
     /// The token is valid, so refreshing changes nothing and re-login changes
-    /// nothing — the grant would be refused again. Only an administrator of
-    /// that organization can clear it.
+    /// nothing — the grant would be refused again.
+    ///
+    /// **Do not read the code's wording as the cause.** It names an
+    /// organization, but the one case observed was a **lapsed subscription** on
+    /// an ordinary personal account, and the message itself says "currently".
+    /// Treating this as permanent was an error in an earlier revision;
+    /// `scheduler` retries it with backoff rather than quarantining.
     #[error("OAuth is disabled for this account's organization")]
-    OrgOauthDisabled,
+    OauthNotAllowed,
     #[error("throttled (retry_after={retry_after_secs}s)")]
     Throttled { retry_after_secs: u64 },
     #[error("response shape not recognized")]
@@ -150,8 +155,8 @@ async fn fetch_usage_body_at(
     // the one code that must not be treated as recoverable.
     if status == 403 {
         let body = resp.json::<serde_json::Value>().await.unwrap_or(serde_json::Value::Null);
-        if is_org_oauth_disabled(&body) {
-            return Err(UsageError::OrgOauthDisabled);
+        if is_oauth_not_allowed(&body) {
+            return Err(UsageError::OauthNotAllowed);
         }
         return Err(UsageError::Unauthorized);
     }
@@ -171,15 +176,21 @@ async fn fetch_usage_body_at(
     Ok((status, body))
 }
 
-/// Whether a 403 body carries the one error code that means "not ever", rather
-/// than "not with this token".
+/// Whether a 403 body carries the one error code that means "not this account,
+/// right now", rather than "not with this token".
+///
+/// Named for what it detects and not for what the code says. The wire code is
+/// `oauth_not_allowed_for_organization`, but the observed cause was a lapsed
+/// subscription on an ordinary account — so a function called
+/// `is_org_oauth_disabled` (which this was) teaches every later reader a wrong
+/// cause.
 ///
 /// Matched on `error_code` and **not** on `message`: the message is prose the
 /// server is free to reword, and the code is the part documented as stable by
 /// being a code at all. An unrecognised shape yields `false`, which routes to
 /// `Unauthorized` — the pre-existing behaviour, so a server-side rename
 /// degrades to what this function replaced rather than to something new.
-fn is_org_oauth_disabled(body: &serde_json::Value) -> bool {
+fn is_oauth_not_allowed(body: &serde_json::Value) -> bool {
     body.get("error")
         .and_then(|e| e.get("details"))
         .and_then(|d| d.get("error_code"))
@@ -486,7 +497,7 @@ mod tests {
             .await
             .unwrap_err();
         assert!(
-            matches!(err, UsageError::OrgOauthDisabled),
+            matches!(err, UsageError::OauthNotAllowed),
             "a 403 carrying oauth_not_allowed_for_organization must not be \
              classified as a recoverable auth failure, got {err:?}"
         );
@@ -535,14 +546,14 @@ mod tests {
     #[test]
     fn the_org_policy_is_recognised_by_code_and_not_by_message() {
         let real: serde_json::Value = serde_json::from_str(ORG_DISABLED_BODY).unwrap();
-        assert!(is_org_oauth_disabled(&real));
+        assert!(is_oauth_not_allowed(&real));
 
         let reworded: serde_json::Value = serde_json::from_str(
             r#"{"error":{"message":"totally different prose",
                  "details":{"error_code":"oauth_not_allowed_for_organization"}}}"#,
         )
         .unwrap();
-        assert!(is_org_oauth_disabled(&reworded), "the message must not matter");
+        assert!(is_oauth_not_allowed(&reworded), "the message must not matter");
 
         let right_message_wrong_code: serde_json::Value = serde_json::from_str(
             r#"{"error":{"message":"OAuth authentication is currently not allowed for this organization.",
@@ -550,10 +561,10 @@ mod tests {
         )
         .unwrap();
         assert!(
-            !is_org_oauth_disabled(&right_message_wrong_code),
+            !is_oauth_not_allowed(&right_message_wrong_code),
             "a renamed code must degrade to Unauthorized, not be rescued by prose"
         );
 
-        assert!(!is_org_oauth_disabled(&serde_json::Value::Null));
+        assert!(!is_oauth_not_allowed(&serde_json::Value::Null));
     }
 }
