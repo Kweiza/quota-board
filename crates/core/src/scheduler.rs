@@ -50,6 +50,9 @@ pub enum FailureKind {
     /// invalid_grant. Permanently dead.
     AuthDead,
     SecretsLocked,
+    /// The organization disabled OAuth. Permanent, and unlike `AuthDead` a
+    /// re-login does not fix it.
+    OrgOauthDisabled,
 }
 
 /// The classification of the two error types a poll can produce lives here, in
@@ -72,6 +75,11 @@ impl FailureKind {
             // The access token was rejected. §7.1's `AUTH_EXPIRED` — a refresh
             // is the remedy, and `auth::stored` performs it on the next poll.
             UsageError::Unauthorized => Some(FailureKind::AuthExpired),
+            // Not `AuthExpired`: that state renders as "refreshing…" and waits
+            // for a refresh to rescue it. The token here is fine, so the
+            // refresh succeeds and the next poll gets the same 403 — a spinner
+            // that never resolves, which is the display §7.1 calls out by name.
+            UsageError::OrgOauthDisabled => Some(FailureKind::OrgOauthDisabled),
             UsageError::UnknownShape => Some(FailureKind::UnknownShape),
             UsageError::Transport(_) => Some(FailureKind::Network),
             // **A 5xx is not a network error, and calling it one is a
@@ -570,7 +578,9 @@ impl<C: Clock> Scheduler<C> {
         let interval = self.policy.interval;
         if let Some(e) = self.entries.get_mut(uuid) {
             e.last_failure = Some(kind);
-            if kind == FailureKind::AuthDead {
+            // Both are permanent, so both quarantine on the first strike. They
+            // differ only in what the user is told and offered.
+            if kind == FailureKind::AuthDead || kind == FailureKind::OrgOauthDisabled {
                 // One-strike quarantine. Never retried.
                 e.quarantined = true;
                 return;
@@ -727,7 +737,19 @@ impl<C: Clock> Scheduler<C> {
         let now = self.clock.now();
 
         if e.quarantined {
-            return Some(AccountState::AuthDead);
+            // Written arm by arm rather than with a `_` fallback: a third
+            // quarantining kind added later must be given a display here
+            // deliberately, not inherit `AuthDead`'s clickable "re-login
+            // required" — the one affordance that is wrong for this state.
+            return Some(match e.last_failure {
+                Some(FailureKind::OrgOauthDisabled) => AccountState::OrgOauthDisabled,
+                Some(FailureKind::AuthDead)
+                | Some(FailureKind::Network)
+                | Some(FailureKind::UnknownShape)
+                | Some(FailureKind::AuthExpired)
+                | Some(FailureKind::SecretsLocked)
+                | None => AccountState::AuthDead,
+            });
         }
         if let Some(until) = e.throttled_until.filter(|t| *t > now) {
             return Some(AccountState::Throttled { until });
@@ -770,6 +792,7 @@ impl<C: Clock> Scheduler<C> {
                 Some(FailureKind::AuthExpired) => AccountState::AuthExpired,
                 Some(FailureKind::SecretsLocked) => AccountState::SecretsLocked,
                 Some(FailureKind::AuthDead) => AccountState::AuthDead,
+                Some(FailureKind::OrgOauthDisabled) => AccountState::OrgOauthDisabled,
             }),
         }
     }
@@ -1132,6 +1155,48 @@ mod tests {
         assert_eq!(s.state("a"), Some(AccountState::AuthDead));
         c.advance_secs(100_000);
         assert!(s.due().is_empty(), "a quarantined account is never polled again");
+    }
+
+    /// A 403 naming the organization policy is permanent like `AuthDead`, and
+    /// must **not** render as `AuthDead` — the two differ in the only thing
+    /// §7.1 says a failure state is for, which is the remedy it offers. Telling
+    /// a user to re-login when re-logging in is guaranteed to be refused is the
+    /// confusing failure that section exists to prevent.
+    #[test]
+    fn an_org_oauth_denial_is_quarantined_but_is_not_auth_dead() {
+        let (mut s, c) = sched();
+        s.add("a");
+        s.record_failure("a", FailureKind::OrgOauthDisabled);
+
+        assert_eq!(s.state("a"), Some(AccountState::OrgOauthDisabled));
+        assert_ne!(
+            s.state("a"),
+            Some(AccountState::AuthDead),
+            "re-login is the one affordance that cannot work here"
+        );
+        c.advance_secs(100_000);
+        assert!(s.due().is_empty(), "permanent, so never polled again");
+    }
+
+    /// The quarantine branch runs before the cached-snapshot branch, so an
+    /// account that worked yesterday and is denied today must show the denial
+    /// rather than a dimmed old reading. Without this the state would be
+    /// reachable only on an account that had never once succeeded.
+    #[test]
+    fn an_org_oauth_denial_beats_a_cached_snapshot() {
+        let (mut s, c) = sched();
+        s.add("a");
+        s.begin_poll("a");
+        s.record_success("a", win(42.0), None);
+        assert!(matches!(s.state("a"), Some(AccountState::Ok { .. })));
+
+        c.advance_secs(10);
+        s.record_failure("a", FailureKind::OrgOauthDisabled);
+        assert_eq!(
+            s.state("a"),
+            Some(AccountState::OrgOauthDisabled),
+            "a stale reading with an age would imply this is transient"
+        );
     }
 
     /// Spec §7: accounts are independent of each other.
