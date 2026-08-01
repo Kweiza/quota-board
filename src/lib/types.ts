@@ -42,6 +42,15 @@ export type AccountState =
   | { kind: 'throttled'; until: string }
   | { kind: 'auth_expired' }
   | { kind: 'auth_dead' }
+  /**
+   * The account's Anthropic organization has OAuth turned off. Permanent, like
+   * `auth_dead` — but **it must not offer the re-login affordance**, because
+   * the grant would be refused again. Only an administrator of that
+   * organization can clear it, which is not an action this app can take.
+   * Measured on a real account 2026-08-01: a 403 carrying
+   * `error.details.error_code = "oauth_not_allowed_for_organization"`.
+   */
+  | { kind: 'org_oauth_disabled' }
   | { kind: 'secrets_locked' }
   | { kind: 'unknown_shape' }
   | { kind: 'network' }

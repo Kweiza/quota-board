@@ -59,6 +59,11 @@
     <!-- §7.1: the click is this state's only remedy, so the parent must be
          able to hear it. -->
     <button class="note action" on:click={onRelogin}>re-login required</button>
+  {:else if state.kind === 'org_oauth_disabled'}
+    <!-- Deliberately NOT the `action` button `auth_dead` uses. §7.1 makes the
+         click a state's remedy, and this state has none the app can perform —
+         a button here would be an affordance that is guaranteed to fail. -->
+    <div class="note">OAuth disabled for this org</div>
   {:else if state.kind === 'secrets_locked'}
     <button class="note action" on:click={onUnlock}>unlock</button>
   {:else if state.kind === 'throttled'}

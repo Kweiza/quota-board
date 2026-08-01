@@ -10,6 +10,22 @@ pub const USAGE_URL: &str = "https://api.anthropic.com/api/oauth/usage";
 pub enum UsageError {
     #[error("access token was rejected")]
     Unauthorized,
+    /// The account's Anthropic organization has OAuth turned off entirely.
+    ///
+    /// Split out from `Unauthorized` because the two need opposite handling and
+    /// arrive with the same status. Measured on a real account, 2026-08-01:
+    ///
+    /// ```json
+    /// {"type":"error","error":{"type":"permission_error",
+    ///  "message":"OAuth authentication is currently not allowed for this organization.",
+    ///  "details":{"error_code":"oauth_not_allowed_for_organization"}}}
+    /// ```
+    ///
+    /// The token is valid, so refreshing changes nothing and re-login changes
+    /// nothing — the grant would be refused again. Only an administrator of
+    /// that organization can clear it.
+    #[error("OAuth is disabled for this account's organization")]
+    OrgOauthDisabled,
     #[error("throttled (retry_after={retry_after_secs}s)")]
     Throttled { retry_after_secs: u64 },
     #[error("response shape not recognized")]
@@ -124,7 +140,22 @@ async fn fetch_usage_body_at(
             .unwrap_or(0);
         return Err(UsageError::Throttled { retry_after_secs });
     }
-    if status == 401 || status == 403 {
+    // A 403 is not always the same thing as a 401, and the difference is
+    // permanent versus transient — so this one status needs its body read
+    // before it is classified. Everything else keeps the old ladder.
+    //
+    // Reading it cannot fail the request: a 403 whose body is missing,
+    // truncated or not JSON falls through to `Unauthorized`, which is where it
+    // used to go anyway. The only thing a body buys is the chance to recognise
+    // the one code that must not be treated as recoverable.
+    if status == 403 {
+        let body = resp.json::<serde_json::Value>().await.unwrap_or(serde_json::Value::Null);
+        if is_org_oauth_disabled(&body) {
+            return Err(UsageError::OrgOauthDisabled);
+        }
+        return Err(UsageError::Unauthorized);
+    }
+    if status == 401 {
         return Err(UsageError::Unauthorized);
     }
     if !(200..300).contains(&status) {
@@ -138,6 +169,22 @@ async fn fetch_usage_body_at(
     // behaviour change smuggled into a debug-window task.
     let body = resp.json().await.map_err(|e| UsageError::Transport(e.to_string()))?;
     Ok((status, body))
+}
+
+/// Whether a 403 body carries the one error code that means "not ever", rather
+/// than "not with this token".
+///
+/// Matched on `error_code` and **not** on `message`: the message is prose the
+/// server is free to reword, and the code is the part documented as stable by
+/// being a code at all. An unrecognised shape yields `false`, which routes to
+/// `Unauthorized` — the pre-existing behaviour, so a server-side rename
+/// degrades to what this function replaced rather than to something new.
+fn is_org_oauth_disabled(body: &serde_json::Value) -> bool {
+    body.get("error")
+        .and_then(|e| e.get("details"))
+        .and_then(|d| d.get("error_code"))
+        .and_then(serde_json::Value::as_str)
+        == Some("oauth_not_allowed_for_organization")
 }
 
 /// The parsing half, split out so a caller that captured the body can still
@@ -404,5 +451,109 @@ mod tests {
             .await
             .unwrap_err();
         assert!(matches!(err, UsageError::Unauthorized));
+    }
+
+    /// The body is the one measured on a real account on 2026-08-01, verbatim.
+    /// A hand-simplified body would test the parser against a shape the server
+    /// does not send.
+    const ORG_DISABLED_BODY: &str = r#"{
+        "type": "error",
+        "error": {
+            "type": "permission_error",
+            "message": "OAuth authentication is currently not allowed for this organization.",
+            "details": {
+                "error_visibility": "user_facing",
+                "error_code": "oauth_not_allowed_for_organization"
+            }
+        },
+        "request_id": "req_011CdbxpKgRdr6NWwLPok5WP"
+    }"#;
+
+    #[tokio::test]
+    async fn a_403_naming_the_org_policy_is_not_merely_unauthorized() {
+        let server = wiremock::MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/api/oauth/usage"))
+            .respond_with(
+                ResponseTemplate::new(403)
+                    .set_body_raw(ORG_DISABLED_BODY, "application/json"),
+            )
+            .mount(&server)
+            .await;
+
+        let http = ReqwestHttp::new().unwrap();
+        let err = fetch_usage_at(&http, &format!("{}/api/oauth/usage", server.uri()), "tok")
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, UsageError::OrgOauthDisabled),
+            "a 403 carrying oauth_not_allowed_for_organization must not be \
+             classified as a recoverable auth failure, got {err:?}"
+        );
+    }
+
+    /// The other side of the same branch: a 403 this code does not recognise
+    /// must land exactly where it landed before this variant existed.
+    #[tokio::test]
+    async fn an_unrecognised_403_still_reports_unauthorized() {
+        let server = wiremock::MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/api/oauth/usage"))
+            .respond_with(ResponseTemplate::new(403).set_body_raw(
+                r#"{"error":{"details":{"error_code":"something_else"}}}"#,
+                "application/json",
+            ))
+            .mount(&server)
+            .await;
+
+        let http = ReqwestHttp::new().unwrap();
+        let err = fetch_usage_at(&http, &format!("{}/api/oauth/usage", server.uri()), "tok")
+            .await
+            .unwrap_err();
+        assert!(matches!(err, UsageError::Unauthorized), "got {err:?}");
+    }
+
+    /// A 403 with no body at all, which is what a proxy or an outage produces.
+    #[tokio::test]
+    async fn a_403_with_no_body_reports_unauthorized_rather_than_panicking() {
+        let server = wiremock::MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/api/oauth/usage"))
+            .respond_with(ResponseTemplate::new(403))
+            .mount(&server)
+            .await;
+
+        let http = ReqwestHttp::new().unwrap();
+        let err = fetch_usage_at(&http, &format!("{}/api/oauth/usage", server.uri()), "tok")
+            .await
+            .unwrap_err();
+        assert!(matches!(err, UsageError::Unauthorized), "got {err:?}");
+    }
+
+    /// Matched on the code, not the prose — the message is the server's to
+    /// reword and this must not depend on it.
+    #[test]
+    fn the_org_policy_is_recognised_by_code_and_not_by_message() {
+        let real: serde_json::Value = serde_json::from_str(ORG_DISABLED_BODY).unwrap();
+        assert!(is_org_oauth_disabled(&real));
+
+        let reworded: serde_json::Value = serde_json::from_str(
+            r#"{"error":{"message":"totally different prose",
+                 "details":{"error_code":"oauth_not_allowed_for_organization"}}}"#,
+        )
+        .unwrap();
+        assert!(is_org_oauth_disabled(&reworded), "the message must not matter");
+
+        let right_message_wrong_code: serde_json::Value = serde_json::from_str(
+            r#"{"error":{"message":"OAuth authentication is currently not allowed for this organization.",
+                 "details":{"error_code":"renamed_upstream"}}}"#,
+        )
+        .unwrap();
+        assert!(
+            !is_org_oauth_disabled(&right_message_wrong_code),
+            "a renamed code must degrade to Unauthorized, not be rescued by prose"
+        );
+
+        assert!(!is_org_oauth_disabled(&serde_json::Value::Null));
     }
 }

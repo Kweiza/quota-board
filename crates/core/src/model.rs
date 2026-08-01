@@ -70,6 +70,15 @@ pub enum AccountState {
     AuthExpired,
     /// invalid_grant. Only re-login fixes this.
     AuthDead,
+    /// This account's Anthropic organization has OAuth turned off.
+    ///
+    /// Permanent like `AuthDead`, but **its remedy is different and that is why
+    /// it is not `AuthDead`**: re-logging in cannot help, because the grant
+    /// would be refused again. Offering the one affordance that cannot work is
+    /// the confusing failure §7.1 exists to prevent. Only an administrator of
+    /// that organization can clear it, which is an action this application
+    /// cannot take and must not pretend to offer.
+    OrgOauthDisabled,
     SecretsLocked,
     /// The response could not be parsed. **Not 0%.**
     UnknownShape,
