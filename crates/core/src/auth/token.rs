@@ -120,13 +120,110 @@ pub struct ReqwestHttp {
     client: reqwest::Client,
 }
 
+/// Which root certificates TLS is verified against.
+///
+/// **This crate deliberately stops deciding.** The default is unchanged and is
+/// what every desktop caller uses: `rustls-platform-verifier`, which asks the
+/// operating system. But a host that knows its platform better than this crate
+/// does can supply the roots itself, and one has to.
+///
+/// The measured reason, on Android 16 / API 36 (2026-08-02): the platform
+/// verifier hands the chain to Android's `CertPathValidator`, which insists on
+/// revocation information and answers
+///
+/// ```text
+/// java.security.cert.CertPathValidatorException: Certificate does not specify OCSP responder
+/// ```
+///
+/// for `api.anthropic.com` and `platform.claude.com` — surfacing as
+/// `invalid peer certificate: Revoked`. In the same process and the same run,
+/// `www.google.com` and `example.com` verified fine, so this is a property of
+/// the certificates (no OCSP responder in their AIA extension, which is where
+/// the web is going) rather than of the device. Apple's verifier accepts them,
+/// which is why iOS never saw it.
+///
+/// [`TrustRoots::Only`] routes through rustls' own WebPKI verifier instead,
+/// which checks the chain and the name and does not demand revocation data.
+/// **It replaces the platform verifier rather than adding to it** — that is the
+/// point, and it is also the cost: nothing the OS trusts is consulted unless
+/// the caller passes it in.
+#[derive(Clone, PartialEq, Eq, Default)]
+pub enum TrustRoots {
+    /// Ask the operating system. The default, and unchanged behaviour.
+    #[default]
+    Platform,
+    /// Trust exactly these DER-encoded certificates and nothing else.
+    Only(Vec<Vec<u8>>),
+}
+
+/// Hand-written for legibility rather than for secrecy — root certificates are
+/// public by definition, but a whole platform trust store is roughly 150 of
+/// them and a `Debug` that prints every byte is a log nobody reads.
+impl std::fmt::Debug for TrustRoots {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Platform => f.write_str("TrustRoots::Platform"),
+            Self::Only(roots) => write!(f, "TrustRoots::Only({} roots)", roots.len()),
+        }
+    }
+}
+
 impl ReqwestHttp {
+    /// The operating system's trust store. What every desktop caller wants.
     pub fn new() -> Result<Self, AuthError> {
-        let client = reqwest::Client::builder()
+        Self::with_roots(TrustRoots::default())
+    }
+
+    /// The same client, with the caller choosing what TLS trusts.
+    ///
+    /// See [`TrustRoots`] for why a caller would ever pass anything but the
+    /// default.
+    pub fn with_roots(roots: TrustRoots) -> Result<Self, AuthError> {
+        let builder = reqwest::Client::builder()
             .user_agent(USER_AGENT)
-            .timeout(std::time::Duration::from_secs(30))
-            .build()
-            .map_err(|e| AuthError::Transport(e.to_string()))?;
+            .timeout(std::time::Duration::from_secs(30));
+
+        if let TrustRoots::Only(ders) = roots {
+            // Refused, not honoured. `tls_certs_only(<empty>)` builds happily
+            // and then fails every connection with a certificate error, which
+            // reads as "the server is broken" — and the real cause, a host that
+            // read its trust store and got nothing back, is invisible from
+            // there. The failure belongs where the mistake is.
+            if ders.is_empty() {
+                return Err(AuthError::Transport(
+                    "no trust roots were supplied, which would trust nothing at all".into(),
+                ));
+            }
+            let supplied = ders.len();
+            let mut certs = Vec::with_capacity(supplied);
+            for (i, der) in ders.iter().enumerate() {
+                certs.push(reqwest::Certificate::from_der(der).map_err(|e| {
+                    AuthError::Transport(format!("trust root {i} is not a certificate: {e}"))
+                })?);
+            }
+            // `tls_certs_only`, not `add_root_certificate`: the latter *extends*
+            // the platform verifier, which would keep the revocation demand this
+            // exists to escape.
+            //
+            // The build is where a bad root actually surfaces. `from_der` above
+            // keeps the DER and defers parsing, so garbage bytes sail through it
+            // and come back out of `build()` as the word "builder error" with no
+            // index and no cause — measured, not assumed. The index is lost
+            // either way; saying *what kind* of input was rejected is the part
+            // still worth keeping, because otherwise a host that read its trust
+            // store badly gets a message that could mean anything.
+            return builder
+                .tls_certs_only(certs)
+                .build()
+                .map(|client| Self { client })
+                .map_err(|e| {
+                    AuthError::Transport(format!(
+                        "one of the {supplied} supplied trust roots was rejected: {e}"
+                    ))
+                });
+        }
+
+        let client = builder.build().map_err(|e| AuthError::Transport(e.to_string()))?;
         Ok(Self { client })
     }
 
@@ -748,5 +845,78 @@ mod tests {
             "revoke did not respect its own timeout: took {:?}",
             start.elapsed()
         );
+    }
+}
+
+#[cfg(test)]
+mod trust_root_tests {
+    use super::*;
+
+    /// A real root, so the conversion from DER is exercised on something that
+    /// actually parses. Self-signed and expiring in 2126 — it is a *shape*, not
+    /// a trust decision, and nothing verifies against it.
+    const ROOT_DER: &[u8] = include_bytes!("../../tests/fixtures/self_signed_root.der");
+
+    #[test]
+    fn a_supplied_root_replaces_the_platform_verifier() {
+        assert!(ReqwestHttp::with_roots(TrustRoots::Only(vec![ROOT_DER.to_vec()])).is_ok());
+    }
+
+    /// **Trusting nothing is not a configuration, it is a bug that has not
+    /// happened yet.** A host that reads its platform trust store and finds it
+    /// empty — an unreadable keystore, a wrong API, a stripped image — would
+    /// otherwise get a client whose every request fails with a certificate
+    /// error, which reads as "the server is broken" and is undiagnosable from
+    /// the outside. Refusing at construction puts the failure where the cause
+    /// is.
+    #[test]
+    fn an_empty_root_list_is_refused_rather_than_trusting_nothing() {
+        // `match`, not `unwrap_err()`: `ReqwestHttp` has no `Debug` and must not
+        // grow one — it owns a client whose configuration is nobody's business
+        // in a log.
+        let Err(err) = ReqwestHttp::with_roots(TrustRoots::Only(vec![])) else {
+            panic!("an empty trust list was accepted");
+        };
+        assert!(
+            err.to_string().contains("no trust roots"),
+            "the message must name the cause: {err}"
+        );
+    }
+
+    /// The same reasoning one step later: a host that hands over something that
+    /// is not a certificate must be told so, not left with a client that fails
+    /// every connection.
+    ///
+    /// It cannot say *which* one. `reqwest::Certificate::from_der` keeps the
+    /// bytes and defers parsing, so garbage passes it and reappears out of
+    /// `build()` as the bare words "builder error" — measured while writing
+    /// this test, which is why the assertion is on the wording this crate adds
+    /// rather than on reqwest's.
+    #[test]
+    fn a_root_that_is_not_a_certificate_is_refused() {
+        let Err(err) = ReqwestHttp::with_roots(TrustRoots::Only(vec![b"nope".to_vec()])) else {
+            panic!("a non-certificate was accepted as a trust root");
+        };
+        assert!(
+            err.to_string().contains("trust root"),
+            "the message must say which input was rejected: {err}"
+        );
+    }
+
+    /// `new()` must keep meaning what it meant before this existed. Every
+    /// desktop caller goes through it and none of them passes roots.
+    #[test]
+    fn the_default_is_still_the_platform_verifier() {
+        assert_eq!(TrustRoots::default(), TrustRoots::Platform);
+        assert!(ReqwestHttp::new().is_ok());
+    }
+
+    /// Root certificates are public by definition, but a `Debug` that prints
+    /// every byte of a whole platform trust store is a log nobody can read.
+    #[test]
+    fn debug_reports_how_many_roots_rather_than_all_of_them() {
+        let printed = format!("{:?}", TrustRoots::Only(vec![ROOT_DER.to_vec(); 3]));
+        assert!(printed.contains('3'), "the count should survive: {printed}");
+        assert!(printed.len() < 100, "Debug printed the certificates: {} bytes", printed.len());
     }
 }
