@@ -1186,6 +1186,17 @@ strongest available short of it.
   Fatal left is the missing notarization ticket, which is the ordinary state of
   an unnotarized app and is what the README's instructions address. JSON takes
   no comments, so this is the only place the reason is written down.
+
+  **The two states are told apart by the message, and both were measured on
+  macOS 26.** Unsigned bundle → *"…is damaged and can't be opened. You should
+  move it to the Trash."*, which no click-through clears. Ad-hoc signed bundle →
+  *"Apple could not verify 'Quota Board.app' is free of malware…"*, which both
+  `xattr` and *Open Anyway* clear. A bug report quoting the first sentence is
+  reporting a build problem; one quoting the second is reporting the documented
+  install step.
+- **`spctl -a` cannot tell those two apart** — it answers `rejected` for both.
+  Use `syspolicy_check distribution <app>`, which grades each finding, and read
+  it against a known-good bundle rather than alone
 - **Right-click → *Open* is no longer a bypass on macOS 15 and later.** Apple
   removed it; the flow is now blocked launch → System Settings → *Privacy &
   Security* → *Open Anyway*. `xattr -dr com.apple.quarantine` still works and is
