@@ -100,10 +100,22 @@ Windows, `.deb`/`.rpm`/`.AppImage` on Linux. Prefer the `.deb` or `.rpm` on
 Linux: they are a few megabytes, while the AppImage carries its own copy of
 WebKitGTK and is an order of magnitude larger.
 
-**Nothing is code-signed.** macOS will refuse the first launch; open it once
-from Finder's right-click → Open, or clear the quarantine flag with
-`xattr -dr com.apple.quarantine "/Applications/Quota Board.app"`. Windows
-SmartScreen will warn; the bypass is *More info* → *Run anyway*.
+**Nothing is notarized and there is no Developer ID.** The macOS bundle is
+ad-hoc signed, which is enough for the app to run but not enough for Gatekeeper
+to admit it unaided.
+
+- **macOS** — clear the quarantine flag:
+  `xattr -dr com.apple.quarantine "/Applications/Quota Board.app"`.
+  Finder's right-click → *Open* is **not** an alternative on macOS 15 and later;
+  Apple removed that bypass. There the other route is to let the launch be
+  blocked, then System Settings → *Privacy & Security* → *Open Anyway*.
+- **Windows** — SmartScreen will warn; the bypass is *More info* →
+  *Run anyway*.
+
+> **Releases 0.1.0 and 0.2.0 shipped without the ad-hoc signature.** macOS
+> reports those two as *"damaged and can't be opened"*, and no click-through
+> gets past it — the `xattr` command above is the only way to run them. Fixed in
+> 0.2.1.
 
 **On macOS an unsigned build changes identity every time you rebuild it**, and
 keychain items are bound to that identity. The system will ask again for

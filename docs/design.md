@@ -1171,8 +1171,25 @@ strongest available short of it.
   designs would need separate validation
 - **macOS App Store: not a goal.** Transparent windows require
   `macOSPrivateApi`, which forfeits App Store distribution eligibility
-- **Code signing**: not in early versions. The README explains how to get past
-  Gatekeeper / SmartScreen warnings
+- **Code signing**: no Developer ID and no notarization. The macOS bundle **is**
+  ad-hoc signed (`bundle.macOS.signingIdentity: "-"`), and that is not a
+  cosmetic difference from signing nothing at all. Tauri only runs `codesign`
+  when an identity is configured; with none, the bundle ships carrying only the
+  linker's ad-hoc Mach-O signature and **no `_CodeSignature/CodeResources`** —
+  and macOS then reports the app as **"damaged and can't be opened"**, which
+  neither right-click → *Open* nor the *Open Anyway* button will bypass.
+
+  **Measured on 0.1.0 and 0.2.0, which both shipped that way.**
+  `codesign --verify` failed with *"code has no resources but signature
+  indicates they must be present"*, and `syspolicy_check distribution` graded it
+  a **Fatal** codesign error. Ad-hoc signing clears exactly that error; the only
+  Fatal left is the missing notarization ticket, which is the ordinary state of
+  an unnotarized app and is what the README's instructions address. JSON takes
+  no comments, so this is the only place the reason is written down.
+- **Right-click → *Open* is no longer a bypass on macOS 15 and later.** Apple
+  removed it; the flow is now blocked launch → System Settings → *Privacy &
+  Security* → *Open Anyway*. `xattr -dr com.apple.quarantine` still works and is
+  the instruction to lead with
 
 ## 16. Non-goals
 
