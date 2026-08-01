@@ -6,6 +6,7 @@ use crate::secrets::SecretError;
 use crate::snapshots::CachedSnapshot;
 use crate::usage::http::UsageError;
 use chrono::{DateTime, TimeDelta, Utc};
+use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
@@ -42,7 +43,8 @@ impl Clock for TestClock {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum FailureKind {
     Network,
     UnknownShape,
@@ -244,6 +246,63 @@ pub const IN_FLIGHT_RECLAIM_SECS: i64 = 170;
 /// Bounded rather than open-ended so the shift below stays inside `i32` and the
 /// multiplication has a chance of being representable.
 const MAX_BACKOFF_LEVEL: u32 = 6;
+
+/// The version stamped into [`SchedulerState`].
+///
+/// Bumped whenever the meaning of a field changes. [`Scheduler::restore_state`]
+/// **refuses** a version it does not know rather than applying what it
+/// recognises — a partially restored schedule is one nobody designed, and
+/// starting fresh is a defined state while half-applied is not.
+pub const SCHEDULER_STATE_VERSION: u32 = 1;
+
+/// One account's timing, in a form that survives the process.
+///
+/// **Deliberately not the whole `Entry`.** `last_windows`, `last_credit` and
+/// `last_fetched_at` are absent because `snapshots.json` already persists them
+/// and restores them through `seed_from_cache`, which carries the age §7.1
+/// requires. Duplicating them here would give the same data two sources of
+/// truth, which is the bug class this crate keeps naming.
+///
+/// `in_flight_since` is absent for a different reason: a poll that was running
+/// when the process died is not running now. Persisting it would block the
+/// account for `IN_FLIGHT_RECLAIM_SECS` after every crash, over a poll that no
+/// longer exists.
+///
+/// `quarantined` is absent too — `accounts.json` owns it, and
+/// `register_accounts` already restores it.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct EntryTiming {
+    pub uuid: String,
+    pub next_due_at: DateTime<Utc>,
+    pub backoff_level: u32,
+    /// §6.2's server-ordered wait. **The reason this type exists.**
+    pub throttled_until: Option<DateTime<Utc>>,
+    /// §6.1's per-account floor. Without it every cold start satisfies the
+    /// floor vacuously, because `None` reads as "never attempted".
+    pub last_attempt_at: Option<DateTime<Utc>>,
+    /// Read by `state()`'s precedence before it reaches the snapshot.
+    pub last_failure: Option<FailureKind>,
+}
+
+/// Everything about the schedule that must outlive the process.
+///
+/// On a desktop this matters at every quit and relaunch: today a restart
+/// forgets a `Retry-After` the server issued seconds earlier and re-polls
+/// inside the wait it was told to observe. On a phone it matters constantly,
+/// because the process is killed and re-forked as a matter of course.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SchedulerState {
+    pub version: u32,
+    pub entries: Vec<EntryTiming>,
+}
+
+/// [`Scheduler::restore_state`] was handed a version it cannot interpret.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+#[error("scheduler state version {found} is not supported (this build understands {expected})")]
+pub struct UnsupportedStateVersion {
+    pub found: u32,
+    pub expected: u32,
+}
 
 struct Entry {
     next_due_at: DateTime<Utc>,
@@ -732,6 +791,75 @@ impl<C: Clock> Scheduler<C> {
         }
     }
 
+    /// Snapshot the timing of every registered account.
+    ///
+    /// Call it after any tick that changed a schedule and persist the result
+    /// beside `accounts.json`. It is cheap and allocation-bounded by the
+    /// account count, so a host that cannot tell whether anything changed can
+    /// simply write it every tick.
+    pub fn export_state(&self) -> SchedulerState {
+        let mut entries: Vec<EntryTiming> = self
+            .entries
+            .iter()
+            .map(|(uuid, e)| EntryTiming {
+                uuid: uuid.clone(),
+                next_due_at: e.next_due_at,
+                backoff_level: e.backoff_level,
+                throttled_until: e.throttled_until,
+                last_attempt_at: e.last_attempt_at,
+                last_failure: e.last_failure,
+            })
+            .collect();
+        // `HashMap` iteration order is not stable, and an unstable order would
+        // rewrite the persisted file on every tick with identical content —
+        // pointless disk churn, and it makes a diff of two states unreadable.
+        entries.sort_by(|a, b| a.uuid.cmp(&b.uuid));
+        SchedulerState { version: SCHEDULER_STATE_VERSION, entries }
+    }
+
+    /// Re-apply a previously exported schedule.
+    ///
+    /// **Call it after the accounts are registered**, not before: only accounts
+    /// this scheduler already knows are touched. An entry for an account that
+    /// has since been removed is ignored, and an account with no entry keeps
+    /// the fresh timing `add` gave it — which is the correct answer for an
+    /// account added while the process was not running.
+    ///
+    /// Returns how many entries were applied, so a caller can tell "restored
+    /// nothing because the file was empty" from "restored nothing because every
+    /// account is gone".
+    ///
+    /// **A version it does not recognise is refused whole.** Applying the
+    /// fields that happen to still parse would produce a schedule nobody
+    /// designed; a fresh start is at least a state this code was written for.
+    pub fn restore_state(
+        &mut self,
+        state: &SchedulerState,
+    ) -> Result<usize, UnsupportedStateVersion> {
+        if state.version != SCHEDULER_STATE_VERSION {
+            return Err(UnsupportedStateVersion {
+                found: state.version,
+                expected: SCHEDULER_STATE_VERSION,
+            });
+        }
+        let mut applied = 0;
+        for t in &state.entries {
+            let Some(e) = self.entries.get_mut(&t.uuid) else { continue };
+            e.next_due_at = t.next_due_at;
+            e.backoff_level = t.backoff_level;
+            e.throttled_until = t.throttled_until;
+            e.last_attempt_at = t.last_attempt_at;
+            e.last_failure = t.last_failure;
+            // Never restored, and this is the point rather than an omission: a
+            // poll that was in flight when the process died is not in flight
+            // now, and restoring it would strand the account for
+            // `IN_FLIGHT_RECLAIM_SECS` over a request that no longer exists.
+            e.in_flight_since = None;
+            applied += 1;
+        }
+        Ok(applied)
+    }
+
     pub fn state(&self, uuid: &str) -> Option<AccountState> {
         let e = self.entries.get(uuid)?;
         let now = self.clock.now();
@@ -901,6 +1029,16 @@ mod tests {
 
     fn sched() -> (Scheduler<TestClock>, TestClock) {
         let clock = TestClock::new("2026-07-29T12:00:00Z");
+        let s = Scheduler::new(PollPolicy::default(), clock.clone());
+        (s, clock)
+    }
+
+    /// A second, independent scheduler whose clock starts where another one
+    /// left off — a cold start, in other words. The restore tests need two
+    /// schedulers and one timeline; sharing a `TestClock` would share the
+    /// handle and let one test's `advance_secs` move the other's clock.
+    fn sched_at(at: DateTime<Utc>) -> (Scheduler<TestClock>, TestClock) {
+        let clock = TestClock(Arc::new(Mutex::new(at)));
         let s = Scheduler::new(PollPolicy::default(), clock.clone());
         (s, clock)
     }
@@ -1197,6 +1335,145 @@ mod tests {
             Some(AccountState::OrgOauthDisabled),
             "a stale reading with an age would imply this is transient"
         );
+    }
+
+    // ---- export_state / restore_state ------------------------------------
+
+    /// The whole point: a server-ordered wait must outlive the process. Without
+    /// this, a phone that is killed and re-forked — which is the normal case,
+    /// not an edge one — polls again immediately inside a wait §6.2 says is
+    /// the entire input to the throttle policy.
+    #[test]
+    fn a_server_ordered_wait_survives_a_restart() {
+        let (mut before, c1) = sched();
+        before.add("a");
+        before.record_throttle("a", 600);
+        assert!(matches!(before.state("a"), Some(AccountState::Throttled { .. })));
+        let saved = before.export_state();
+
+        // A brand-new scheduler, as after a cold start.
+        let (mut after, c2) = sched_at(c1.now());
+        after.add("a");
+        assert!(
+            !after.due().is_empty() || after.state("a") == Some(AccountState::Loading),
+            "precondition: a fresh scheduler has no idea it was throttled"
+        );
+
+        assert_eq!(after.restore_state(&saved), Ok(1));
+        assert!(
+            matches!(after.state("a"), Some(AccountState::Throttled { .. })),
+            "the wait was forgotten across the restart"
+        );
+        assert!(after.due().is_empty(), "and it must not be polled during it");
+
+        c2.advance_secs(601);
+        assert_eq!(after.due(), vec!["a"], "but it does become due once the wait passes");
+    }
+
+    /// §6.1's floor is satisfied vacuously when `last_attempt_at` is `None`,
+    /// because `None` reads as "never attempted". A cold start must not hand
+    /// every account a free poll.
+    #[test]
+    fn the_per_account_floor_survives_a_restart() {
+        let (mut before, c1) = sched();
+        before.add("a");
+        before.begin_poll("a");
+        before.end_poll("a");
+        let saved = before.export_state();
+
+        let (mut after, _c2) = sched_at(c1.now());
+        after.add("a");
+        after.restore_state(&saved).unwrap();
+        assert!(
+            after.due().is_empty(),
+            "an account polled a moment ago must not be due again after a restart"
+        );
+    }
+
+    /// A poll that was running when the process died is not running now.
+    #[test]
+    fn an_in_flight_poll_is_not_restored() {
+        let (mut before, c1) = sched();
+        before.add("a");
+        before.begin_poll("a"); // deliberately no end_poll: the process "died"
+        let saved = before.export_state();
+
+        let (mut after, c2) = sched_at(c1.now());
+        after.add("a");
+        after.restore_state(&saved).unwrap();
+
+        // The floor still applies, so move past it; what must NOT apply is a
+        // 170-second in-flight reclaim over a request that no longer exists.
+        c2.advance_secs(181);
+        assert_eq!(
+            after.due(),
+            vec!["a"],
+            "a dead process's in-flight poll must not strand the account"
+        );
+    }
+
+    #[test]
+    fn restore_ignores_accounts_that_no_longer_exist_and_leaves_new_ones_fresh() {
+        let (mut before, c1) = sched();
+        before.add("gone");
+        before.record_throttle("gone", 600);
+        let saved = before.export_state();
+
+        let (mut after, _c2) = sched_at(c1.now());
+        after.add("fresh");
+        assert_eq!(
+            after.restore_state(&saved),
+            Ok(0),
+            "an entry for a removed account must not resurrect it"
+        );
+        assert!(after.state("gone").is_none());
+        assert_eq!(after.state("fresh"), Some(AccountState::Loading));
+    }
+
+    /// Refused whole, not partially applied: half a schedule is one nobody
+    /// designed, while a fresh start is a state this code was written for.
+    #[test]
+    fn an_unknown_state_version_is_refused_rather_than_partly_applied() {
+        let (mut before, c1) = sched();
+        before.add("a");
+        before.record_throttle("a", 600);
+        let mut saved = before.export_state();
+        saved.version = SCHEDULER_STATE_VERSION + 1;
+
+        let (mut after, _c2) = sched_at(c1.now());
+        after.add("a");
+        let err = after.restore_state(&saved).unwrap_err();
+        assert_eq!(err.found, SCHEDULER_STATE_VERSION + 1);
+        assert_eq!(err.expected, SCHEDULER_STATE_VERSION);
+        assert_eq!(
+            after.state("a"),
+            Some(AccountState::Loading),
+            "nothing may have been applied"
+        );
+    }
+
+    /// The persisted form has to survive the round trip through disk, and the
+    /// order has to be stable or the file is rewritten every tick with
+    /// identical content.
+    #[test]
+    fn the_exported_state_round_trips_through_json_in_a_stable_order() {
+        let (mut s, _c) = sched();
+        for uuid in ["c", "a", "b"] {
+            s.add(uuid);
+        }
+        s.record_throttle("b", 300);
+        s.record_failure("c", FailureKind::Network);
+
+        let exported = s.export_state();
+        assert_eq!(
+            exported.entries.iter().map(|e| e.uuid.as_str()).collect::<Vec<_>>(),
+            vec!["a", "b", "c"],
+            "HashMap order is not stable; the export must be"
+        );
+
+        let json = serde_json::to_string(&exported).unwrap();
+        let parsed: SchedulerState = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed, exported, "the round trip must be lossless");
     }
 
     /// Spec §7: accounts are independent of each other.
