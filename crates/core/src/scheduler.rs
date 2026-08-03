@@ -2,8 +2,9 @@ use crate::accounts::{Account, AccountError, AccountStore};
 use crate::auth::stored::StoredTokenError;
 use crate::auth::token::AuthError;
 use crate::model::{AccountState, ExtraLine, UsageWindow};
+use crate::provider::Provider;
 use crate::secrets::SecretError;
-use crate::snapshots::CachedSnapshot;
+use crate::snapshots::{cache_key, CachedSnapshot};
 use crate::usage::http::UsageError;
 use chrono::{DateTime, TimeDelta, Utc};
 use serde::{Deserialize, Serialize};
@@ -930,16 +931,26 @@ impl<C: Clock> Scheduler<C> {
 /// unverified cache. On the fallback store at launch-at-login that means the
 /// widget shows nothing until the passphrase is entered — a consequence of
 /// §9.3 (and of design.md:600-601), not a bug to work around.
+///
+/// **Looks the cache up by `snapshots::cache_key(a.provider, a.account_id)`,
+/// not by the bare id.** `snapshots::save`/`remove` write and delete under
+/// that same namespaced key; a bare-id lookup here would miss every entry a
+/// Codex account ever writes (it always fails closed to `None` — nothing ever
+/// there to seed from — since Anthropic's own key happens to still look like
+/// a bare id) and, for an *upgraded* Anthropic account, would keep matching a
+/// pre-upgrade entry that `save` can no longer reach or refresh, restoring the
+/// same stale snapshot forever rather than the one cold start the format
+/// change was supposed to cost.
 pub fn register_accounts<C: Clock>(
     sched: &mut Scheduler<C>,
     accounts: &[Account],
     cache: &mut std::collections::HashMap<String, CachedSnapshot>,
-    current_fingerprint: &dyn Fn(&str) -> Option<String>,
+    current_fingerprint: &dyn Fn(Provider, &str) -> Option<String>,
 ) {
     for a in accounts {
         sched.add(&a.account_id);
-        if let Some(snap) = cache.remove(&a.account_id) {
-            if let Some(fp) = current_fingerprint(&a.account_id) {
+        if let Some(snap) = cache.remove(&cache_key(a.provider, &a.account_id)) {
+            if let Some(fp) = current_fingerprint(a.provider, &a.account_id) {
                 sched.seed_from_cache(&a.account_id, snap, &fp);
             }
         }
@@ -1852,7 +1863,7 @@ mod tests {
     fn a_persisted_quarantine_is_restored_at_startup() {
         let (mut s, c) = sched();
         let mut cache = HashMap::new();
-        register_accounts(&mut s, &[account("a", true), account("b", false)], &mut cache, &|_| None);
+        register_accounts(&mut s, &[account("a", true), account("b", false)], &mut cache, &|_, _| None);
 
         assert_eq!(s.state("a"), Some(AccountState::AuthDead));
         c.advance_secs(100_000);
@@ -1861,6 +1872,37 @@ mod tests {
             vec!["b"],
             "the quarantined account was polled again after a restart"
         );
+    }
+
+    /// `snapshots::save`/`remove` write and delete under
+    /// `cache_key(provider, id)`, so `register_accounts` must look the cache
+    /// up the same way. Seeding *two* entries for the same id pins that: a
+    /// fixture with only the correctly-keyed entry would restore the right
+    /// value even under the old bare-id lookup this replaced, since there
+    /// would be nothing else in the map for it to find instead. The bare
+    /// entry stands in for a pre-upgrade cache file — `save` no longer writes
+    /// or removes that key, so a lookup that still preferred it would restore
+    /// the same stale snapshot forever, not just for one cold start.
+    #[test]
+    fn restoring_an_account_reads_the_namespaced_cache_entry_not_the_bare_one() {
+        let (mut s, c) = sched();
+        let mut cache = HashMap::new();
+        cache.insert(cache_key(Provider::Openai, "same"), cached(&c, 77.0, 3600, "fp"));
+        cache.insert("same".to_string(), cached(&c, 11.0, 3600, "fp"));
+
+        let mut a = account("same", false);
+        a.provider = Provider::Openai;
+        register_accounts(&mut s, &[a], &mut cache, &|_, _| Some("fp".to_string()));
+
+        match s.state("same").unwrap() {
+            AccountState::Stale { windows, .. } => {
+                assert_eq!(
+                    windows[0].percent, 77.0,
+                    "the bare-id entry was restored instead of the namespaced one"
+                );
+            }
+            other => panic!("expected Stale, got {other:?}"),
+        }
     }
 
     /// The disk value, not the in-memory one. `Scheduler`'s copy of the flag is
@@ -2132,7 +2174,7 @@ mod tests {
         let (mut s, c) = sched();
         let mut cache = HashMap::new();
         let accounts = [account("a", false), account("b", false), account("c", false)];
-        register_accounts(&mut s, &accounts, &mut cache, &|_| None);
+        register_accounts(&mut s, &accounts, &mut cache, &|_, _| None);
 
         let stagger = PollPolicy::default().stagger();
         assert!(stagger > TimeDelta::zero(), "a zero stagger would make this test catch nothing");
