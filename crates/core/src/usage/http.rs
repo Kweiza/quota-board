@@ -1,6 +1,6 @@
 use crate::auth::token::{ReqwestHttp, ANTHROPIC_BETA};
 use crate::model::{ExtraLine, UsageWindow};
-use crate::usage::parse::{parse_credit, parse_usage, ParseError};
+use crate::usage::anthropic::{parse_credit, parse_usage, ParseError};
 use crate::usage::raw::RawResponse;
 
 /// Spec §5.1. The single data source.
@@ -333,7 +333,7 @@ mod tests {
     /// that a window present but unreadable becomes an error rather than
     /// falling through to a fabricated empty success, i.e. an implicit 0%. The
     /// distinction between the two parse failures is pinned where it is real,
-    /// in `usage::parse`'s `unreadable_sources_yield_an_error_not_an_empty_success`.
+    /// in `usage::anthropic`'s `unreadable_sources_yield_an_error_not_an_empty_success`.
     #[tokio::test]
     async fn an_unreadable_source_is_unknown_shape_not_zero() {
         let server = MockServer::start().await;

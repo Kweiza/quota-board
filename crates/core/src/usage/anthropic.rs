@@ -286,7 +286,7 @@ mod tests {
             // would otherwise pass against nothing.
             other => panic!(
                 "no fixture named {other:?} is compiled in — add it to the table \
-                 in parse.rs's test module alongside the file"
+                 in anthropic.rs's test module alongside the file"
             ),
         };
         serde_json::from_str(text).unwrap()
@@ -312,7 +312,7 @@ mod tests {
         }
         assert!(
             missing.is_empty(),
-            "fixtures on disk but not compiled into parse.rs's table: {missing:?}"
+            "fixtures on disk but not compiled into anthropic.rs's table: {missing:?}"
         );
     }
 
