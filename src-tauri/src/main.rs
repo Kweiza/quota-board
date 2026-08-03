@@ -9,8 +9,9 @@ mod tray;
 
 use quota_core::accounts::AccountStore;
 use quota_core::auth::pkce::AuthConfig;
-use quota_core::auth::stored::{token_key, RefreshLocks};
+use quota_core::auth::stored::RefreshLocks;
 use quota_core::auth::token::{ReqwestHttp, TokenSet};
+use quota_core::provider::{token_key, Provider};
 use quota_core::scheduler::{register_accounts, Scheduler, SystemClock};
 use quota_core::secrets::{keychain::KeychainStore, timeout::TimeoutStore, SecretStore, SERVICE};
 /// Named only inside the `QUOTA_FORCE_FALLBACK` block below, which is itself
@@ -177,8 +178,12 @@ fn main() {
             }
             let mut scheduler = Scheduler::new(settings.poll_policy(), SystemClock);
             let store = Arc::clone(&secrets);
+            // `Provider::Anthropic` is temporary: `register_accounts` calls this
+            // with only a uuid, not the account's own provider. Task 6 threads
+            // `Provider` through the scheduler's account map; until then every
+            // account this closure sees is Anthropic anyway.
             let current_fp = move |uuid: &str| -> Option<String> {
-                let raw = store.get(&token_key(uuid)).ok().flatten()?;
+                let raw = store.get(&token_key(Provider::Anthropic, uuid)).ok().flatten()?;
                 let tokens: TokenSet = serde_json::from_slice(&raw).ok()?;
                 Some(fingerprint(&tokens.access_token))
             };

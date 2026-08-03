@@ -35,6 +35,7 @@
 
 use crate::auth::pkce::AuthConfig;
 use crate::auth::token::{refresh, AuthError, TokenHttp, TokenSet};
+use crate::provider::{token_key, Provider};
 use crate::secrets::{SecretError, SecretStore};
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
@@ -43,14 +44,6 @@ use std::sync::{Arc, Mutex};
 /// a second pass exists only to adopt a value stored underneath us and
 /// re-evaluate it. More than that is not contention, it is a bug.
 const MAX_ATTEMPTS: usize = 2;
-
-/// docs/design.md §9.3: entries are keyed uniquely by `account.uuid` under our
-/// own service name, and lookups are exact. This is the only place the key is
-/// built — four independent re-derivations of this format is how ccstatusline
-/// #521 happens.
-pub fn token_key(uuid: &str) -> String {
-    format!("{uuid}:tokens")
-}
 
 #[derive(Debug, thiserror::Error)]
 pub enum StoredTokenError {
@@ -68,9 +61,20 @@ pub enum StoredTokenError {
     Auth(#[from] AuthError),
 }
 
-/// One async mutex per account. Entries are created on first use and never
-/// evicted — the map is bounded by the account count, so eviction would be more
-/// machinery than it saves.
+/// One lock per account, identified by provider and id together — see
+/// `RefreshLocks`'s doc comment for why the pair, not the id alone, is the key.
+type AccountLock = Arc<tokio::sync::Mutex<()>>;
+
+/// One async mutex per **(provider, account)** pair. Entries are created on
+/// first use and never evicted — the map is bounded by the account count, so
+/// eviction would be more machinery than it saves.
+///
+/// **Keyed by `(Provider, String)`, not by the id alone.** Two accounts that
+/// share an id across providers (docs/design.md §9.3 — nothing stops Anthropic
+/// and Codex from issuing the same string) must not share a lock: if they did,
+/// one provider's refresh would serialize against a refresh that has nothing
+/// to do with it, and `is_refreshing` would answer for the wrong account
+/// entirely.
 ///
 /// **A `RefreshLocks` serializes only against itself.** Two instances covering
 /// the same account serialize nothing at all: each hands out its own mutex, and
@@ -80,15 +84,15 @@ pub enum StoredTokenError {
 /// handler, or per poll.
 #[derive(Default)]
 pub struct RefreshLocks {
-    inner: Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
+    inner: Mutex<HashMap<(Provider, String), AccountLock>>,
 }
 
 impl RefreshLocks {
-    fn for_uuid(&self, uuid: &str) -> Arc<tokio::sync::Mutex<()>> {
+    fn for_account(&self, provider: Provider, uuid: &str) -> AccountLock {
         // The std guard is a temporary and is dropped at the end of this
         // expression, so it never crosses an await and
         // `clippy::await_holding_lock` does not fire.
-        self.inner.lock().unwrap().entry(uuid.to_string()).or_default().clone()
+        self.inner.lock().unwrap().entry((provider, uuid.to_string())).or_default().clone()
     }
 
     /// Whether a refresh is in flight for this account. Lets a caller answer
@@ -98,8 +102,12 @@ impl RefreshLocks {
     /// Advisory only: the answer can go stale the instant it is returned. It
     /// drives a display state, never a correctness decision — the lock itself
     /// is what orders writers.
-    pub fn is_refreshing(&self, uuid: &str) -> bool {
-        self.inner.lock().unwrap().get(uuid).is_some_and(|m| m.try_lock().is_err())
+    pub fn is_refreshing(&self, provider: Provider, uuid: &str) -> bool {
+        self.inner
+            .lock()
+            .unwrap()
+            .get(&(provider, uuid.to_string()))
+            .is_some_and(|m| m.try_lock().is_err())
     }
 }
 
@@ -127,19 +135,28 @@ pub struct Fresh {
     pub persisted: Result<(), SecretError>,
 }
 
-fn load(store: &dyn SecretStore, uuid: &str) -> Result<TokenSet, StoredTokenError> {
-    let raw = store.get(&token_key(uuid))?.ok_or(StoredTokenError::Missing)?;
+fn load(
+    store: &dyn SecretStore,
+    provider: Provider,
+    uuid: &str,
+) -> Result<TokenSet, StoredTokenError> {
+    let raw = store.get(&token_key(provider, uuid))?.ok_or(StoredTokenError::Missing)?;
     serde_json::from_slice(&raw).map_err(|_| StoredTokenError::Corrupt)
 }
 
-fn save(store: &dyn SecretStore, uuid: &str, tokens: &TokenSet) -> Result<(), SecretError> {
+fn save(
+    store: &dyn SecretStore,
+    provider: Provider,
+    uuid: &str,
+    tokens: &TokenSet,
+) -> Result<(), SecretError> {
     // `TokenSet` is plain data, so serializing it cannot fail in practice.
     // Report it as a store error rather than as `Corrupt`: nothing was parsed
     // and nothing was stored, and the caller's useful response is identical to
     // any other failed write — the value did not reach the store.
     let blob = serde_json::to_vec(tokens)
         .map_err(|_| SecretError::Backend("failed to serialize the token set".into()))?;
-    store.put(&token_key(uuid), &blob)
+    store.put(&token_key(provider, uuid), &blob)
 }
 
 /// Refreshes the stored token set if §10.5's five-minute skew says it is due,
@@ -162,18 +179,24 @@ fn save(store: &dyn SecretStore, uuid: &str, tokens: &TokenSet) -> Result<(), Se
 ///
 /// The caller must not hold any other lock across this call. It awaits a
 /// network request of up to 30 seconds.
+///
+/// **`provider` is part of the identity, not a filter.** Two accounts that
+/// share a `uuid` string across providers are two different accounts
+/// (docs/design.md §9.3), so it is threaded into every key and lock lookup
+/// alongside `uuid` rather than assumed to be Anthropic.
 pub async fn ensure_fresh<H: TokenHttp>(
     http: &H,
     cfg: &AuthConfig,
     store: &dyn SecretStore,
     locks: &RefreshLocks,
+    provider: Provider,
     uuid: &str,
 ) -> Result<Fresh, StoredTokenError> {
-    let guard = locks.for_uuid(uuid);
+    let guard = locks.for_account(provider, uuid);
     let _held = guard.lock().await;
 
     for _ in 0..MAX_ATTEMPTS {
-        let current = load(store, uuid)?;
+        let current = load(store, provider, uuid)?;
         if !current.needs_refresh() {
             // The double check. A caller that waited on the lock lands here and
             // returns what the winner stored, with no second request. Nothing
@@ -187,7 +210,7 @@ pub async fn ensure_fresh<H: TokenHttp>(
         // Compare-and-swap (§10.5). Every arm is explicit on purpose: a
         // catch-all that falls through to the write is wrong in two distinct
         // ways, and both cost the user a permanently dead account.
-        match load(store, uuid) {
+        match load(store, provider, uuid) {
             // Someone stored a different chain underneath us — realistically a
             // re-login landing mid-refresh. §10.5 says adopt it rather than
             // overwrite. `continue` re-reads and re-evaluates freshness, which
@@ -217,14 +240,14 @@ pub async fn ensure_fresh<H: TokenHttp>(
         // is dead and `new` is the only live credential. A failed write is
         // reported, never propagated: returning `Err` here would discard the
         // live token and waste the poll cycle on top of the durability loss.
-        let persisted = save(store, uuid, &new);
+        let persisted = save(store, provider, uuid, &new);
         return Ok(Fresh { tokens: new, persisted });
     }
 
     // Two adoptions in a row means some third writer keeps storing already
     // stale token sets. Hand back what is actually stored and let the next poll
     // cycle re-evaluate, rather than refreshing in a loop.
-    Ok(Fresh { tokens: load(store, uuid)?, persisted: Ok(()) })
+    Ok(Fresh { tokens: load(store, provider, uuid)?, persisted: Ok(()) })
 }
 
 #[cfg(test)]
@@ -266,7 +289,7 @@ mod tests {
     }
 
     fn stored_refresh_token(store: &dyn SecretStore) -> Option<String> {
-        let raw = store.get(&token_key(UUID)).unwrap()?;
+        let raw = store.get(&token_key(Provider::Anthropic, UUID)).unwrap()?;
         Some(serde_json::from_slice::<TokenSet>(&raw).unwrap().refresh_token)
     }
 
@@ -327,15 +350,15 @@ mod tests {
 
         let store = MemoryStore::default();
         store
-            .put(&token_key(UUID), &serde_json::to_vec(&expired_tokens("rt-0")).unwrap())
+            .put(&token_key(Provider::Anthropic, UUID), &serde_json::to_vec(&expired_tokens("rt-0")).unwrap())
             .unwrap();
         let locks = RefreshLocks::default();
         let http = ReqwestHttp::new().unwrap();
         let cfg = cfg_for(&server).await;
 
         let (a, b) = tokio::join!(
-            ensure_fresh(&http, &cfg, &store, &locks, UUID),
-            ensure_fresh(&http, &cfg, &store, &locks, UUID),
+            ensure_fresh(&http, &cfg, &store, &locks, Provider::Anthropic, UUID),
+            ensure_fresh(&http, &cfg, &store, &locks, Provider::Anthropic, UUID),
         );
 
         assert_eq!(posts.load(Ordering::SeqCst), 1, "the refresh was not serialized");
@@ -352,7 +375,7 @@ mod tests {
         let server = MockServer::start().await;
         let store = Arc::new(MemoryStore::default());
         store
-            .put(&token_key(UUID), &serde_json::to_vec(&expired_tokens("rt-0")).unwrap())
+            .put(&token_key(Provider::Anthropic, UUID), &serde_json::to_vec(&expired_tokens("rt-0")).unwrap())
             .unwrap();
 
         let interloper = store.clone();
@@ -360,7 +383,7 @@ mod tests {
             .respond_with(move |_: &Request| {
                 let fresh = fresh_tokens("rt-login");
                 interloper
-                    .put(&token_key(UUID), &serde_json::to_vec(&fresh).unwrap())
+                    .put(&token_key(Provider::Anthropic, UUID), &serde_json::to_vec(&fresh).unwrap())
                     .unwrap();
                 ResponseTemplate::new(200).set_body_json(ok_body("rt-ours"))
             })
@@ -373,6 +396,7 @@ mod tests {
             &cfg_for(&server).await,
             store.as_ref(),
             &RefreshLocks::default(),
+            Provider::Anthropic,
             UUID,
         )
         .await
@@ -395,13 +419,13 @@ mod tests {
         let server = MockServer::start().await;
         let store = Arc::new(MemoryStore::default());
         store
-            .put(&token_key(UUID), &serde_json::to_vec(&expired_tokens("rt-0")).unwrap())
+            .put(&token_key(Provider::Anthropic, UUID), &serde_json::to_vec(&expired_tokens("rt-0")).unwrap())
             .unwrap();
 
         let deleter = store.clone();
         Mock::given(method("POST"))
             .respond_with(move |_: &Request| {
-                deleter.delete(&token_key(UUID)).unwrap();
+                deleter.delete(&token_key(Provider::Anthropic, UUID)).unwrap();
                 ResponseTemplate::new(200).set_body_json(ok_body("rt-1"))
             })
             .mount(&server)
@@ -413,6 +437,7 @@ mod tests {
             &cfg_for(&server).await,
             store.as_ref(),
             &RefreshLocks::default(),
+            Provider::Anthropic,
             UUID,
         )
         .await
@@ -436,7 +461,7 @@ mod tests {
         let store = CountingStore::default();
         store
             .inner
-            .put(&token_key(UUID), &serde_json::to_vec(&fresh_tokens("rt-0")).unwrap())
+            .put(&token_key(Provider::Anthropic, UUID), &serde_json::to_vec(&fresh_tokens("rt-0")).unwrap())
             .unwrap();
 
         let http = ReqwestHttp::new().unwrap();
@@ -445,6 +470,7 @@ mod tests {
             &cfg_for(&server).await,
             &store,
             &RefreshLocks::default(),
+            Provider::Anthropic,
             UUID,
         )
         .await
@@ -470,7 +496,7 @@ mod tests {
         let store = CountingStore { fail_puts: true, ..Default::default() };
         store
             .inner
-            .put(&token_key(UUID), &serde_json::to_vec(&expired_tokens("rt-0")).unwrap())
+            .put(&token_key(Provider::Anthropic, UUID), &serde_json::to_vec(&expired_tokens("rt-0")).unwrap())
             .unwrap();
 
         let http = ReqwestHttp::new().unwrap();
@@ -479,6 +505,7 @@ mod tests {
             &cfg_for(&server).await,
             &store,
             &RefreshLocks::default(),
+            Provider::Anthropic,
             UUID,
         )
         .await
@@ -531,7 +558,7 @@ mod tests {
 
         let store = MemoryStore::default();
         store
-            .put(&token_key(UUID), &serde_json::to_vec(&expired_tokens("rt-0")).unwrap())
+            .put(&token_key(Provider::Anthropic, UUID), &serde_json::to_vec(&expired_tokens("rt-0")).unwrap())
             .unwrap();
 
         let http = ReqwestHttp::new().unwrap();
@@ -540,6 +567,7 @@ mod tests {
             &cfg_for(&server).await,
             &store,
             &RefreshLocks::default(),
+            Provider::Anthropic,
             UUID,
         )
         .await
@@ -558,7 +586,7 @@ mod tests {
     async fn a_corrupt_blob_does_not_leak_its_contents() {
         let server = MockServer::start().await;
         let store = MemoryStore::default();
-        store.put(&token_key(UUID), br#"{"access_token":"sk-ant-SENTINEL""#).unwrap();
+        store.put(&token_key(Provider::Anthropic, UUID), br#"{"access_token":"sk-ant-SENTINEL""#).unwrap();
 
         let http = ReqwestHttp::new().unwrap();
         let err = ensure_fresh(
@@ -566,6 +594,7 @@ mod tests {
             &cfg_for(&server).await,
             &store,
             &RefreshLocks::default(),
+            Provider::Anthropic,
             UUID,
         )
         .await

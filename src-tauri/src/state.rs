@@ -416,11 +416,15 @@ impl AppState {
         // one. A store swapped in mid-poll therefore takes effect from the
         // next poll, and this one finishes against the store it started with.
         let store = self.secrets();
+        // `Provider::Anthropic` is temporary, matching `fetch_usage_captured_at`
+        // below: this account's own provider is not yet threaded through the
+        // polling loop. Task 6 replaces both with the account's provider.
         let fresh = match ensure_fresh(
             &self.http,
             &self.cfg,
             store.as_ref(),
             &self.refresh_locks,
+            Provider::Anthropic,
             uuid,
         )
         .await
@@ -482,7 +486,9 @@ impl AppState {
                     let path = self.snapshots_path.clone();
                     let id = uuid.to_string();
                     let written = tauri::async_runtime::spawn_blocking(move || {
-                        save_snapshot(&path, &id, &snap)
+                        // `Provider::Anthropic` stopgap — see `ensure_fresh`
+                        // above.
+                        save_snapshot(&path, Provider::Anthropic, &id, &snap)
                     })
                     .await;
                     // Not swallowed with `let _ =`: a cache that silently never
@@ -907,8 +913,8 @@ pub(crate) mod tests {
     /// three behaviours are one test rather than three.
     #[tokio::test]
     async fn unlocking_installs_the_encrypted_file_store_and_the_poll_path_uses_it() {
-        use quota_core::auth::stored::token_key;
         use quota_core::auth::token::TokenSet;
+        use quota_core::provider::token_key;
         use quota_core::secrets::encrypted_file::EncryptedFileStore;
 
         let path = tmp("tokens");
@@ -924,7 +930,8 @@ pub(crate) mod tests {
         };
         {
             let seed = EncryptedFileStore::open(&path, "correct horse").unwrap();
-            seed.put(&token_key("a"), &serde_json::to_vec(&tokens).unwrap()).unwrap();
+            seed.put(&token_key(Provider::Anthropic, "a"), &serde_json::to_vec(&tokens).unwrap())
+                .unwrap();
         }
 
         let state = app_state_with(Arc::new(LockedStore), StoreKind::NoBackend, tmp("settings"));
