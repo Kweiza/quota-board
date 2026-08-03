@@ -95,6 +95,20 @@ export interface AccountView {
 }
 
 /**
+ * The primary key (§9.3) as one string. Svelte's keyed `{#each}` blocks and
+ * maps like `Settings.svelte`'s `throttledUntil` need a single hashable key
+ * rather than two values, and `account_id` alone is not unique across
+ * providers. Mirrors `snapshots::cache_key` in `crates/core/src/snapshots.rs`
+ * — same pairing, same reason: two providers may issue the same
+ * `account_id`, and a bare id would treat them as one entry, colliding a
+ * keyed `{#each}` and letting one account's note or capture stand in for the
+ * other's.
+ */
+export function accountKey(accountId: string, provider: Provider): string {
+  return `${provider}:${accountId}`
+}
+
+/**
  * Mirrors `StoreKind` in `src-tauri/src/state.rs`, which serializes with
  * `#[serde(rename_all = "snake_case")]`. docs/design.md §9.2 gives
  * `keychain_locked` and `no_backend` the same account state (`SECRETS_LOCKED`)

@@ -297,7 +297,7 @@ describe('command wrappers', () => {
     ])
   })
 
-  it('lastResponse returns the captured response keyed by uuid', async () => {
+  it('lastResponse returns the captured response keyed by the uuid and provider', async () => {
     const captured: RawResponse = {
       captured_at: '2026-07-31T09:00:00Z',
       status: 200,
@@ -306,9 +306,11 @@ describe('command wrappers', () => {
     }
     const calls = recordArgs((cmd) => (cmd === 'last_response' ? captured : null))
 
-    await expect(lastResponse('acct-1')).resolves.toEqual(captured)
+    await expect(lastResponse('acct-1', 'openai')).resolves.toEqual(captured)
 
-    expect(calls).toEqual([{ cmd: 'last_response', args: { uuid: 'acct-1' } }])
+    expect(calls).toEqual([
+      { cmd: 'last_response', args: { uuid: 'acct-1', provider: 'openai' } },
+    ])
   })
 
   // `null` means "nothing captured for this account yet", which the debug panel
@@ -317,7 +319,7 @@ describe('command wrappers', () => {
   it('lastResponse passes a null capture through unchanged', async () => {
     recordArgs()
 
-    await expect(lastResponse('acct-1')).resolves.toBeNull()
+    await expect(lastResponse('acct-1', 'anthropic')).resolves.toBeNull()
   })
 })
 

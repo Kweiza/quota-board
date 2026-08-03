@@ -139,8 +139,8 @@ export const setSettings = (pollIntervalSecs: number): Promise<SettingsView> =>
  * `null` means nothing has been captured for this account yet — **do not
  * coerce it**; the panel renders the two differently.
  */
-export const lastResponse = (uuid: string): Promise<RawResponse | null> =>
-  invoke('last_response', { uuid })
+export const lastResponse = (uuid: string, provider: Provider): Promise<RawResponse | null> =>
+  invoke('last_response', { uuid, provider })
 
 /**
  * The refresh path that does **not** depend on the visibility gate. The four

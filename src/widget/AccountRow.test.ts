@@ -49,6 +49,15 @@ describe('AccountRow provider', () => {
     expect(screen.getByTitle('Codex').textContent).toBe('CX')
   })
 
+  /// Without this, every test above would still pass if `BADGE.anthropic`
+  /// were `{ text: 'CX', title: 'Codex' }` — nothing in this file asserted
+  /// what a *Claude* row's badge says, only what a Codex row's does.
+  it('marks a Claude row with its own badge, not the Codex one', () => {
+    render(AccountRow, { account: acct({ provider: 'anthropic', label: 'work' }) })
+    expect(screen.getByTitle('Claude').textContent).toBe('CL')
+    expect(screen.queryByTitle('Codex')).toBeNull()
+  })
+
   /// The note serves design.md §5.3's read order, which has no Codex counterpart.
   /// Left ungated it appears on every Codex row, always.
   it('does not tell a Codex row that weekly is not reported', () => {

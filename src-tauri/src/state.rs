@@ -58,7 +58,9 @@ pub struct AppState {
     /// here would compile silently.
     pub(crate) secrets: RwLock<SecretsHandle>,
     /// §5.5's "retain the raw JSON so it can be inspected in a debug window",
-    /// keyed by uuid, **already masked** (`usage::raw`).
+    /// keyed by (provider, uuid) — the pair, not the bare id (§9.3), so two
+    /// accounts sharing an id across providers do not share a slot — **already
+    /// masked** (`usage::raw`).
     ///
     /// **In memory only.** It is deliberately not merged into
     /// `snapshots_path`: §9.1 puts that cache in a plain file on disk, and a
@@ -68,9 +70,10 @@ pub struct AppState {
     ///
     /// **There is no entry cap.** The key set is a subset of the registered
     /// accounts — `record` is reached only from `poll_claimed` with a
-    /// scheduler-owned uuid — and `forget_raw` drops an entry when the account
-    /// is deleted. `crates/core/src/snapshots.rs:73-86` is a uuid-keyed map with
-    /// the same `save`/`remove` shape and no cap, for the same reason.
+    /// scheduler-owned (provider, uuid) pair — and `forget_raw` drops an entry
+    /// when the account is deleted. `crates/core/src/snapshots.rs:73-86` is a
+    /// pair-keyed map with the same `save`/`remove` shape and no cap, for the
+    /// same reason.
     ///
     /// Same `std::sync` rule as `secrets`: taken and released inside one
     /// statement, never across an `await`.
@@ -316,20 +319,20 @@ impl AppState {
     /// ends polling for the life of the process. The body arrives already
     /// masked and already bounded — `RawResponse::capture` is the only
     /// constructor and it does both, so nothing here can forget either.
-    fn record_raw(&self, uuid: &str, raw: RawResponse) {
-        self.last_raw.lock().unwrap_or_else(|e| e.into_inner()).record(uuid, raw);
+    fn record_raw(&self, provider: Provider, uuid: &str, raw: RawResponse) {
+        self.last_raw.lock().unwrap_or_else(|e| e.into_inner()).record(provider, uuid, raw);
     }
 
     /// §5.5. `None` means this account has not been polled successfully since
     /// the process started — not "there was no body".
-    pub fn last_raw_for(&self, uuid: &str) -> Option<RawResponse> {
-        self.last_raw.lock().unwrap_or_else(|e| e.into_inner()).get(uuid).cloned()
+    pub fn last_raw_for(&self, provider: Provider, uuid: &str) -> Option<RawResponse> {
+        self.last_raw.lock().unwrap_or_else(|e| e.into_inner()).get(provider, uuid).cloned()
     }
 
     /// Dropped together with the account. With no entry cap this is the only
     /// bound on the key set, so the call at `remove_account` is not optional.
-    pub fn forget_raw(&self, uuid: &str) {
-        self.last_raw.lock().unwrap_or_else(|e| e.into_inner()).remove(uuid);
+    pub fn forget_raw(&self, provider: Provider, uuid: &str) {
+        self.last_raw.lock().unwrap_or_else(|e| e.into_inner()).remove(provider, uuid);
     }
 
     /// §6.1 + §8.4. Applies a new polling interval to the **running** scheduler.
@@ -459,9 +462,21 @@ impl AppState {
         // one. A store swapped in mid-poll therefore takes effect from the
         // next poll, and this one finishes against the store it started with.
         let store = self.secrets();
+        // Selected by provider, not `&self.cfg` unconditionally: `ensure_fresh`
+        // takes `provider` only for the lock and store keys (auth/stored.rs)
+        // — the spec is what actually reaches the network, in `refresh`'s
+        // POST to `cfg.token_url`. The identical defect this task already
+        // fixed at the revoke call, on a path that runs on every token
+        // rotation instead of once at removal: an unconditional `&self.cfg`
+        // here would POST a live Codex refresh token to `platform.claude.com`
+        // every time a Codex access token expires — routine, not an edge case.
+        let cfg = match provider {
+            Provider::Anthropic => &self.cfg,
+            Provider::Openai => &self.openai_cfg,
+        };
         let fresh = match ensure_fresh(
             &self.http,
-            &self.cfg,
+            cfg,
             store.as_ref(),
             &self.refresh_locks,
             provider,
@@ -499,7 +514,7 @@ impl AppState {
             fetch_usage_captured_at(&self.http, provider, usage_url, &fresh.tokens.access_token)
                 .await;
         if let Some(raw) = fetched.raw {
-            self.record_raw(uuid, raw);
+            self.record_raw(provider, uuid, raw);
         }
         let extra = fetched.extra;
         match fetched.outcome {
@@ -1213,6 +1228,71 @@ pub(crate) mod tests {
         assert!(
             anthropic_server.received_requests().await.unwrap().is_empty(),
             "the Codex account's poll reached Anthropic's URL instead of its own"
+        );
+    }
+
+    /// The identical hazard as the test above, one step earlier in the same
+    /// poll: `ensure_fresh`'s `cfg` argument, not its `provider` argument, is
+    /// what reaches the network — `refresh` (auth/token.rs) posts
+    /// `refresh_token` and `client_id` to `cfg.token_url`. An unconditional
+    /// `&self.cfg` in `poll_claimed` would send a live Codex refresh token to
+    /// Anthropic's token endpoint on **every token rotation**, not once at
+    /// removal like the revoke call this task already fixed — routinely,
+    /// whenever a Codex access token expires.
+    ///
+    /// The token here is **expired** (`expires_at` in the past), unlike the
+    /// sibling test above: `ensure_fresh` only calls `refresh` at all when
+    /// `needs_refresh()` is true, so a live token — which the sibling test
+    /// uses deliberately, to isolate the usage-URL routing from this one —
+    /// would never reach this code path.
+    #[tokio::test]
+    async fn a_codex_account_is_refreshed_against_its_own_token_endpoint_not_anthropics() {
+        use quota_core::auth::token::TokenSet;
+        use quota_core::provider::token_key;
+        use wiremock::matchers::method;
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let anthropic_server = MockServer::start().await;
+        let openai_server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "access_token": "new-codex-access",
+                "refresh_token": "new-codex-refresh",
+                "expires_in": 27000,
+                "scope": ""
+            })))
+            .mount(&openai_server)
+            .await;
+        // Deliberately no `Mock` mounted on `anthropic_server` — same reasoning
+        // as the sibling test above.
+
+        let mut state = app_state(Arc::new(quota_core::secrets::MemoryStore::default()));
+        state.cfg.token_url = format!("{}/v1/oauth/token", anthropic_server.uri());
+        state.openai_cfg.token_url = format!("{}/api/accounts/oauth/token", openai_server.uri());
+
+        let tokens = TokenSet {
+            access_token: "codex-access".into(),
+            refresh_token: "codex-refresh".into(),
+            expires_at: Utc::now() - chrono::TimeDelta::seconds(1),
+            refresh_token_expires_at: Utc::now() + chrono::TimeDelta::days(30),
+            scopes: vec![],
+            client_id: "test".into(),
+        };
+        state
+            .secrets()
+            .put(&token_key(Provider::Openai, "codex-a"), &serde_json::to_vec(&tokens).unwrap())
+            .unwrap();
+        state.scheduler.lock().await.add(Provider::Openai, "codex-a");
+
+        state.poll_one(Provider::Openai, "codex-a").await;
+
+        assert!(
+            !openai_server.received_requests().await.unwrap().is_empty(),
+            "the Codex account's refresh never reached its own token endpoint"
+        );
+        assert!(
+            anthropic_server.received_requests().await.unwrap().is_empty(),
+            "a Codex refresh token was sent to Anthropic's token endpoint"
         );
     }
 }

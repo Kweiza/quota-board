@@ -1,22 +1,32 @@
 <script lang="ts">
   import { untilHhMm } from '../lib/format'
-  import type { AccountView } from '../lib/types'
+  import { accountKey } from '../lib/types'
+  import type { AccountView, Provider } from '../lib/types'
 
   /**
    * Display only, like `src/widget/AccountRow.svelte`: no IPC lives here, only
    * callbacks reported upwards. `Settings.svelte` owns every command, which is
    * what lets this component be rendered from plain props in a test.
+   *
+   * Every callback below carries `provider` alongside the id: the primary key
+   * is the pair (§9.3), and a row that reported only its id would leave the
+   * parent to guess the provider by searching its own list for that id — the
+   * exact ambiguity that collapses two accounts sharing an id into "whichever
+   * sorts first".
    */
   export let accounts: AccountView[] = []
-  export let onRemove: (uuid: string) => void = () => {}
-  export let onRename: (uuid: string, label: string) => void = () => {}
-  export let onMove: (uuid: string, delta: number) => void = () => {}
-  export let onRefresh: (uuid: string) => void = () => {}
+  export let onRemove: (accountId: string, provider: Provider) => void = () => {}
+  export let onRename: (accountId: string, provider: Provider, label: string) => void = () => {}
+  export let onMove: (accountId: string, provider: Provider, delta: number) => void = () => {}
+  export let onRefresh: (accountId: string, provider: Provider) => void = () => {}
   /**
-   * §6.4's refusal, keyed by uuid: the instant a manual refresh may next fire,
-   * for each account whose last "Refresh now" was refused. A map rather than a
-   * single value because the refusal is per-account — with three accounts, one
-   * line above the list cannot say which row was refused.
+   * §6.4's refusal, keyed by `accountKey(account_id, provider)`: the instant a
+   * manual refresh may next fire, for each account whose last "Refresh now"
+   * was refused. A map rather than a single value because the refusal is
+   * per-account — with three accounts, one line above the list cannot say
+   * which row was refused. Keyed by the pair, not the bare id, for the same
+   * reason the `{#each}` below is: two accounts sharing an id under different
+   * providers must not share one refusal note.
    *
    * It is **not** derived from `AccountView.state`: `refresh_account` returns
    * §6.2's refusal early, without touching the scheduler, so re-reading the
@@ -28,12 +38,13 @@
 </script>
 
 <ul class="rows">
-  <!-- Keyed by account_id, never by index: `accounts://changed` replaces this
-       array wholesale, and an index key would move a half-typed label onto the
-       wrong account. CLAUDE.md: the primary key is the (provider, account_id)
-       pair — `account_id` alone is what this list's own callbacks are keyed
-       by, since `Settings.svelte` resolves the provider itself. -->
-  {#each accounts as a, i (a.account_id)}
+  <!-- Keyed by the (provider, account_id) pair, never by the bare id or by
+       index: `accounts://changed` replaces this array wholesale, an index key
+       would move a half-typed label onto the wrong account, and a bare-id key
+       collides — a Svelte `each_key_duplicate` error, not a silent mis-render —
+       the moment two providers share an id. CLAUDE.md: the primary key is the
+       pair. -->
+  {#each accounts as a, i (accountKey(a.account_id, a.provider))}
     <li class="row">
       <div class="ident">
         <!-- `value=` rather than `bind:value=`: binding would write through
@@ -44,7 +55,7 @@
           type="text"
           aria-label="Display name"
           value={a.label}
-          on:blur={(e) => onRename(a.account_id, e.currentTarget.value)}
+          on:blur={(e) => onRename(a.account_id, a.provider, e.currentTarget.value)}
         />
         <!-- §9.3: the label is user-editable and may be duplicated, so this is
              the only thing left that tells two accounts apart. -->
@@ -59,22 +70,27 @@
              `role="status"` because this is the only answer a press gets: a
              refused button is otherwise inert until `Retry-After` runs out,
              which is the defect this note exists to fix. -->
-        {#if throttledUntil[a.account_id]}
+        {#if throttledUntil[accountKey(a.account_id, a.provider)]}
           <span class="throttle" role="status">
-            throttled, available after {untilHhMm(throttledUntil[a.account_id])}
+            throttled, available after {untilHhMm(throttledUntil[accountKey(a.account_id, a.provider)])}
           </span>
         {/if}
       </div>
       <div class="actions">
-        <button on:click={() => onRefresh(a.account_id)}>Refresh now</button>
+        <button on:click={() => onRefresh(a.account_id, a.provider)}>Refresh now</button>
         <!-- A direction, not an index: the parent rebuilds the whole (provider,
              account_id) key array for `reorder_accounts`, and an index captured
              at render time goes stale as soon as the list is re-read. -->
-        <button disabled={i === 0} on:click={() => onMove(a.account_id, -1)}>Move up</button>
-        <button disabled={i === accounts.length - 1} on:click={() => onMove(a.account_id, 1)}>
+        <button disabled={i === 0} on:click={() => onMove(a.account_id, a.provider, -1)}>
+          Move up
+        </button>
+        <button
+          disabled={i === accounts.length - 1}
+          on:click={() => onMove(a.account_id, a.provider, 1)}
+        >
           Move down
         </button>
-        <button class="danger" on:click={() => onRemove(a.account_id)}>Remove</button>
+        <button class="danger" on:click={() => onRemove(a.account_id, a.provider)}>Remove</button>
       </div>
     </li>
   {/each}
