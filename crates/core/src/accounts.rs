@@ -2,6 +2,7 @@
 //! display several Claude accounts side by side. **Tokens never live here** —
 //! the `secrets` module owns those.
 
+use crate::provider::Provider;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use std::io::Write;
@@ -10,8 +11,20 @@ use std::path::{Path, PathBuf};
 /// Account metadata. **Tokens never live here** — `secrets` owns those.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Account {
-    /// Primary key. `account.uuid` from the OAuth token response.
-    pub uuid: String,
+    /// The provider's own account identifier, and half of the primary key.
+    ///
+    /// **Serialized as `uuid`, which it is not.** Anthropic issues a UUID here;
+    /// Codex issues `user-…` (measured, Spike F). The Rust name was corrected
+    /// and the wire name deliberately was not: renaming the on-disk key would
+    /// make a downgraded build fail to parse the file, and `AccountStore::load`
+    /// answers an unparseable file by serving an empty list and refusing every
+    /// write — the user is told their accounts could not be read.
+    #[serde(rename = "uuid")]
+    pub account_id: String,
+    /// The other half of the primary key. Absent from files written before this
+    /// field existed, which is exactly what `Provider`'s `Default` covers.
+    #[serde(default)]
+    pub provider: Provider,
     /// User-editable display name.
     pub display_label: String,
     /// Display only. **Never used as a key.**
@@ -99,9 +112,16 @@ impl AccountStore {
         &self.accounts
     }
 
-    /// Update by uuid, or append if it is new.
+    /// Update by (provider, account_id), or append if it is new.
     pub fn upsert(&mut self, mut account: Account) -> Result<(), AccountError> {
-        match self.accounts.iter().position(|a| a.uuid == account.uuid) {
+        // The pair, not the id alone: two providers may issue the same string,
+        // and collapsing them would make adding the second account silently
+        // replace the first.
+        let existing = self
+            .accounts
+            .iter()
+            .position(|a| a.account_id == account.account_id && a.provider == account.provider);
+        match existing {
             Some(i) => {
                 account.sort_order = self.accounts[i].sort_order;
                 self.accounts[i] = account;
@@ -114,9 +134,10 @@ impl AccountStore {
         self.flush()
     }
 
-    pub fn remove(&mut self, uuid: &str) -> Result<bool, AccountError> {
+    pub fn remove(&mut self, provider: Provider, account_id: &str) -> Result<bool, AccountError> {
         let before = self.accounts.len();
-        self.accounts.retain(|a| a.uuid != uuid);
+        self.accounts
+            .retain(|a| !(a.account_id == account_id && a.provider == provider));
         let removed = self.accounts.len() != before;
         if removed {
             for (i, a) in self.accounts.iter_mut().enumerate() {
@@ -127,13 +148,17 @@ impl AccountStore {
         Ok(removed)
     }
 
-    /// Reorder to match the given uuid sequence. Unknown uuids are ignored, and
-    /// accounts missing from the argument are appended afterwards in their
-    /// original order.
-    pub fn reorder(&mut self, uuids: &[String]) -> Result<(), AccountError> {
+    /// Reorder to match the given (provider, account_id) sequence. Unknown keys
+    /// are ignored, and accounts missing from the argument are appended
+    /// afterwards in their original order.
+    pub fn reorder(&mut self, keys: &[(Provider, String)]) -> Result<(), AccountError> {
         let mut ordered: Vec<Account> = Vec::with_capacity(self.accounts.len());
-        for id in uuids {
-            if let Some(i) = self.accounts.iter().position(|a| &a.uuid == id) {
+        for (provider, id) in keys {
+            if let Some(i) = self
+                .accounts
+                .iter()
+                .position(|a| a.provider == *provider && &a.account_id == id)
+            {
                 ordered.push(self.accounts.remove(i));
             }
         }
@@ -203,6 +228,7 @@ fn write_text_then_rename(tmp: &Path, text: &str, dest: &Path) -> Result<(), Acc
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::provider::Provider;
 
     /// Produce a unique path on every call. A pid alone would collide across
     /// every test, since the harness runs them as threads in one process — the
@@ -220,9 +246,10 @@ mod tests {
         p
     }
 
-    fn acc(uuid: &str, label: &str) -> Account {
+    fn acc(account_id: &str, label: &str) -> Account {
         Account {
-            uuid: uuid.into(),
+            account_id: account_id.into(),
+            provider: Provider::Anthropic,
             display_label: label.into(),
             email: format!("{label}@example.com"),
             created_at: Utc::now(),
@@ -283,14 +310,19 @@ mod tests {
         s.upsert(acc("uuid-a", "a")).unwrap();
         s.upsert(acc("uuid-b", "b")).unwrap();
         s.upsert(acc("uuid-c", "c")).unwrap();
-        s.reorder(&["uuid-c".into(), "uuid-a".into(), "uuid-b".into()]).unwrap();
-        let ids: Vec<_> = s.list().iter().map(|a| a.uuid.clone()).collect();
+        s.reorder(&[
+            (Provider::Anthropic, "uuid-c".into()),
+            (Provider::Anthropic, "uuid-a".into()),
+            (Provider::Anthropic, "uuid-b".into()),
+        ])
+        .unwrap();
+        let ids: Vec<_> = s.list().iter().map(|a| a.account_id.clone()).collect();
         assert_eq!(ids, vec!["uuid-c", "uuid-a", "uuid-b"]);
 
         // Check that the order survives a round trip through disk.
         drop(s);
         let s = AccountStore::load(&path);
-        let ids: Vec<_> = s.list().iter().map(|a| a.uuid.clone()).collect();
+        let ids: Vec<_> = s.list().iter().map(|a| a.account_id.clone()).collect();
         assert_eq!(ids, vec!["uuid-c", "uuid-a", "uuid-b"], "order must survive a restart");
 
         std::fs::remove_file(&path).ok();
@@ -365,7 +397,7 @@ mod tests {
         std::fs::write(&path, serde_json::to_string_pretty(&vec![a, b, c]).unwrap()).unwrap();
 
         let s = AccountStore::load(&path);
-        let ids: Vec<_> = s.list().iter().map(|x| x.uuid.clone()).collect();
+        let ids: Vec<_> = s.list().iter().map(|x| x.account_id.clone()).collect();
         assert_eq!(ids, vec!["uuid-b", "uuid-c", "uuid-a"], "load() must sort by sort_order");
         std::fs::remove_file(&path).ok();
     }
@@ -375,8 +407,8 @@ mod tests {
         let path = tmp();
         let mut s = AccountStore::load(&path);
         s.upsert(acc("uuid-a", "a")).unwrap();
-        assert!(s.remove("uuid-a").unwrap());
-        assert!(!s.remove("uuid-a").unwrap());
+        assert!(s.remove(Provider::Anthropic, "uuid-a").unwrap());
+        assert!(!s.remove(Provider::Anthropic, "uuid-a").unwrap());
         std::fs::remove_file(&path).ok();
     }
 
@@ -397,6 +429,57 @@ mod tests {
         for forbidden in ["access_token", "refresh_token", "Bearer"] {
             assert!(!text.contains(forbidden), "metadata contains {forbidden}");
         }
+        std::fs::remove_file(&path).ok();
+    }
+
+    /// An accounts.json written by 0.2.1 has no `provider` field at all. It must
+    /// keep loading, as Anthropic — the alternative is `AccountStore::load`
+    /// degrading to an empty list and then refusing every write, which is how a
+    /// user is told their saved accounts could not be read.
+    #[test]
+    fn a_file_without_provider_loads_as_anthropic() {
+        let path = tmp();
+        std::fs::write(
+            &path,
+            r#"[{"uuid":"acc-1","display_label":"work","email":"w@example.com",
+                 "created_at":"2026-07-01T00:00:00Z","last_ok_at":null,
+                 "quarantined":false,"sort_order":0}]"#,
+        )
+        .unwrap();
+
+        let s = AccountStore::load(&path);
+        assert_eq!(s.list().len(), 1, "a pre-provider file must still load");
+        assert_eq!(s.list()[0].provider, Provider::Anthropic);
+        assert_eq!(s.list()[0].account_id, "acc-1");
+        std::fs::remove_file(&path).ok();
+    }
+
+    /// The on-disk name stays `uuid` even though the Rust field does not. A
+    /// downgraded build must not meet a key it has never heard of.
+    #[test]
+    fn the_on_disk_key_is_still_named_uuid() {
+        let path = tmp();
+        let mut s = AccountStore::load(&path);
+        s.upsert(acc("acc-1", "work")).unwrap();
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(text.contains("\"uuid\""), "on-disk key changed: {text}");
+        assert!(!text.contains("\"account_id\""), "wrote the Rust name: {text}");
+        std::fs::remove_file(&path).ok();
+    }
+
+    /// The key is (provider, account_id). Two providers may issue the same string
+    /// and they are still two accounts.
+    #[test]
+    fn the_same_id_under_two_providers_stays_two_accounts() {
+        let path = tmp();
+        let mut s = AccountStore::load(&path);
+        let mut a = acc("same-id", "claude");
+        let mut b = acc("same-id", "codex");
+        a.provider = Provider::Anthropic;
+        b.provider = Provider::Openai;
+        s.upsert(a).unwrap();
+        s.upsert(b).unwrap();
+        assert_eq!(s.list().len(), 2, "the provider is part of the key");
         std::fs::remove_file(&path).ok();
     }
 }

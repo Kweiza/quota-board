@@ -6,6 +6,7 @@ use quota_core::auth::pkce::{
 use quota_core::auth::stored::token_key;
 use quota_core::auth::token::{exchange_code, revoke, TokenSet};
 use quota_core::model::AccountState;
+use quota_core::provider::Provider;
 use quota_core::scheduler::PollPolicy;
 use quota_core::secrets::{encrypted_file::EncryptedFileStore, timeout::TimeoutStore, SecretStore};
 use quota_core::usage::raw::RawResponse;
@@ -47,10 +48,10 @@ pub async fn list_accounts(state: State<'_, AppState>) -> Result<Vec<AccountView
         .list()
         .iter()
         .map(|a| AccountView {
-            uuid: a.uuid.clone(),
+            uuid: a.account_id.clone(),
             label: a.display_label.clone(),
             email: a.email.clone(),
-            state: sched.state(&a.uuid).unwrap_or(AccountState::Loading),
+            state: sched.state(&a.account_id).unwrap_or(AccountState::Loading),
         })
         .collect())
 }
@@ -546,11 +547,14 @@ pub async fn remove_account(app: tauri::AppHandle, uuid: String) -> Result<(), S
 
     // Lock order: scheduler before accounts.
     state.scheduler.lock().await.remove(&uuid);
+    // `uuid` here is a bare account id from the wire, not (provider, id) —
+    // Task 9 makes the frontend provider-aware. Every account this command can
+    // reach today is Anthropic, so that is the provider half of the key.
     let removed = state
         .accounts
         .lock()
         .await
-        .remove(&uuid)
+        .remove(Provider::Anthropic, &uuid)
         .map_err(|e| e.to_string())?;
     if !removed {
         // `AccountStore::remove` answers `Ok(false)` for an unknown uuid
@@ -586,7 +590,7 @@ pub async fn rename_account(
 ) -> Result<(), String> {
     let state = app.state::<AppState>();
     let mut accounts = state.accounts.lock().await;
-    let Some(mut a) = accounts.list().iter().find(|a| a.uuid == uuid).cloned() else {
+    let Some(mut a) = accounts.list().iter().find(|a| a.account_id == uuid).cloned() else {
         return Err("unknown account".into());
     };
     a.display_label = label;
@@ -599,11 +603,15 @@ pub async fn rename_account(
 #[tauri::command]
 pub async fn reorder_accounts(app: tauri::AppHandle, uuids: Vec<String>) -> Result<(), String> {
     let state = app.state::<AppState>();
+    // Every account this command can reach today is Anthropic — see the same
+    // note on `remove_account`.
+    let keys: Vec<(Provider, String)> =
+        uuids.into_iter().map(|id| (Provider::Anthropic, id)).collect();
     state
         .accounts
         .lock()
         .await
-        .reorder(&uuids)
+        .reorder(&keys)
         .map_err(|e| e.to_string())?;
     let _ = app.emit("accounts://changed", ());
     Ok(())
@@ -933,7 +941,8 @@ mod tests {
         assert_eq!(tokens.access_token, "at-1");
 
         let accounts = state.accounts.lock().await;
-        let a = accounts.list().iter().find(|a| a.uuid == "u-42").expect("account not registered");
+        let a =
+            accounts.list().iter().find(|a| a.account_id == "u-42").expect("account not registered");
         assert_eq!(a.email, "who@example.invalid");
 
         // The login is over; the paste form must not stay armed with a value

@@ -3,6 +3,7 @@ use quota_core::accounts::{Account, AccountStore};
 use quota_core::auth::pkce::{AuthConfig, PendingAuth};
 use quota_core::auth::stored::{ensure_fresh, RefreshLocks};
 use quota_core::auth::token::ReqwestHttp;
+use quota_core::provider::Provider;
 use quota_core::scheduler::{
     persist_last_ok, persist_quarantine, FailureKind, Scheduler, SystemClock,
 };
@@ -346,9 +347,10 @@ impl AppState {
         let mut sched = self.scheduler.lock().await;
         let mut accounts = self.accounts.lock().await;
 
-        let existing = accounts.list().iter().find(|a| a.uuid == uuid).cloned();
+        let existing = accounts.list().iter().find(|a| a.account_id == uuid).cloned();
         accounts.upsert(Account {
-            uuid: uuid.to_string(),
+            account_id: uuid.to_string(),
+            provider: Provider::Anthropic,
             display_label: existing
                 .as_ref()
                 .map(|a| a.display_label.clone())
@@ -619,7 +621,8 @@ pub(crate) mod tests {
 
     fn account(uuid: &str) -> Account {
         Account {
-            uuid: uuid.into(),
+            account_id: uuid.into(),
+            provider: Provider::Anthropic,
             display_label: uuid.into(),
             email: format!("{uuid}@example.invalid"),
             created_at: chrono::Utc::now(),
@@ -832,7 +835,8 @@ pub(crate) mod tests {
             let mut accounts = state.accounts.lock().await;
             accounts
                 .upsert(Account {
-                    uuid: "a".into(),
+                    account_id: "a".into(),
+                    provider: Provider::Anthropic,
                     display_label: "work".into(),
                     email: "old@example.invalid".into(),
                     created_at: created,
@@ -854,7 +858,7 @@ pub(crate) mod tests {
         {
             let accounts = state.accounts.lock().await;
             let a =
-                accounts.list().iter().find(|x| x.uuid == "a").expect("the account is still there");
+                accounts.list().iter().find(|x| x.account_id == "a").expect("the account is still there");
             assert_eq!(a.display_label, "work", "the re-login overwrote the user's rename");
             assert_eq!(
                 a.email, "different@example.invalid",
