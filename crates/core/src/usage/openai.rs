@@ -116,6 +116,15 @@ pub fn parse_reset_credits(raw: &Value) -> Option<ResetCredits> {
     Some(ResetCredits { available, applicable })
 }
 
+/// The account's email, for display only (§9.3 — never a key).
+///
+/// Here rather than on `CapturedFetch` because only the add-account path wants
+/// it: putting it on the fetch result would add a field to the polling path
+/// that every poll carries and nothing reads.
+pub fn parse_email(raw: &Value) -> Option<String> {
+    raw.get("email")?.as_str().filter(|s| !s.is_empty()).map(str::to_string)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -240,5 +249,27 @@ mod tests {
         let anthropic = v(r#"{"five_hour":{"utilization":7.0,
             "resets_at":"2026-07-29T09:09:59.795962+00:00"},"limits":[]}"#);
         assert!(parse_usage(&anthropic).is_err());
+    }
+
+    /// Measured, Spike F: the usage response carries `email` even when the
+    /// token response does not — this is what `auth::token::backfill_email`
+    /// relies on.
+    #[test]
+    fn reads_the_email_from_the_usage_response() {
+        assert_eq!(parse_email(&v(PLUS_ZERO)).as_deref(), Some("redacted@example.com"));
+    }
+
+    /// A present-but-empty email is not an email — the same reasoning
+    /// `auth::token::account_id_from` applies to a present-but-empty
+    /// identifier, and for the same reason: a blank string is not a value to
+    /// fill a label with.
+    #[test]
+    fn an_empty_email_is_absent_not_a_blank_string() {
+        assert_eq!(parse_email(&v(r#"{"email":""}"#)), None);
+    }
+
+    #[test]
+    fn a_body_with_no_email_key_is_absent() {
+        assert_eq!(parse_email(&v(r#"{"plan_type":"plus"}"#)), None);
     }
 }

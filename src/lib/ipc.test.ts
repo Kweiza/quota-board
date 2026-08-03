@@ -220,13 +220,13 @@ describe('openSettings', () => {
  * rejects at runtime with nothing on the JS side to catch it.
  */
 describe('command wrappers', () => {
-  it('beginLogin invokes the begin_login command with no arguments and returns the URL', async () => {
+  it('beginLogin invokes the begin_login command with the requested provider and returns the URL', async () => {
     const url = 'https://claude.ai/oauth/authorize?code_challenge=abc'
     const calls = recordArgs((cmd) => (cmd === 'begin_login' ? url : null))
 
-    await expect(beginLogin()).resolves.toBe(url)
+    await expect(beginLogin('openai')).resolves.toBe(url)
 
-    expect(calls).toEqual([{ cmd: 'begin_login', args: {} }])
+    expect(calls).toEqual([{ cmd: 'begin_login', args: { provider: 'openai' } }])
   })
 
   // Tauri v2 maps a camelCase key on this side onto the snake_case parameter of
