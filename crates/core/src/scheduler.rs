@@ -162,11 +162,21 @@ impl PollPolicy {
     /// per-account floor.** They happen to share Anthropic's value because
     /// this constant predates a second provider existing at all. The
     /// per-account floor a specific entry is actually held to is
-    /// `Provider::min_interval_secs`, read off that entry — see
-    /// `effective_interval`. A provider added later with a floor above this
-    /// constant is still enforced correctly; one added with a floor below it
-    /// is not reachable, because this clamp would raise the user's interval
-    /// past it regardless.
+    /// `Provider::min_interval_secs`, read off that entry.
+    ///
+    /// **This clamp only reaches the paths routed through `effective_interval`**
+    /// — `record_success`, `record_failure`, `set_policy`, and `state`'s
+    /// staleness check. There, a provider floor below this constant could
+    /// never surface: `effective_interval` is `policy_interval.max(floor)`, and
+    /// `policy_interval` itself can never be lower than this constant to begin
+    /// with. It does **not** reach `due()`, `pull_forward`, or `make_due_now`,
+    /// which read `e.provider.min_interval_secs()` directly rather than
+    /// through `effective_interval`. A provider added later with a floor below
+    /// 180 would have those three enforce its own lower number — e.g. `due()`
+    /// handing the account back every 60s in the record-no-outcome loop
+    /// (`a_poll_that_records_no_outcome_still_respects_the_floor`'s scenario),
+    /// even though every *scheduled* poll still waits out at least this
+    /// constant.
     pub const MIN_INTERVAL_SECS: i64 = 180;
     /// How long to back off after a `Retry-After: 0` (budget exhausted).
     ///
@@ -508,7 +518,8 @@ impl<C: Clock> Scheduler<C> {
     ///
     /// The floor cannot be crossed here: `with_interval_secs` is the only
     /// constructor and it clamps, and `due()` re-checks `last_attempt_at +
-    /// MIN_INTERVAL_SECS` independently of the policy whatever is written here.
+    /// e.provider.min_interval_secs()` independently of the policy whatever is
+    /// written here.
     pub fn set_policy(&mut self, policy: PollPolicy) {
         self.policy = policy;
         let now = self.clock.now();
