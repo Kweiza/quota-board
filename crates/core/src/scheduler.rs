@@ -1615,6 +1615,35 @@ mod tests {
         assert_eq!(parsed, exported, "the round trip must be lossless");
     }
 
+    /// A `scheduler-state.json` written before `provider` existed has no such
+    /// key at all. It must still load, as Anthropic — the same guarantee
+    /// `accounts.rs`'s `a_file_without_provider_loads_as_anthropic` gives the
+    /// account file, for the same reason: every entry such a file could hold
+    /// was necessarily Anthropic's.
+    #[test]
+    fn an_entry_without_a_provider_field_deserializes_as_anthropic() {
+        let timing = EntryTiming {
+            uuid: "a".into(),
+            // Deliberately not the default, so a deserializer that silently
+            // ignored the removed key below could not accidentally pass.
+            provider: Provider::Openai,
+            next_due_at: Utc::now(),
+            backoff_level: 0,
+            throttled_until: None,
+            last_attempt_at: None,
+            last_failure: None,
+        };
+        let mut value = serde_json::to_value(&timing).unwrap();
+        value.as_object_mut().unwrap().remove("provider");
+
+        let restored: EntryTiming = serde_json::from_value(value).unwrap();
+        assert_eq!(
+            restored.provider,
+            Provider::Anthropic,
+            "a pre-provider entry must default to Anthropic, not fail to load"
+        );
+    }
+
     /// Spec §7: accounts are independent of each other.
     #[test]
     fn one_account_failing_does_not_affect_another() {
