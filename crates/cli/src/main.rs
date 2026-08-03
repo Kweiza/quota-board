@@ -99,7 +99,7 @@ async fn cmd_show(only: Option<&str>) -> Result<(), Box<dyn std::error::Error>> 
             eprintln!("{}: the token was rotated but could not be stored ({e}) — the next run will not see it", a.display_label);
         }
 
-        match fetch_usage(&http, &fresh.tokens.access_token).await {
+        match fetch_usage(&http, Provider::Anthropic, &fresh.tokens.access_token).await {
             Ok(windows) => {
                 println!("{}:", a.display_label);
                 for w in windows {

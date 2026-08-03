@@ -94,6 +94,12 @@ impl FailureKind {
             // The honest alternative would be a sixth state whose display is
             // identical to two existing ones.
             UsageError::Status(_) => Some(FailureKind::Network),
+            // The API never heard the request, so nothing is known about the
+            // account. docs/design.md §7.1's states exist to carry remedies,
+            // and there is no remedy for this that differs from NETWORK's —
+            // none. A state of its own would offer the user the same nothing
+            // under a second name.
+            UsageError::EdgeRefused { .. } => Some(FailureKind::Network),
         }
     }
 
@@ -1063,6 +1069,16 @@ mod tests {
         // Not because a 5xx is a network error, but because §7.1 defines
         // NETWORK by its rendering and "last value with its age" is right here.
         assert_eq!(kind(UsageError::Status(503)), Some(FailureKind::Network));
+    }
+
+    /// A Cloudflare challenge must not reach the user as AUTH_DEAD. That state
+    /// carries a re-login button, and the re-login would be refused
+    /// identically — the user would be sent round a loop that cannot end.
+    #[test]
+    fn an_edge_refusal_is_a_network_failure_not_a_dead_grant() {
+        let k = FailureKind::from_usage_error(&UsageError::EdgeRefused { status: 403 });
+        assert_eq!(k, Some(FailureKind::Network));
+        assert_ne!(k, Some(FailureKind::AuthDead));
     }
 
     /// The same, for `auth::stored`. `Missing`/`Corrupt` reaching `AUTH_DEAD`
