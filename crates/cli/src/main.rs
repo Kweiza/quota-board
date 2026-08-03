@@ -11,6 +11,7 @@ use quota_core::auth::pkce::{begin, success_redirect, AuthConfig};
 use quota_core::auth::stored::{ensure_fresh, token_key, RefreshLocks};
 use quota_core::auth::token::{exchange_code, refresh, ReqwestHttp, TokenSet};
 use quota_core::paths::accounts_file;
+use quota_core::provider::Provider;
 use quota_core::secrets::{keychain::KeychainStore, SecretStore, SERVICE};
 use quota_core::usage::http::fetch_usage;
 
@@ -50,7 +51,8 @@ async fn cmd_login() -> Result<(), Box<dyn std::error::Error>> {
 
     let mut accounts = AccountStore::load(&accounts_file());
     accounts.upsert(Account {
-        uuid: identity.uuid.clone(),
+        account_id: identity.uuid.clone(),
+        provider: Provider::Anthropic,
         display_label: identity.email.clone(),
         email: identity.email,
         created_at: chrono::Utc::now(),
@@ -83,10 +85,10 @@ async fn cmd_show(only: Option<&str>) -> Result<(), Box<dyn std::error::Error>> 
     let locks = RefreshLocks::default();
 
     for a in accounts.list() {
-        if only.is_some_and(|u| u != a.uuid) {
+        if only.is_some_and(|u| u != a.account_id) {
             continue;
         }
-        let fresh = match ensure_fresh(&http, &cfg, store.as_ref(), &locks, &a.uuid).await {
+        let fresh = match ensure_fresh(&http, &cfg, store.as_ref(), &locks, &a.account_id).await {
             Ok(f) => f,
             Err(e) => {
                 println!("{}: {e}", a.display_label);

@@ -931,10 +931,10 @@ pub fn register_accounts<C: Clock>(
     current_fingerprint: &dyn Fn(&str) -> Option<String>,
 ) {
     for a in accounts {
-        sched.add(&a.uuid);
-        if let Some(snap) = cache.remove(&a.uuid) {
-            if let Some(fp) = current_fingerprint(&a.uuid) {
-                sched.seed_from_cache(&a.uuid, snap, &fp);
+        sched.add(&a.account_id);
+        if let Some(snap) = cache.remove(&a.account_id) {
+            if let Some(fp) = current_fingerprint(&a.account_id) {
+                sched.seed_from_cache(&a.account_id, snap, &fp);
             }
         }
         if a.quarantined {
@@ -944,7 +944,7 @@ pub fn register_accounts<C: Clock>(
             // backoff (its `AuthDead` early return). Order against the seed
             // above does not matter: `state()` checks `quarantined` before
             // anything else.
-            sched.record_failure(&a.uuid, FailureKind::AuthDead);
+            sched.record_failure(&a.account_id, FailureKind::AuthDead);
         }
     }
 }
@@ -961,7 +961,7 @@ pub fn persist_quarantine(
     accounts: &mut AccountStore,
     uuid: &str,
 ) -> Result<bool, AccountError> {
-    let Some(mut a) = accounts.list().iter().find(|a| a.uuid == uuid).cloned() else {
+    let Some(mut a) = accounts.list().iter().find(|a| a.account_id == uuid).cloned() else {
         return Ok(false);
     };
     if a.quarantined {
@@ -992,7 +992,7 @@ pub fn persist_last_ok(
     uuid: &str,
     at: DateTime<Utc>,
 ) -> Result<bool, AccountError> {
-    let Some(mut a) = accounts.list().iter().find(|a| a.uuid == uuid).cloned() else {
+    let Some(mut a) = accounts.list().iter().find(|a| a.account_id == uuid).cloned() else {
         return Ok(false);
     };
     a.last_ok_at = Some(at);
@@ -1004,6 +1004,7 @@ pub fn persist_last_ok(
 mod tests {
     use super::*;
     use crate::model::UsageWindow;
+    use crate::provider::Provider;
 
     fn win(pct: f64) -> Vec<UsageWindow> {
         vec![UsageWindow {
@@ -1709,7 +1710,8 @@ mod tests {
 
     fn account(uuid: &str, quarantined: bool) -> Account {
         Account {
-            uuid: uuid.into(),
+            account_id: uuid.into(),
+            provider: Provider::Anthropic,
             display_label: uuid.into(),
             email: format!("{uuid}@example.com"),
             created_at: Utc::now(),
