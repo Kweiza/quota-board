@@ -36,9 +36,9 @@ pub enum AuthError {
     OAuth { status: u16, code: Option<String>, description: Option<String> },
     #[error("failed to parse the response: {0}")]
     Decode(String),
-    /// The response carried no field `account_id_from` recognises as an
-    /// identifier. **Never carries the body**: the body holds the tokens, and
-    /// CLAUDE.md forbids a live credential reaching an error message.
+    /// `account_id_from` walked every candidate path and found none present.
+    /// **Never carries the body**: the body holds the tokens, and CLAUDE.md
+    /// forbids a live credential reaching an error message.
     #[error("the token response carried no account identifier")]
     NoAccountIdentifier,
 }
