@@ -482,4 +482,61 @@ mod tests {
         assert_eq!(s.list().len(), 2, "the provider is part of the key");
         std::fs::remove_file(&path).ok();
     }
+
+    /// The key is (provider, account_id), not the id alone — `remove` must
+    /// delete only the pair asked for. Mutating the `&&` in `remove`'s retain
+    /// predicate to `||` would delete both accounts here, since the id half
+    /// alone matches either one regardless of provider; this is the test that
+    /// catches it.
+    #[test]
+    fn remove_only_deletes_the_matching_provider() {
+        let path = tmp();
+        let mut s = AccountStore::load(&path);
+        let mut a = acc("same-id", "claude");
+        let mut b = acc("same-id", "codex");
+        a.provider = Provider::Anthropic;
+        b.provider = Provider::Openai;
+        s.upsert(a).unwrap();
+        s.upsert(b).unwrap();
+
+        assert!(s.remove(Provider::Anthropic, "same-id").unwrap());
+        assert_eq!(s.list().len(), 1, "only the Anthropic account should be gone");
+        assert_eq!(
+            s.list()[0].provider,
+            Provider::Openai,
+            "the other provider's account was removed too"
+        );
+        std::fs::remove_file(&path).ok();
+    }
+
+    /// Same premise as `remove_only_deletes_the_matching_provider`, for
+    /// `reorder`: it must move the pair asked for, not merely an account whose
+    /// id half happens to match. Mutating the `&&` in `reorder`'s `position`
+    /// predicate to `||` would move the wrong entry here, because the id alone
+    /// matches the first account in insertion order regardless of which
+    /// provider was actually requested.
+    #[test]
+    fn reorder_targets_the_matching_provider_when_ids_collide() {
+        let path = tmp();
+        let mut s = AccountStore::load(&path);
+        let mut a = acc("same-id", "claude");
+        let mut b = acc("same-id", "codex");
+        a.provider = Provider::Anthropic;
+        b.provider = Provider::Openai;
+        s.upsert(a).unwrap();
+        s.upsert(b).unwrap();
+
+        // Ask for the Openai entry to move first; the Anthropic entry, which
+        // shares the id string, must stay behind it rather than being the one
+        // that moves.
+        s.reorder(&[(Provider::Openai, "same-id".into())]).unwrap();
+
+        let providers: Vec<_> = s.list().iter().map(|a| a.provider).collect();
+        assert_eq!(
+            providers,
+            vec![Provider::Openai, Provider::Anthropic],
+            "reorder moved the wrong provider's account"
+        );
+        std::fs::remove_file(&path).ok();
+    }
 }
