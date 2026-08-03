@@ -103,7 +103,25 @@ pub struct AppState {
     /// statement, never across an `await`.
     pub(crate) pending_manual: std::sync::Mutex<Option<(Provider, PendingAuth)>>,
     pub http: ReqwestHttp,
+    /// Anthropic's login endpoints, with `main.rs`'s `token_url()` override
+    /// baked in (debug-only, Step 11's local-mock verification).
     pub cfg: ProviderSpec,
+    /// Codex's half of the same pair. Kept as its own field rather than a map,
+    /// for the same reason `usage_url`/`openai_usage_url` below are: `Provider`
+    /// is a closed set of two, and a `HashMap` would buy nothing over one field
+    /// per variant while making a typo'd key a runtime `None` instead of a
+    /// compile error.
+    ///
+    /// **Without this, nothing could exercise a Codex login against a mock.**
+    /// `login_cfg` in `commands.rs` used to resolve every OpenAI login straight
+    /// to `Provider::Openai.spec()` — the real `auth.openai.com` — because no
+    /// override existed for it, unlike the identical seam
+    /// `QUOTA_OPENAI_USAGE_URL` already gave the usage endpoint. That left the
+    /// whole login path — `begin_login` → `complete_login` →
+    /// `register_authenticated` — for Codex with no test able to reach it
+    /// without touching the real network, which CLAUDE.md forbids. `main.rs`'s
+    /// `openai_token_url()` is the same override, one endpoint over.
+    pub openai_cfg: ProviderSpec,
     /// Per-account refresh locks (Task 10b). **Exactly one instance may exist
     /// in the whole application** — two copies serialize nothing, because each
     /// hands out its own mutex (auth/stored.rs:76-84).
@@ -700,6 +718,13 @@ pub(crate) mod tests {
             cfg: ProviderSpec {
                 token_url: "http://127.0.0.1:1/never".into(),
                 ..Provider::Anthropic.spec()
+            },
+            // Same dead address, same reason — a test that needs a real Codex
+            // login exchange overrides this field directly, the same way
+            // existing tests override `cfg.token_url`.
+            openai_cfg: ProviderSpec {
+                token_url: "http://127.0.0.1:1/never".into(),
+                ..Provider::Openai.spec()
             },
             refresh_locks: RefreshLocks::default(),
             poll_permit: Mutex::new(()),

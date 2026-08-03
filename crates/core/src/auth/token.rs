@@ -38,10 +38,15 @@ pub enum AuthError {
     OAuth { status: u16, code: Option<String>, description: Option<String> },
     #[error("failed to parse the response: {0}")]
     Decode(String),
-    /// No account identifier could be derived from the token response —
-    /// either `account_id_from` walked every OpenAI candidate path and found
-    /// none present (or every one empty), or Anthropic's response carried no
-    /// `account` block that matched the measured shape at all.
+    /// `account_id_from` walked every OpenAI candidate path and found none
+    /// present, or every one present but empty. **Only the OpenAI path
+    /// through `identity_from` produces this**: Anthropic's branch returns
+    /// `Ok(None)` instead when `account` is absent or does not match the
+    /// measured shape, which `commands::complete_login` turns into its own
+    /// plain-string refusal ("the token response carried no account block"),
+    /// not this error. `exchange_and_identify` reuses this same variant for
+    /// its own "no identity at all" case, but nothing calls it with
+    /// `Provider::Anthropic`.
     /// **Never carries the body**: the body holds the tokens, and CLAUDE.md
     /// forbids a live credential reaching an error message.
     #[error("the token response carried no account identifier")]
