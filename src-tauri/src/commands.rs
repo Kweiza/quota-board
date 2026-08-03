@@ -32,8 +32,12 @@ use tauri_plugin_autostart::ManagerExt;
 /// and `list()` returns that order, so the array order *is* the order.
 #[derive(serde::Serialize)]
 pub struct AccountView {
-    pub uuid: String,
+    pub account_id: String,
+    /// Which service this row belongs to. The widget shows a badge from it and
+    /// gates §5.3's "weekly not reported" note on it.
+    pub provider: Provider,
     pub label: String,
+    /// Display only. **Never used as a key** (§9.3) — the key is the pair.
     pub email: String,
     pub state: AccountState,
 }
@@ -47,7 +51,8 @@ pub async fn list_accounts(state: State<'_, AppState>) -> Result<Vec<AccountView
         .list()
         .iter()
         .map(|a| AccountView {
-            uuid: a.account_id.clone(),
+            account_id: a.account_id.clone(),
+            provider: a.provider,
             label: a.display_label.clone(),
             email: a.email.clone(),
             state: sched.state(a.provider, &a.account_id).unwrap_or(AccountState::Loading),
@@ -103,10 +108,13 @@ pub async fn refresh_account(
         // "throttled, after HH:MM" and `AccountList.svelte` renders it as
         // "throttled, available after HH:MM". Cited by name: both files move.
         //
-        // `Provider::Anthropic` stopgap: `uuid` is a bare id from the wire, not
-        // (provider, id) — Task 9 makes the frontend provider-aware. Every
-        // account this command can reach today is Anthropic (see the same note
-        // a few lines down on `is_refreshing`).
+        // `Provider::Anthropic` stopgap, still not resolved: `uuid` is a bare
+        // id from the wire, not (provider, id). Task 9 made `remove_account`,
+        // `reorder_accounts` and `rename_account` provider-aware but left this
+        // command as it was — every account it reaches today is still
+        // Anthropic in practice, but that is an assumption this command
+        // trusts rather than one the wire enforces (see the same note a few
+        // lines down on `is_refreshing`).
         if let Some(s @ AccountState::Throttled { .. }) = sched.state(Provider::Anthropic, &uuid) {
             return Ok(s);
         }
@@ -120,8 +128,8 @@ pub async fn refresh_account(
     // for up to 30 seconds. `is_refreshing` is advisory by design
     // (auth/stored.rs:98-103) and drives a display state only.
     //
-    // `Provider::Anthropic` stopgap: `uuid` is a bare id from the wire, not
-    // (provider, id) — Task 9 makes the frontend provider-aware.
+    // `Provider::Anthropic` stopgap, still not resolved — see the same note
+    // above `refresh_account`'s `Throttled` check.
     if state.refresh_locks.is_refreshing(Provider::Anthropic, &uuid) {
         return Ok(AccountState::AuthExpired);
     }
@@ -547,11 +555,29 @@ pub(crate) async fn complete_login(
 }
 
 #[tauri::command]
-pub async fn remove_account(app: tauri::AppHandle, uuid: String) -> Result<(), String> {
-    let state = app.state::<AppState>();
-    // `uuid` here is a bare account id from the wire, not (provider, id) — see
-    // the `Provider::Anthropic` stopgap on `AccountStore::remove` below.
-    let key = token_key(Provider::Anthropic, &uuid);
+pub async fn remove_account(
+    app: tauri::AppHandle,
+    uuid: String,
+    provider: Provider,
+) -> Result<(), String> {
+    remove_account_for(&app.state::<AppState>(), provider, &uuid).await?;
+    let _ = app.emit("accounts://changed", ());
+    Ok(())
+}
+
+/// The whole of `remove_account` except the event, so it can be tested without
+/// an `AppHandle` — the same split `finish_manual_login`/`complete_login` use.
+///
+/// Takes `provider` rather than assuming Anthropic: the primary key is the
+/// pair (§9.3), and an id-only lookup would remove the wrong account, or
+/// nothing at all, whenever a Codex account happens to share an id with a
+/// Claude one.
+pub(crate) async fn remove_account_for(
+    state: &AppState,
+    provider: Provider,
+    uuid: &str,
+) -> Result<(), String> {
+    let key = token_key(provider, uuid);
     let store = state.secrets();
 
     // Both store calls run on a blocking thread. `SecretStore` is synchronous
@@ -595,22 +621,14 @@ pub async fn remove_account(app: tauri::AppHandle, uuid: String) -> Result<(), S
     }
 
     // Lock order: scheduler before accounts.
-    //
-    // `uuid` here is a bare account id from the wire, not (provider, id) —
-    // Task 9 makes the frontend provider-aware. Every account this command can
-    // reach today is Anthropic, so that is the provider half of the key.
-    state.scheduler.lock().await.remove(Provider::Anthropic, &uuid);
-    let removed = state
-        .accounts
-        .lock()
-        .await
-        .remove(Provider::Anthropic, &uuid)
-        .map_err(|e| e.to_string())?;
+    state.scheduler.lock().await.remove(provider, uuid);
+    let removed =
+        state.accounts.lock().await.remove(provider, uuid).map_err(|e| e.to_string())?;
     if !removed {
-        // `AccountStore::remove` answers `Ok(false)` for an unknown uuid
-        // (accounts.rs:85-96). Emitting `accounts://changed` for a removal
-        // that removed nothing would tell every window to re-read for no
-        // reason. Same shape as `rename_account`'s unknown-account arm.
+        // `AccountStore::remove` answers `Ok(false)` for an unknown (provider,
+        // id) pair (accounts.rs:137-149). Emitting `accounts://changed` for a
+        // removal that removed nothing would tell every window to re-read for
+        // no reason. Same shape as `rename_account`'s unknown-account arm.
         return Err("unknown account".into());
     }
 
@@ -619,19 +637,24 @@ pub async fn remove_account(app: tauri::AppHandle, uuid: String) -> Result<(), S
     // `snapshots::remove` (snapshots.rs:80) exists for exactly this and had no
     // caller.
     let path = state.snapshots_path.clone();
-    let id = uuid.clone();
-    if let Ok(Err(e)) = tauri::async_runtime::spawn_blocking(move || {
-        // `Provider::Anthropic` stopgap — see `AccountStore::remove` above.
-        quota_core::snapshots::remove(&path, Provider::Anthropic, &id)
-    })
-    .await
+    let id = uuid.to_string();
+    if let Ok(Err(e)) =
+        tauri::async_runtime::spawn_blocking(move || quota_core::snapshots::remove(&path, provider, &id))
+            .await
     {
         eprintln!("{uuid}: the cached snapshot could not be removed: {e}");
     }
-    state.forget_raw(&uuid);
+    state.forget_raw(uuid);
 
-    let _ = app.emit("accounts://changed", ());
     Ok(())
+}
+
+/// One account's key, as a reorder needs it: the pair is the primary key
+/// (§9.3), so a bare id would let two providers sharing an id collide.
+#[derive(serde::Deserialize)]
+pub struct AccountKey {
+    pub account_id: String,
+    pub provider: Provider,
 }
 
 #[tauri::command]
@@ -639,34 +662,51 @@ pub async fn rename_account(
     app: tauri::AppHandle,
     uuid: String,
     label: String,
+    provider: Provider,
 ) -> Result<(), String> {
-    let state = app.state::<AppState>();
-    let mut accounts = state.accounts.lock().await;
-    let Some(mut a) = accounts.list().iter().find(|a| a.account_id == uuid).cloned() else {
-        return Err("unknown account".into());
-    };
-    a.display_label = label;
-    accounts.upsert(a).map_err(|e| e.to_string())?;
-    drop(accounts);
+    rename_account_for(&app.state::<AppState>(), provider, &uuid, label).await?;
     let _ = app.emit("accounts://changed", ());
     Ok(())
 }
 
+/// The whole of `rename_account` except the event, so it can be tested
+/// without an `AppHandle` — the same split `remove_account_for` uses.
+///
+/// Looks the account up by (provider, id), not id alone: a bare-id lookup
+/// would rename whichever of two same-id accounts across providers happened
+/// to sort first, silently leaving the one actually asked for untouched.
+pub(crate) async fn rename_account_for(
+    state: &AppState,
+    provider: Provider,
+    uuid: &str,
+    label: String,
+) -> Result<(), String> {
+    let mut accounts = state.accounts.lock().await;
+    let Some(mut a) =
+        accounts.list().iter().find(|a| a.account_id == uuid && a.provider == provider).cloned()
+    else {
+        return Err("unknown account".into());
+    };
+    a.display_label = label;
+    accounts.upsert(a).map_err(|e| e.to_string())
+}
+
 #[tauri::command]
-pub async fn reorder_accounts(app: tauri::AppHandle, uuids: Vec<String>) -> Result<(), String> {
-    let state = app.state::<AppState>();
-    // Every account this command can reach today is Anthropic — see the same
-    // note on `remove_account`.
-    let keys: Vec<(Provider, String)> =
-        uuids.into_iter().map(|id| (Provider::Anthropic, id)).collect();
-    state
-        .accounts
-        .lock()
-        .await
-        .reorder(&keys)
-        .map_err(|e| e.to_string())?;
+pub async fn reorder_accounts(app: tauri::AppHandle, keys: Vec<AccountKey>) -> Result<(), String> {
+    let pairs: Vec<(Provider, String)> =
+        keys.into_iter().map(|k| (k.provider, k.account_id)).collect();
+    reorder_accounts_for(&app.state::<AppState>(), pairs).await?;
     let _ = app.emit("accounts://changed", ());
     Ok(())
+}
+
+/// The whole of `reorder_accounts` except the event, so it can be tested
+/// without an `AppHandle` — the same split `remove_account_for` uses.
+pub(crate) async fn reorder_accounts_for(
+    state: &AppState,
+    keys: Vec<(Provider, String)>,
+) -> Result<(), String> {
+    state.accounts.lock().await.reorder(&keys).map_err(|e| e.to_string())
 }
 
 /// A user passphrase in transit.
@@ -1119,5 +1159,109 @@ mod tests {
         // Still armed: the user may paste again, and a refused attempt must not
         // cost them the URL.
         assert!(state.pending_manual.lock().unwrap().is_some(), "a refusal disarmed the form");
+    }
+
+    /// Clones `app_state`'s Anthropic "a" into an Openai account sharing the
+    /// same id — the exact collision (provider, id) exists to resolve. Reusing
+    /// the seeded account rather than hand-building one keeps this test in the
+    /// construction style the module already uses.
+    async fn add_openai_twin_of_a(state: &AppState) {
+        let mut accounts = state.accounts.lock().await;
+        let mut twin = accounts.list().iter().find(|a| a.account_id == "a").unwrap().clone();
+        twin.provider = Provider::Openai;
+        accounts.upsert(twin).unwrap();
+    }
+
+    /// docs/design.md §9.3: the primary key is the pair, not the bare id.
+    /// Mutating `remove_account_for`'s provider check to match on the id alone
+    /// would delete the Anthropic account here instead of its Openai twin, or
+    /// delete both — this is the test that catches it.
+    #[tokio::test]
+    async fn remove_account_only_removes_the_matching_provider() {
+        let state = app_state(Arc::new(MemoryStore::default()));
+        {
+            let mut accounts = state.accounts.lock().await;
+            // Only the colliding pair matters here; `app_state`'s incidental
+            // second seeded account ("b") would otherwise survive the removal
+            // too and blur the exact count this test is about.
+            accounts.remove(Provider::Anthropic, "b").unwrap();
+        }
+        add_openai_twin_of_a(&state).await;
+
+        remove_account_for(&state, Provider::Openai, "a").await.unwrap();
+
+        let accounts = state.accounts.lock().await;
+        assert_eq!(
+            accounts.list().len(),
+            1,
+            "removing the Openai twin should leave exactly the Anthropic account behind"
+        );
+        assert_eq!(
+            accounts.list()[0].provider,
+            Provider::Anthropic,
+            "the Anthropic account was removed instead of its Openai twin"
+        );
+    }
+
+    /// Same premise, for `reorder_accounts_for`: it must move the pair asked
+    /// for, not merely an account whose id half happens to match. Asked to
+    /// move the Openai twin to the front, the Anthropic account sharing its id
+    /// must stay at the position requested for it rather than being the one
+    /// that moves.
+    #[tokio::test]
+    async fn reorder_accounts_moves_the_matching_provider() {
+        let state = app_state(Arc::new(MemoryStore::default()));
+        add_openai_twin_of_a(&state).await;
+
+        reorder_accounts_for(
+            &state,
+            vec![
+                (Provider::Openai, "a".to_string()),
+                (Provider::Anthropic, "b".to_string()),
+                (Provider::Anthropic, "a".to_string()),
+            ],
+        )
+        .await
+        .unwrap();
+
+        let accounts = state.accounts.lock().await;
+        let order: Vec<(Provider, String)> =
+            accounts.list().iter().map(|a| (a.provider, a.account_id.clone())).collect();
+        assert_eq!(
+            order,
+            vec![
+                (Provider::Openai, "a".to_string()),
+                (Provider::Anthropic, "b".to_string()),
+                (Provider::Anthropic, "a".to_string()),
+            ],
+            "reorder did not produce the requested order"
+        );
+    }
+
+    /// Same premise again, for `rename_account_for`: renaming the Openai twin
+    /// must not touch the Anthropic account sharing its id.
+    #[tokio::test]
+    async fn rename_account_only_renames_the_matching_provider() {
+        let state = app_state(Arc::new(MemoryStore::default()));
+        add_openai_twin_of_a(&state).await;
+
+        rename_account_for(&state, Provider::Openai, "a", "renamed".to_string()).await.unwrap();
+
+        let accounts = state.accounts.lock().await;
+        let anthropic_a = accounts
+            .list()
+            .iter()
+            .find(|a| a.account_id == "a" && a.provider == Provider::Anthropic)
+            .expect("the Anthropic account vanished");
+        assert_eq!(
+            anthropic_a.display_label, "a",
+            "the Anthropic account's label changed even though only its Openai twin was renamed"
+        );
+        let openai_a = accounts
+            .list()
+            .iter()
+            .find(|a| a.account_id == "a" && a.provider == Provider::Openai)
+            .expect("the Openai twin vanished");
+        assert_eq!(openai_a.display_label, "renamed");
     }
 }

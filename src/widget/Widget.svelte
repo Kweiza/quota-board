@@ -9,9 +9,10 @@
   export let onOpenSettings: () => void = () => {}
   // §7.1 makes clicking these the only remedy AUTH_DEAD and SECRETS_LOCKED
   // have, so the row's callbacks must reach the mount site rather than stop
-  // here. Keyed by uuid, never by email or label: the account primary key is
-  // `account.uuid`. Both handlers open the settings window, which owns the
-  // re-login (`begin_login`) and the unlock prompt (`unlock_secrets`).
+  // here. Keyed by `account_id`, never by email or label — `provider` is the
+  // other half of the primary key (§9.3), but neither of these handlers acts
+  // on a specific account today; both just open the settings window, which
+  // owns the re-login (`begin_login`) and the unlock prompt (`unlock_secrets`).
   export let onRelogin: (uuid: string) => void = () => {}
   export let onUnlock: (uuid: string) => void = () => {}
   // §6.4's manual refresh. Same keying rule as the two above — uuid, never the
@@ -35,13 +36,13 @@
   <div class="titlebar">
     <button class="gear" title="Settings" on:click={onOpenSettings}>⚙</button>
   </div>
-  {#each accounts as a (a.uuid)}
+  {#each accounts as a (a.account_id)}
     <AccountRow
       account={a}
       {now}
-      onRelogin={() => onRelogin(a.uuid)}
-      onUnlock={() => onUnlock(a.uuid)}
-      onRefresh={() => onRefresh(a.uuid)}
+      onRelogin={() => onRelogin(a.account_id)}
+      onUnlock={() => onUnlock(a.account_id)}
+      onRefresh={() => onRefresh(a.account_id)}
     />
   {/each}
   {#if warning}

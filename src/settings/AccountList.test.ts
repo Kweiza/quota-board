@@ -7,8 +7,8 @@ import type { AccountView } from '../lib/types'
  * `AccountList` is display-only — it calls no IPC and only reports callbacks —
  * so it renders from plain props, exactly like `src/widget/AccountRow.svelte`.
  */
-function account(uuid: string, label: string, email: string): AccountView {
-  return { uuid, label, email, state: { kind: 'loading' } }
+function account(accountId: string, label: string, email: string): AccountView {
+  return { account_id: accountId, provider: 'anthropic', label, email, state: { kind: 'loading' } }
 }
 
 const two = [

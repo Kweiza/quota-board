@@ -4,6 +4,7 @@ import AccountRow from './AccountRow.svelte'
 import type { AccountView } from '../lib/types'
 
 const NOW = new Date('2026-07-29T12:00:00Z')
+const OLD = new Date(NOW.getTime() - 12 * 60_000).toISOString()
 
 const win = (id: string, label: string, pct: number) => ({
   window_id: id,
@@ -13,12 +14,77 @@ const win = (id: string, label: string, pct: number) => ({
   scope: null,
 })
 
+/**
+ * The general fixture: every field defaults to the Claude row this file has
+ * always tested, and a caller overrides only what a given test is about.
+ * `view()` below is the special case that predates Task 9 — kept so the ~30
+ * call sites across this file that only ever varied `state` do not all have to
+ * learn about `provider`.
+ */
+function acct(overrides: Partial<AccountView> = {}): AccountView {
+  return {
+    account_id: 'u1',
+    provider: 'anthropic',
+    label: 'work@example.com',
+    email: 'work@example.com',
+    state: { kind: 'loading' },
+    ...overrides,
+  }
+}
+
 function view(state: AccountView['state']): AccountView {
-  return { uuid: 'u1', label: 'work@example.com', email: 'work@example.com', state }
+  return acct({ state })
 }
 
 const ok = (windows: ReturnType<typeof win>[], fetchedAt = NOW.toISOString()) =>
-  view({ kind: 'ok', windows, credit: null, fetched_at: fetchedAt })
+  view({ kind: 'ok', windows, extra: null, fetched_at: fetchedAt })
+
+describe('AccountRow provider', () => {
+  it('marks a Codex row so it cannot be confused with a Claude one', () => {
+    render(AccountRow, { account: acct({ provider: 'openai', label: 'work' }) })
+    // `toHaveTextContent` needs `@testing-library/jest-dom`, which this project
+    // does not depend on — every other assertion in this file reads
+    // `.textContent` directly (see `AccountRow bars` above), so this matches
+    // rather than adding a new dependency for one assertion.
+    expect(screen.getByTitle('Codex').textContent).toBe('CX')
+  })
+
+  /// The note serves design.md §5.3's read order, which has no Codex counterpart.
+  /// Left ungated it appears on every Codex row, always.
+  it('does not tell a Codex row that weekly is not reported', () => {
+    render(AccountRow, {
+      account: acct({
+        provider: 'openai',
+        state: { kind: 'ok', windows: [win('primary', '7d', 0)], extra: null, fetched_at: NOW.toISOString() },
+      }),
+    })
+    expect(screen.queryByText(/weekly not reported/i)).toBeNull()
+  })
+
+  it('still tells a Claude row that weekly is not reported', () => {
+    render(AccountRow, {
+      account: acct({
+        provider: 'anthropic',
+        state: { kind: 'ok', windows: [win('five_hour', '5h', 10)], extra: null, fetched_at: NOW.toISOString() },
+      }),
+    })
+    expect(screen.getByText(/weekly not reported/i)).toBeTruthy()
+  })
+
+  /// AccountRow.svelte's CSS comment records the bug this prevents: `.amounts`
+  /// was left out of the stale list and money rendered at full strength inside an
+  /// otherwise dimmed row. The badge is the same class of element.
+  it('dims the badge on a stale row', () => {
+    const { container } = render(AccountRow, {
+      account: acct({
+        provider: 'openai',
+        state: { kind: 'stale', windows: [], extra: null, fetched_at: OLD },
+      }),
+    })
+    const badge = container.querySelector('.badge')!
+    expect(getComputedStyle(badge).opacity).not.toBe('1')
+  })
+})
 
 describe('AccountRow bars', () => {
   it('draws one bar when the account reports one window', () => {
@@ -75,7 +141,7 @@ describe('AccountRow states', () => {
   it('shows a stale value together with its age', () => {
     const fetched = new Date(NOW.getTime() - 12 * 60_000).toISOString()
     render(AccountRow, {
-      account: view({ kind: 'stale', windows: [win('five_hour', '5h', 20)], credit: null, fetched_at: fetched }),
+      account: view({ kind: 'stale', windows: [win('five_hour', '5h', 20)], extra: null, fetched_at: fetched }),
       now: NOW,
     })
     expect(screen.getByText('12m ago')).toBeTruthy()
@@ -85,7 +151,7 @@ describe('AccountRow states', () => {
   it('keeps the bar colour at full strength on a stale row', () => {
     const fetched = new Date(NOW.getTime() - 12 * 60_000).toISOString()
     const { unmount } = render(AccountRow, {
-      account: view({ kind: 'stale', windows: [win('five_hour', '5h', 91)], credit: null, fetched_at: fetched }),
+      account: view({ kind: 'stale', windows: [win('five_hour', '5h', 91)], extra: null, fetched_at: fetched }),
       now: NOW,
     })
     expect(screen.getByRole('meter').className).toContain('red')
@@ -114,7 +180,7 @@ describe('AccountRow states', () => {
       )
 
     const staleRow = render(AccountRow, {
-      account: view({ kind: 'stale', windows: [win('five_hour', '5h', 38)], credit: null, fetched_at: fetched }),
+      account: view({ kind: 'stale', windows: [win('five_hour', '5h', 38)], extra: null, fetched_at: fetched }),
       now: NOW,
     })
     const stale = opacities(staleRow.container)
@@ -202,8 +268,8 @@ describe('AccountRow refresh', () => {
    * clicks and a second window away.
    */
   const EVERY_STATE: AccountView['state'][] = [
-    { kind: 'ok', windows: [win('five_hour', '5h', 20)], credit: null, fetched_at: NOW.toISOString() },
-    { kind: 'stale', windows: [win('five_hour', '5h', 20)], credit: null, fetched_at: NOW.toISOString() },
+    { kind: 'ok', windows: [win('five_hour', '5h', 20)], extra: null, fetched_at: NOW.toISOString() },
+    { kind: 'stale', windows: [win('five_hour', '5h', 20)], extra: null, fetched_at: NOW.toISOString() },
     { kind: 'loading' },
     { kind: 'throttled', until: '2026-07-29T14:05:00Z' },
     { kind: 'auth_expired' },
@@ -287,7 +353,7 @@ describe('AccountRow refresh', () => {
     const fetched = new Date(NOW.getTime() - 12 * 60_000).toISOString()
 
     const staleRow = render(AccountRow, {
-      account: view({ kind: 'stale', windows: [win('five_hour', '5h', 20)], credit: null, fetched_at: fetched }),
+      account: view({ kind: 'stale', windows: [win('five_hour', '5h', 20)], extra: null, fetched_at: fetched }),
       now: NOW,
     })
     const stale = opacity(staleRow.container)
@@ -308,11 +374,11 @@ const CREDIT = {
 }
 
 describe('AccountRow credit line', () => {
-  const withCredit = (credit: AccountView['state'] extends never ? never : typeof CREDIT | null) =>
+  const withCredit = (credit: typeof CREDIT | null) =>
     view({
       kind: 'ok',
       windows: [win('five_hour', '5h', 20)],
-      credit,
+      extra: credit ? { kind: 'credit', ...credit } : null,
       fetched_at: NOW.toISOString(),
     })
 
@@ -360,7 +426,7 @@ describe('AccountRow credit line', () => {
       account: view({
         kind: 'stale',
         windows: [win('five_hour', '5h', 20)],
-        credit: CREDIT,
+        extra: { kind: 'credit', ...CREDIT },
         fetched_at: fetched,
       }),
       now: NOW,

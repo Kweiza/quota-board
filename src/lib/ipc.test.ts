@@ -15,6 +15,7 @@ import {
   onAuthFailed,
   openSettings,
   renameAccount,
+  reorderAccounts,
   setSettings,
 } from './ipc'
 import type { RawResponse, SettingsView } from './types'
@@ -247,12 +248,39 @@ describe('command wrappers', () => {
     expect(calls).toEqual([{ cmd: 'set_settings', args: { pollIntervalSecs: 300 } }])
   })
 
-  it('renameAccount sends the uuid and the label, in that shape', async () => {
+  it('renameAccount sends the uuid, the provider and the label, in that shape', async () => {
     const calls = recordArgs()
 
-    await renameAccount('acct-1', 'Work')
+    await renameAccount('acct-1', 'openai', 'Work')
 
-    expect(calls).toEqual([{ cmd: 'rename_account', args: { uuid: 'acct-1', label: 'Work' } }])
+    expect(calls).toEqual([
+      { cmd: 'rename_account', args: { uuid: 'acct-1', provider: 'openai', label: 'Work' } },
+    ])
+  })
+
+  /**
+   * §9.3: the primary key is the pair, so the wire has to carry the provider
+   * for every key in a reorder, not just the id half.
+   */
+  it('reorderAccounts sends each account as a (provider, id) pair', async () => {
+    const calls = recordArgs()
+
+    await reorderAccounts([
+      { account_id: 'acct-2', provider: 'openai' },
+      { account_id: 'acct-1', provider: 'anthropic' },
+    ])
+
+    expect(calls).toEqual([
+      {
+        cmd: 'reorder_accounts',
+        args: {
+          keys: [
+            { account_id: 'acct-2', provider: 'openai' },
+            { account_id: 'acct-1', provider: 'anthropic' },
+          ],
+        },
+      },
+    ])
   })
 
   it('lastResponse returns the captured response keyed by uuid', async () => {

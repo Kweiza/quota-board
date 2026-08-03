@@ -8,6 +8,7 @@ import type {
   AutostartView,
   LoginUrls,
   ManualFallback,
+  Provider,
   RawResponse,
   SettingsView,
   StoreStatus,
@@ -85,15 +86,8 @@ export const onUsageUpdated = (fn: () => void): Promise<UnlistenFn> =>
 export const refreshAccount = (uuid: string): Promise<AccountState> =>
   invoke('refresh_account', { uuid })
 
-/**
- * §10.3's flow, for whichever provider the user pressed the button for.
- *
- * `'anthropic' | 'openai'` rather than a shared `Provider` type from
- * `./types`: that file still describes the pre-`ExtraLine` shape and bringing
- * it in line is a separate task, so this stays a narrow literal union scoped
- * to the one argument that needs it.
- */
-export const beginLogin = (provider: 'anthropic' | 'openai'): Promise<LoginUrls> =>
+/** §10.3's flow, for whichever provider the user pressed the button for. */
+export const beginLogin = (provider: Provider): Promise<LoginUrls> =>
   invoke('begin_login', { provider })
 
 /** §10.3's paste path. Rejects with a sentence meant for the user. */
@@ -107,14 +101,23 @@ export const getAutostart = (): Promise<AutostartView> => invoke('get_autostart'
 export const setAutostart = (enabled: boolean): Promise<AutostartView> =>
   invoke('set_autostart', { enabled })
 
-export const removeAccount = (uuid: string): Promise<void> =>
-  invoke('remove_account', { uuid })
+/**
+ * §9.3: the primary key is the pair, so removing the wrong provider's account
+ * sharing this id is exactly the hazard passing `provider` closes off.
+ */
+export const removeAccount = (uuid: string, provider: Provider): Promise<void> =>
+  invoke('remove_account', { uuid, provider })
 
-export const renameAccount = (uuid: string, label: string): Promise<void> =>
-  invoke('rename_account', { uuid, label })
+export const renameAccount = (uuid: string, provider: Provider, label: string): Promise<void> =>
+  invoke('rename_account', { uuid, provider, label })
 
-export const reorderAccounts = (uuids: string[]): Promise<void> =>
-  invoke('reorder_accounts', { uuids })
+/**
+ * The whole rearranged order, as (provider, id) pairs — `AccountStore::reorder`
+ * rewrites `sort_order` from the order it is given, and the pair is what keeps
+ * two providers sharing an id from being treated as one entry.
+ */
+export const reorderAccounts = (keys: { account_id: string; provider: Provider }[]): Promise<void> =>
+  invoke('reorder_accounts', { keys })
 
 export const storeStatus = (): Promise<StoreStatus> => invoke('store_status')
 
