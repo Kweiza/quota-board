@@ -33,9 +33,8 @@
 //!   under `cargo test` and `cargo clippy --all-targets` and fails only under a
 //!   plain `cargo build`. Neither project gate catches it.)
 
-use crate::auth::pkce::AuthConfig;
 use crate::auth::token::{refresh, AuthError, TokenHttp, TokenSet};
-use crate::provider::{token_key, Provider};
+use crate::provider::{token_key, Provider, ProviderSpec};
 use crate::secrets::{SecretError, SecretStore};
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
@@ -186,7 +185,7 @@ fn save(
 /// alongside `uuid` rather than assumed to be Anthropic.
 pub async fn ensure_fresh<H: TokenHttp>(
     http: &H,
-    cfg: &AuthConfig,
+    cfg: &ProviderSpec,
     store: &dyn SecretStore,
     locks: &RefreshLocks,
     provider: Provider,
@@ -262,8 +261,11 @@ mod tests {
 
     const UUID: &str = "acc-1";
 
-    async fn cfg_for(server: &MockServer) -> AuthConfig {
-        AuthConfig { token_url: format!("{}/v1/oauth/token", server.uri()), ..AuthConfig::default() }
+    async fn cfg_for(server: &MockServer) -> ProviderSpec {
+        ProviderSpec {
+            token_url: format!("{}/v1/oauth/token", server.uri()),
+            ..Provider::Anthropic.spec()
+        }
     }
 
     fn expired_tokens(refresh_token: &str) -> TokenSet {
@@ -273,7 +275,7 @@ mod tests {
             expires_at: Utc::now() - TimeDelta::seconds(1),
             refresh_token_expires_at: Utc::now() + TimeDelta::days(30),
             scopes: vec!["user:profile".into()],
-            client_id: AuthConfig::default().client_id,
+            client_id: Provider::Anthropic.spec().client_id,
         }
     }
 

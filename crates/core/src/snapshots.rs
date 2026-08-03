@@ -159,7 +159,6 @@ fn create_owner_only(path: &Path) -> std::io::Result<std::fs::File> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::auth::pkce::AuthConfig;
     use crate::auth::token::TokenSet;
     use chrono::TimeDelta;
 
@@ -292,7 +291,7 @@ mod tests {
             expires_at: Utc::now() + TimeDelta::hours(1),
             refresh_token_expires_at: Utc::now() + TimeDelta::days(30),
             scopes: vec!["user:profile".into()],
-            client_id: AuthConfig::default().client_id,
+            client_id: Provider::Anthropic.spec().client_id,
         };
 
         let path = tmp();

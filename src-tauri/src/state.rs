@@ -1,9 +1,9 @@
 use chrono::Utc;
 use quota_core::accounts::{Account, AccountStore};
-use quota_core::auth::pkce::{AuthConfig, PendingAuth};
+use quota_core::auth::pkce::PendingAuth;
 use quota_core::auth::stored::{ensure_fresh, RefreshLocks};
 use quota_core::auth::token::ReqwestHttp;
-use quota_core::provider::Provider;
+use quota_core::provider::{Provider, ProviderSpec};
 use quota_core::scheduler::{
     persist_last_ok, persist_quarantine, FailureKind, Scheduler, SystemClock,
 };
@@ -97,7 +97,7 @@ pub struct AppState {
     /// statement, never across an `await`.
     pub(crate) pending_manual: std::sync::Mutex<Option<PendingAuth>>,
     pub http: ReqwestHttp,
-    pub cfg: AuthConfig,
+    pub cfg: ProviderSpec,
     /// Per-account refresh locks (Task 10b). **Exactly one instance may exist
     /// in the whole application** — two copies serialize nothing, because each
     /// hands out its own mutex (auth/stored.rs:76-84).
@@ -687,9 +687,9 @@ pub(crate) mod tests {
             pending_manual: std::sync::Mutex::new(None),
             http: quota_core::auth::token::ReqwestHttp::new().unwrap(),
             // Unreachable in these tests: the store fails before any request.
-            cfg: AuthConfig {
+            cfg: ProviderSpec {
                 token_url: "http://127.0.0.1:1/never".into(),
-                ..AuthConfig::default()
+                ..Provider::Anthropic.spec()
             },
             refresh_locks: RefreshLocks::default(),
             poll_permit: Mutex::new(()),

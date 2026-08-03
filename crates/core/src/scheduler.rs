@@ -133,9 +133,17 @@ impl FailureKind {
                 // A transport failure is not an auth failure. Classifying it as
                 // one would eventually quarantine an account over a flaky link.
                 AuthError::Transport(_) => FailureKind::Network,
-                AuthError::OAuth { .. } | AuthError::StateMismatch | AuthError::Decode(_) => {
-                    FailureKind::AuthExpired
-                }
+                // `NoAccountIdentifier` cannot actually reach here today: it is
+                // raised by `account_id_from`, which only the account-creation
+                // path calls, and `refresh` — the only caller that feeds this
+                // match — never calls it. The arm exists because `AuthError` is
+                // matched exhaustively, and it groups with the other
+                // response-shape problems below rather than with a dead grant,
+                // since nothing here says the refresh chain itself is broken.
+                AuthError::OAuth { .. }
+                | AuthError::StateMismatch
+                | AuthError::Decode(_)
+                | AuthError::NoAccountIdentifier => FailureKind::AuthExpired,
             },
         }
     }

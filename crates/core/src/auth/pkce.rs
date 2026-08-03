@@ -1,41 +1,6 @@
+use crate::provider::ProviderSpec;
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
 use sha2::{Digest, Sha256};
-
-/// docs/design.md §10.1, §10.2, §10.4.
-#[derive(Debug, Clone)]
-pub struct AuthConfig {
-    pub authorize_url: String,
-    pub token_url: String,
-    pub client_id: String,
-    pub scopes: Vec<String>,
-}
-
-impl Default for AuthConfig {
-    fn default() -> Self {
-        Self {
-            authorize_url: "https://claude.com/cai/oauth/authorize".into(),
-            token_url: "https://platform.claude.com/v1/oauth/token".into(),
-            // Anthropic runs no third-party OAuth client registration program,
-            // so this reuses Claude Code's own public client. The visible
-            // consequence is that the consent screen shows "Claude Code"
-            // rather than this app's name. Must stay overridable via
-            // configuration so we can switch the moment a real client_id
-            // becomes available — docs/design.md §10.2.
-            client_id: "9d1c250a-e61b-44d9-88ed-5944d1962f5e".into(),
-            // `user:inference` was dropped after measurement, not by guess: a
-            // live spike showed the server accepts `user:profile` alone at
-            // consent, issues a token scoped to it (does not silently re-add
-            // `user:inference`), and that token's `/api/oauth/usage` calls —
-            // both on the initial token and after a refresh — return 200.
-            // Claude Code's insistence on requesting both scopes is therefore
-            // a client-side gate, not a server requirement. A token that
-            // cannot run inference is the point, not an optimisation: it is
-            // the terms-of-service position this whole project is built
-            // around — docs/design.md §10.4, §5.2.
-            scopes: vec!["user:profile".into()],
-        }
-    }
-}
 
 /// State that must be held onto while a login is in flight.
 /// **`verifier` and `state` are passed to the token exchange exactly as-is.**
@@ -142,7 +107,7 @@ pub fn success_redirect() -> &'static str {
 /// whole manual fallback depends on. A second copy of this sequence is a copy
 /// that drifts.
 pub fn authorize_url_for(
-    cfg: &AuthConfig,
+    cfg: &ProviderSpec,
     pending: &PendingAuth,
     redirect_uri: &str,
 ) -> Result<String, url::ParseError> {
@@ -174,7 +139,7 @@ pub fn authorize_url_for(
 /// [`authorize_url_for`] for any further redirect_uri the same login needs
 /// (§10.3's manual fallback).
 pub fn begin(
-    cfg: &AuthConfig,
+    cfg: &ProviderSpec,
     redirect_uri: &str,
 ) -> Result<(PendingAuth, String), url::ParseError> {
     let pending = PendingAuth {
@@ -189,6 +154,7 @@ pub fn begin(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::provider::Provider;
 
     /// The official RFC 7636 Appendix B test vector.
     #[test]
@@ -219,7 +185,7 @@ mod tests {
     /// pasteable code#state page.
     #[test]
     fn authorize_url_has_code_true_first_and_all_required_params() {
-        let cfg = AuthConfig::default();
+        let cfg = Provider::Anthropic.spec();
         let (_pending, url) = begin(&cfg, "http://localhost:54321/callback").unwrap();
 
         let query = url.split_once('?').unwrap().1;
@@ -244,7 +210,7 @@ mod tests {
     /// copies; the same defect has shipped twice in this repository.
     #[test]
     fn debug_redacts_the_verifier_but_keeps_the_rest() {
-        let (pending, _url) = begin(&AuthConfig::default(), "http://localhost:1/callback").unwrap();
+        let (pending, _url) = begin(&Provider::Anthropic.spec(), "http://localhost:1/callback").unwrap();
         let text = format!("{pending:?}");
         assert!(
             !text.contains(&pending.verifier),
@@ -269,7 +235,7 @@ mod tests {
     /// state, which is precisely the failure the fallback exists to avoid.
     #[test]
     fn the_manual_url_differs_from_the_loopback_url_only_in_redirect_uri() {
-        let cfg = AuthConfig::default();
+        let cfg = Provider::Anthropic.spec();
         let (pending, loopback) = begin(&cfg, "http://localhost:54321/callback").unwrap();
         let manual = authorize_url_for(&cfg, &pending, manual_redirect_uri()).unwrap();
 
@@ -298,7 +264,7 @@ mod tests {
 
     #[test]
     fn authorize_url_challenge_matches_the_returned_verifier() {
-        let cfg = AuthConfig::default();
+        let cfg = Provider::Anthropic.spec();
         let (pending, url) = begin(&cfg, "http://localhost:1/callback").unwrap();
         let parsed = url::Url::parse(&url).unwrap();
         let q: std::collections::HashMap<_, _> = parsed.query_pairs().into_owned().collect();
@@ -345,7 +311,7 @@ mod tests {
     /// docs/design.md §10.4: do not ask for scopes this app has no use for.
     #[test]
     fn default_scopes_exclude_everything_we_do_not_need() {
-        let cfg = AuthConfig::default();
+        let cfg = Provider::Anthropic.spec();
         for forbidden in [
             "org:create_api_key",
             "user:sessions:claude_code",
@@ -353,18 +319,18 @@ mod tests {
             "user:file_upload",
             // Dropped after measurement showed the server does not require it
             // for the read-only usage call — see the comment on
-            // `AuthConfig::default()`. This is the line that stops a future
+            // `Provider::Anthropic.spec()`. This is the line that stops a future
             // edit from quietly re-adding it.
             "user:inference",
         ] {
-            assert!(!cfg.scopes.iter().any(|s| s == forbidden), "requesting {forbidden}");
+            assert!(!cfg.scopes.contains(&forbidden), "requesting {forbidden}");
         }
     }
 
     /// docs/design.md §10.1: authorize lives on claude.com/cai, not claude.ai.
     #[test]
     fn endpoints_are_the_verified_ones() {
-        let cfg = AuthConfig::default();
+        let cfg = Provider::Anthropic.spec();
         assert_eq!(cfg.authorize_url, "https://claude.com/cai/oauth/authorize");
         assert_eq!(cfg.token_url, "https://platform.claude.com/v1/oauth/token");
         assert_eq!(cfg.client_id, "9d1c250a-e61b-44d9-88ed-5944d1962f5e");
