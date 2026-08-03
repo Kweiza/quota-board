@@ -178,12 +178,8 @@ fn main() {
             }
             let mut scheduler = Scheduler::new(settings.poll_policy(), SystemClock);
             let store = Arc::clone(&secrets);
-            // `Provider::Anthropic` is temporary: `register_accounts` calls this
-            // with only a uuid, not the account's own provider. Task 6 threads
-            // `Provider` through the scheduler's account map; until then every
-            // account this closure sees is Anthropic anyway.
-            let current_fp = move |uuid: &str| -> Option<String> {
-                let raw = store.get(&token_key(Provider::Anthropic, uuid)).ok().flatten()?;
+            let current_fp = move |provider: Provider, uuid: &str| -> Option<String> {
+                let raw = store.get(&token_key(provider, uuid)).ok().flatten()?;
                 let tokens: TokenSet = serde_json::from_slice(&raw).ok()?;
                 Some(fingerprint(&tokens.access_token))
             };

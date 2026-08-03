@@ -63,7 +63,15 @@ pub fn load(path: &Path) -> HashMap<String, CachedSnapshot> {
 /// Symmetric, unlike `provider::token_key`, and for a measured difference in
 /// cost: an orphaned cache entry is one cold start, while an orphaned keychain
 /// entry is a forced re-login. Making the two agree is not itself a goal.
-fn cache_key(provider: Provider, account_id: &str) -> String {
+///
+/// **`pub(crate)`, not private.** `scheduler::register_accounts` reads this
+/// same map by key on startup (§7.4's restore) and must build the identical
+/// string, or a bare-id lookup would hit nothing — or worse, hit a stale
+/// pre-namespacing entry that this module's own `save`/`remove` can no longer
+/// reach and that therefore never gets updated or cleaned up again. Two
+/// hand-built copies of this format is exactly the mistake `token_key`'s own
+/// doc comment warns about.
+pub(crate) fn cache_key(provider: Provider, account_id: &str) -> String {
     format!("{}:{}", provider.as_str(), account_id)
 }
 
