@@ -66,17 +66,41 @@ fn window(root: &Value, slot: &str) -> Option<UsageWindow> {
     })
 }
 
-/// The windows this account reports. **`Err` when the body is not a Codex usage
-/// response at all** — an empty list would render as an account with no limits,
-/// which is a claim the body does not support.
+/// The windows this account reports. Two distinct error cases, because they
+/// say different things about the response:
+///
+/// - **`UnknownShape`** when `rate_limit` is absent entirely — this body is
+///   not a Codex usage response at all.
+/// - **`UnreadableSource`** when `rate_limit` is present but every window
+///   inside it failed to parse — e.g. `{"rate_limit": {}}`, or a server that
+///   renamed `used_percent`. Checking only that the `rate_limit` key exists is
+///   not enough: `window()` already returns `None` per-slot on any
+///   missing/unparseable field, so a `rate_limit` that exists but is empty or
+///   reshaped would otherwise flow straight through `.flatten()` into
+///   `Ok(vec![])` — a legitimate-looking empty success. `primary_window` was
+///   present and populated in every account measured, on both plans
+///   (docs/research/codex-usage-endpoint.md), so an empty result from a
+///   present `rate_limit` has no known legitimate cause. This is the same
+///   failure `anthropic::ParseError::UnreadableSource` exists to prevent, and
+///   its doc comment carries the reasoning directly: disguising "present but
+///   unparseable" as "no windows to report" would let the screen freeze
+///   silently blank when the endpoint changes shape, with nobody noticing.
+///
+/// An empty list would render as an account with no limits, which is a claim
+/// neither case supports.
 pub fn parse_usage(raw: &Value) -> Result<Vec<UsageWindow>, ParseError> {
     if raw.get("rate_limit").is_none() {
         return Err(ParseError::UnknownShape);
     }
-    Ok([window(raw, "primary_window"), window(raw, "secondary_window")]
-        .into_iter()
-        .flatten()
-        .collect())
+    let windows: Vec<UsageWindow> =
+        [window(raw, "primary_window"), window(raw, "secondary_window")]
+            .into_iter()
+            .flatten()
+            .collect();
+    if windows.is_empty() {
+        return Err(ParseError::UnreadableSource);
+    }
+    Ok(windows)
 }
 
 /// `None` when the account holds none. **Zero is silence, not a line reading
@@ -155,14 +179,44 @@ mod tests {
         assert!(matches!(e, ParseError::UnknownShape));
     }
 
-    /// A window missing its percentage is dropped, not defaulted. One
-    /// unreadable window must not become a confident 0% bar.
+    /// A `rate_limit` that is present but whose only window cannot be read
+    /// (here, missing `used_percent`) must be an error, not an empty success —
+    /// `primary_window` was populated in every account this endpoint has ever
+    /// shown us, so a present `rate_limit` yielding zero windows has no known
+    /// legitimate cause and must not be confused with "this account has no
+    /// limits".
+    ///
+    /// **Replaces a version of this test that called `.unwrap_or_default()`**,
+    /// which passes whether `parse_usage` returns `Ok(vec![])` or
+    /// `Err(UnreadableSource)` — it could not tell the two outcomes apart, so
+    /// it could not have caught the gap this test now pins.
     #[test]
-    fn a_window_without_a_percentage_is_dropped_rather_than_zeroed() {
+    fn a_body_whose_only_window_is_unreadable_is_an_error_not_an_empty_success() {
         let body = v(r#"{"rate_limit":{"primary_window":
             {"limit_window_seconds":604800,"reset_at":1786345526}}}"#);
-        let w = parse_usage(&body).unwrap_or_default();
-        assert!(w.is_empty(), "a percentage-less window became a bar: {w:?}");
+        match parse_usage(&body) {
+            Err(ParseError::UnreadableSource) => {}
+            other => panic!("expected UnreadableSource, got {other:?} — an empty success is wrong"),
+        }
+    }
+
+    /// The companion to the test above: this is what proves the emptiness
+    /// check runs on the *collected* list of windows, not on each window
+    /// individually. A fix that errored whenever any single window failed to
+    /// parse — rather than only when the whole list came back empty — would
+    /// pass every other test in this file but fail this one, by wrongly
+    /// discarding the one window that did parse.
+    #[test]
+    fn one_readable_window_survives_an_unreadable_sibling() {
+        let body = v(r#"{"rate_limit":{
+            "primary_window": {"used_percent":12,"limit_window_seconds":604800,
+                "reset_after_seconds":604800,"reset_at":1786345526},
+            "secondary_window": {"limit_window_seconds":18000}
+        }}"#);
+        let w = parse_usage(&body).unwrap();
+        assert_eq!(w.len(), 1, "the unreadable secondary_window must not sink the readable primary");
+        assert_eq!(w[0].window_id, "primary");
+        assert_eq!(w[0].percent, 12.0);
     }
 
     #[test]

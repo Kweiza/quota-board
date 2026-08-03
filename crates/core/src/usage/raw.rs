@@ -295,7 +295,7 @@ fn is_money_shape_metadata(key: &str, value: &Value) -> bool {
 /// Keys, `null`s, booleans and strings survive, so §12.4's schema-drift
 /// question — did a field appear, disappear, or change from `null` to an
 /// object? — is still answerable from the panel. What does not survive is the
-/// magnitude, which the app never reads (`usage::parse` touches none of these
+/// magnitude, which the app never reads (`usage::anthropic` touches none of these
 /// keys) and which is the one thing in this body that is nobody's business in a
 /// screenshot pasted into a public issue.
 ///
