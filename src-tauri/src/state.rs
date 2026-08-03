@@ -447,8 +447,18 @@ impl AppState {
 
         // §5.5: capture before classifying, so the body that failed to parse —
         // the one the debug window exists for — is retained too.
-        let fetched =
-            fetch_usage_captured_at(&self.http, &self.usage_url, &fresh.tokens.access_token).await;
+        //
+        // `Provider::Anthropic` is temporary: this account's own provider is
+        // not yet threaded through the polling loop. Task 6 replaces this with
+        // the account's provider, alongside `self.usage_url` becoming
+        // per-provider.
+        let fetched = fetch_usage_captured_at(
+            &self.http,
+            Provider::Anthropic,
+            &self.usage_url,
+            &fresh.tokens.access_token,
+        )
+        .await;
         if let Some(raw) = fetched.raw {
             self.record_raw(uuid, raw);
         }

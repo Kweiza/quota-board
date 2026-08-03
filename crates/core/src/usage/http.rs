@@ -1,10 +1,19 @@
 use crate::auth::token::{ReqwestHttp, ANTHROPIC_BETA};
 use crate::model::{ExtraLine, UsageWindow};
-use crate::usage::anthropic::{parse_credit, parse_usage, ParseError};
+use crate::provider::Provider;
+use crate::usage::anthropic::{self, ParseError};
+use crate::usage::openai;
 use crate::usage::raw::RawResponse;
 
-/// Spec §5.1. The single data source.
+/// Spec §5.1. The Anthropic data source.
 pub const USAGE_URL: &str = "https://api.anthropic.com/api/oauth/usage";
+
+/// The Codex data source, measured in Spike F.
+///
+/// **`/backend-api/codex/usage` is not this endpoint.** It answers a Cloudflare
+/// 403; `wham/usage` answers 200 and agrees field for field with the account's
+/// own usage page. Both were measured — see docs/research/codex-usage-endpoint.md.
+pub const OPENAI_USAGE_URL: &str = "https://chatgpt.com/backend-api/wham/usage";
 
 #[derive(Debug, thiserror::Error)]
 pub enum UsageError {
@@ -39,26 +48,45 @@ pub enum UsageError {
     Status(u16),
     #[error("transport error: {0}")]
     Transport(String),
+    /// Something between us and the API refused the request — measured as a
+    /// Cloudflare challenge: an HTML body, `server-timing: chlray`, and no
+    /// `x-oai-request-id`.
+    ///
+    /// **Separate from `Status` because the status code is not the question.**
+    /// A 403 from the API means this account may not read; a 403 from the edge
+    /// means the API never heard the question. Reading the second as the first
+    /// marks a healthy account `AuthDead` and offers a re-login that will fail
+    /// identically.
+    #[error("refused before reaching the API (HTTP {status})")]
+    EdgeRefused { status: u16 },
 }
 
 pub async fn fetch_usage(
     http: &ReqwestHttp,
+    provider: Provider,
     access_token: &str,
 ) -> Result<Vec<UsageWindow>, UsageError> {
-    fetch_usage_at(http, USAGE_URL, access_token).await
+    let url = match provider {
+        Provider::Anthropic => USAGE_URL,
+        Provider::Openai => OPENAI_USAGE_URL,
+    };
+    fetch_usage_at(http, provider, url, access_token).await
 }
 
 /// The URL-taking form. Tests point this at a mock server.
 ///
-/// Signature unchanged on purpose: `crates/cli` (via `fetch_usage`) and the
-/// tests below call this and must keep compiling. It is now a thin wrapper
-/// over the capturing form.
+/// Signature unchanged apart from `provider`: `crates/cli` (via `fetch_usage`)
+/// and the tests below call this and must keep compiling. It is now a thin
+/// wrapper over the capturing form.
 pub async fn fetch_usage_at(
     http: &ReqwestHttp,
+    provider: Provider,
     url: &str,
     access_token: &str,
 ) -> Result<Vec<UsageWindow>, UsageError> {
-    fetch_usage_captured_at(http, url, access_token).await.outcome
+    fetch_usage_captured_at(http, provider, url, access_token)
+        .await
+        .outcome
 }
 
 /// What one fetch produced: the parse outcome, plus the raw body if the
@@ -88,21 +116,30 @@ pub struct CapturedFetch {
 /// `usage`.
 pub async fn fetch_usage_captured_at(
     http: &ReqwestHttp,
+    provider: Provider,
     url: &str,
     access_token: &str,
 ) -> CapturedFetch {
-    let (status, body) = match fetch_usage_body_at(http, url, access_token).await {
+    let (status, body) = match fetch_usage_body_at(http, provider, url, access_token).await {
         Ok(pair) => pair,
-        Err(e) => return CapturedFetch { raw: None, extra: None, outcome: Err(e) },
+        Err(e) => {
+            return CapturedFetch { raw: None, extra: None, outcome: Err(e) };
+        }
     };
     // Captured before parsing, deliberately: the body the debug window most
-    // needs is the one `windows_from_body` is about to reject.
+    // needs is the one the parser below is about to reject.
     let raw = Some(RawResponse::capture(status, &body));
-    CapturedFetch {
-        raw,
-        extra: parse_credit(&body).map(ExtraLine::Credit),
-        outcome: windows_from_body(&body),
-    }
+    let (extra, outcome) = match provider {
+        Provider::Anthropic => (
+            anthropic::parse_credit(&body).map(ExtraLine::Credit),
+            anthropic::parse_usage(&body).map_err(map_parse_error),
+        ),
+        Provider::Openai => (
+            openai::parse_reset_credits(&body).map(ExtraLine::ResetCredits),
+            openai::parse_usage(&body).map_err(map_parse_error),
+        ),
+    };
+    CapturedFetch { raw, extra, outcome }
 }
 
 /// The request half: everything up to and including the 2xx body read.
@@ -112,21 +149,39 @@ pub async fn fetch_usage_captured_at(
 /// this window to make visible, and a hardcoded 200 would hide it.
 async fn fetch_usage_body_at(
     http: &ReqwestHttp,
+    provider: Provider,
     url: &str,
     access_token: &str,
 ) -> Result<(u16, serde_json::Value), UsageError> {
-    let resp = http
-        .raw_client()
-        .get(url)
-        .bearer_auth(access_token)
+    let mut req = http.raw_client().get(url).bearer_auth(access_token);
+    req = match provider {
         // Spec §5.2: this one header only. Nothing that identifies Claude Code.
-        .header("anthropic-beta", ANTHROPIC_BETA)
-        .header("Content-Type", "application/json")
+        Provider::Anthropic => req
+            .header("anthropic-beta", ANTHROPIC_BETA)
+            .header("Content-Type", "application/json"),
+        // Measured: Bearer alone is enough. `ChatGPT-Account-Id` is not
+        // required, `client_version` changes nothing, and no header that
+        // identifies Codex CLI is sent — see docs/research/codex-usage-endpoint.md.
+        Provider::Openai => req.header("Accept", "application/json"),
+    };
+    let resp = req
         .send()
         .await
         .map_err(|e| UsageError::Transport(e.to_string()))?;
 
     let status = resp.status().as_u16();
+
+    // Before the status ladder, not inside it. Who answered decides whether the
+    // status means anything at all: a Cloudflare challenge and an API 403 share
+    // a status code but need opposite handling, and `x-oai-request-id` is the
+    // one signal measured to distinguish them (docs/research/codex-usage-endpoint.md,
+    // "Path selection, and what the 403s mean").
+    if provider == Provider::Openai
+        && !resp.status().is_success()
+        && resp.headers().get("x-oai-request-id").is_none()
+    {
+        return Err(UsageError::EdgeRefused { status });
+    }
 
     if status == 429 {
         // Absence of Retry-After is interpreted as 0 (budget exhausted) — the
@@ -198,25 +253,32 @@ fn is_oauth_not_allowed(body: &serde_json::Value) -> bool {
         == Some("oauth_not_allowed_for_organization")
 }
 
-/// The parsing half, split out so a caller that captured the body can still
-/// classify it.
-fn windows_from_body(body: &serde_json::Value) -> Result<Vec<UsageWindow>, UsageError> {
-    // Written as an exhaustive match, not `.map_err(|_| UsageError::UnknownShape)`:
-    // if `ParseError` ever gains a third variant, this fails to compile until
-    // that variant is given an explicit mapping here, instead of silently
-    // inheriting `UnknownShape` for a case nobody has thought through yet.
-    parse_usage(body).map_err(|e| match e {
+/// Maps a parse failure to the fetch-level error it becomes.
+///
+/// Shared by both providers: `anthropic::parse_usage` and `openai::parse_usage`
+/// return the same `ParseError`, and a window present but unreadable must be
+/// surfaced as an error rather than demoted to a fabricated empty success
+/// (CLAUDE.md: never demote a missing value to 0%) whichever provider produced
+/// it.
+///
+/// Written as an exhaustive match, not `.map_err(|_| UsageError::UnknownShape)`:
+/// if `ParseError` ever gains a third variant, this fails to compile until
+/// that variant is given an explicit mapping here, instead of silently
+/// inheriting `UnknownShape` for a case nobody has thought through yet.
+fn map_parse_error(e: ParseError) -> UsageError {
+    match e {
         ParseError::UnknownShape => UsageError::UnknownShape,
         // A window existed but could not be read — surface it rather than
         // demoting it to 0%.
         ParseError::UnreadableSource => UsageError::UnknownShape,
-    })
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::auth::token::{ReqwestHttp, ANTHROPIC_BETA, USER_AGENT};
+    use crate::provider::Provider;
     use std::sync::{Arc, Mutex};
     use wiremock::matchers::{header, method, path};
     use wiremock::{Mock, MockServer, Request, ResponseTemplate};
@@ -247,7 +309,7 @@ mod tests {
             .await;
 
         let http = ReqwestHttp::new().unwrap();
-        let w = fetch_usage_at(&http, &format!("{}/api/oauth/usage", server.uri()), "tok")
+        let w = fetch_usage_at(&http, Provider::Anthropic, &format!("{}/api/oauth/usage", server.uri()), "tok")
             .await
             .unwrap();
         assert_eq!(w.len(), 1);
@@ -282,7 +344,7 @@ mod tests {
             .await;
 
         let http = ReqwestHttp::new().unwrap();
-        let err = fetch_usage_at(&http, &format!("{}/api/oauth/usage", server.uri()), "tok")
+        let err = fetch_usage_at(&http, Provider::Anthropic, &format!("{}/api/oauth/usage", server.uri()), "tok")
             .await
             .unwrap_err();
         assert!(matches!(err, UsageError::Throttled { retry_after_secs: 42 }));
@@ -299,7 +361,7 @@ mod tests {
             .await;
 
         let http = ReqwestHttp::new().unwrap();
-        let err = fetch_usage_at(&http, &format!("{}/api/oauth/usage", server.uri()), "tok")
+        let err = fetch_usage_at(&http, Provider::Anthropic, &format!("{}/api/oauth/usage", server.uri()), "tok")
             .await
             .unwrap_err();
         assert!(matches!(err, UsageError::Throttled { retry_after_secs: 0 }));
@@ -316,7 +378,7 @@ mod tests {
             .await;
 
         let http = ReqwestHttp::new().unwrap();
-        let err = fetch_usage_at(&http, &format!("{}/api/oauth/usage", server.uri()), "tok")
+        let err = fetch_usage_at(&http, Provider::Anthropic, &format!("{}/api/oauth/usage", server.uri()), "tok")
             .await
             .unwrap_err();
         assert!(matches!(err, UsageError::UnknownShape));
@@ -345,7 +407,7 @@ mod tests {
             .await;
 
         let http = ReqwestHttp::new().unwrap();
-        let err = fetch_usage_at(&http, &format!("{}/api/oauth/usage", server.uri()), "tok")
+        let err = fetch_usage_at(&http, Provider::Anthropic, &format!("{}/api/oauth/usage", server.uri()), "tok")
             .await
             .unwrap_err();
         assert!(matches!(err, UsageError::UnknownShape));
@@ -367,7 +429,7 @@ mod tests {
 
         let http = ReqwestHttp::new().unwrap();
         let got =
-            fetch_usage_captured_at(&http, &format!("{}/api/oauth/usage", server.uri()), "tok")
+            fetch_usage_captured_at(&http, Provider::Anthropic, &format!("{}/api/oauth/usage", server.uri()), "tok")
                 .await;
 
         assert!(matches!(got.outcome, Err(UsageError::UnknownShape)));
@@ -392,7 +454,7 @@ mod tests {
 
         let http = ReqwestHttp::new().unwrap();
         let got =
-            fetch_usage_captured_at(&http, &format!("{}/api/oauth/usage", server.uri()), "tok")
+            fetch_usage_captured_at(&http, Provider::Anthropic, &format!("{}/api/oauth/usage", server.uri()), "tok")
                 .await;
 
         assert!(matches!(got.outcome, Err(UsageError::Throttled { retry_after_secs: 42 })));
@@ -416,7 +478,7 @@ mod tests {
             .await;
 
         let http = ReqwestHttp::new().unwrap();
-        let raw = fetch_usage_captured_at(&http, &format!("{}/api/oauth/usage", server.uri()), "tok")
+        let raw = fetch_usage_captured_at(&http, Provider::Anthropic, &format!("{}/api/oauth/usage", server.uri()), "tok")
             .await
             .raw
             .expect("a 200 body must be captured");
@@ -442,7 +504,7 @@ mod tests {
 
         let http = ReqwestHttp::new().unwrap();
         let got =
-            fetch_usage_captured_at(&http, &format!("{}/api/oauth/usage", server.uri()), "tok")
+            fetch_usage_captured_at(&http, Provider::Anthropic, &format!("{}/api/oauth/usage", server.uri()), "tok")
                 .await;
 
         assert!(got.outcome.is_ok(), "a 202 is still a success on the status ladder");
@@ -458,7 +520,7 @@ mod tests {
             .await;
 
         let http = ReqwestHttp::new().unwrap();
-        let err = fetch_usage_at(&http, &format!("{}/api/oauth/usage", server.uri()), "tok")
+        let err = fetch_usage_at(&http, Provider::Anthropic, &format!("{}/api/oauth/usage", server.uri()), "tok")
             .await
             .unwrap_err();
         assert!(matches!(err, UsageError::Unauthorized));
@@ -493,7 +555,7 @@ mod tests {
             .await;
 
         let http = ReqwestHttp::new().unwrap();
-        let err = fetch_usage_at(&http, &format!("{}/api/oauth/usage", server.uri()), "tok")
+        let err = fetch_usage_at(&http, Provider::Anthropic, &format!("{}/api/oauth/usage", server.uri()), "tok")
             .await
             .unwrap_err();
         assert!(
@@ -518,7 +580,7 @@ mod tests {
             .await;
 
         let http = ReqwestHttp::new().unwrap();
-        let err = fetch_usage_at(&http, &format!("{}/api/oauth/usage", server.uri()), "tok")
+        let err = fetch_usage_at(&http, Provider::Anthropic, &format!("{}/api/oauth/usage", server.uri()), "tok")
             .await
             .unwrap_err();
         assert!(matches!(err, UsageError::Unauthorized), "got {err:?}");
@@ -535,7 +597,7 @@ mod tests {
             .await;
 
         let http = ReqwestHttp::new().unwrap();
-        let err = fetch_usage_at(&http, &format!("{}/api/oauth/usage", server.uri()), "tok")
+        let err = fetch_usage_at(&http, Provider::Anthropic, &format!("{}/api/oauth/usage", server.uri()), "tok")
             .await
             .unwrap_err();
         assert!(matches!(err, UsageError::Unauthorized), "got {err:?}");
@@ -566,5 +628,114 @@ mod tests {
         );
 
         assert!(!is_oauth_not_allowed(&serde_json::Value::Null));
+    }
+
+    /// Measured 2026-08-03: `/backend-api/codex/usage` answers 403 with an HTML
+    /// body, `server-timing: chlray`, and **no `x-oai-request-id`**. That is
+    /// Cloudflare, not the API.
+    ///
+    /// Classifying it as an auth failure marks a healthy account AUTH_DEAD and
+    /// sends the user to a re-login that will be refused identically.
+    /// Classifying it as a throttle waits for a recovery that never comes.
+    #[tokio::test]
+    async fn an_edge_403_is_not_an_auth_failure_and_not_a_throttle() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .respond_with(
+                ResponseTemplate::new(403)
+                    .set_body_string(include_str!("fixtures/openai_edge_403.html"))
+                    .insert_header("content-type", "text/html; charset=UTF-8"),
+            )
+            .mount(&server)
+            .await;
+
+        let http = ReqwestHttp::new().unwrap();
+        let got = fetch_usage_captured_at(&http, Provider::Openai, &server.uri(), "t").await;
+
+        match got.outcome {
+            Err(UsageError::EdgeRefused { status: 403 }) => {}
+            other => panic!("an edge challenge was classified as {other:?}"),
+        }
+    }
+
+    /// The same 403 carrying `x-oai-request-id` *is* the API talking, and must
+    /// go down the ordinary status ladder.
+    #[tokio::test]
+    async fn a_403_from_the_backend_is_classified_normally() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .respond_with(
+                ResponseTemplate::new(403)
+                    .set_body_string(r#"{"error":{"message":"nope"}}"#)
+                    .insert_header("content-type", "application/json")
+                    .insert_header("x-oai-request-id", "req-1"),
+            )
+            .mount(&server)
+            .await;
+
+        let http = ReqwestHttp::new().unwrap();
+        let got = fetch_usage_captured_at(&http, Provider::Openai, &server.uri(), "t").await;
+        assert!(
+            !matches!(got.outcome, Err(UsageError::EdgeRefused { .. })),
+            "a backend answer was mistaken for an edge block"
+        );
+    }
+
+    /// CLAUDE.md: `anthropic-beta` identifies our Anthropic integration and has
+    /// no meaning at OpenAI. Sending it there is at best noise and at worst a
+    /// fingerprint.
+    #[tokio::test]
+    async fn the_openai_request_carries_no_anthropic_header_and_an_honest_ua() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(header("user-agent", USER_AGENT))
+            .and(wiremock::matchers::header_regex("user-agent", "^quota-board/"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_string(include_str!("fixtures/openai_plus_zero.json"))
+                    .insert_header("x-oai-request-id", "req-1"),
+            )
+            .mount(&server)
+            .await;
+
+        let http = ReqwestHttp::new().unwrap();
+        let got = fetch_usage_captured_at(&http, Provider::Openai, &server.uri(), "t").await;
+        let windows = got.outcome.expect("the mock only matches an honest UA");
+        assert_eq!(windows.len(), 1);
+
+        // The absence has to be asserted positively: a mock that merely does not
+        // match on the header would pass whether or not it was sent.
+        let sent = &server.received_requests().await.unwrap()[0];
+        assert!(
+            sent.headers.get("anthropic-beta").is_none(),
+            "anthropic-beta was sent to an OpenAI endpoint"
+        );
+        assert!(
+            sent.headers.get("originator").is_none(),
+            "an originator header claiming to be Codex CLI was sent"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_openai_body_yields_its_reset_credits_as_the_extra_line() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_string(include_str!("fixtures/openai_plus_zero.json"))
+                    .insert_header("x-oai-request-id", "req-1"),
+            )
+            .mount(&server)
+            .await;
+
+        let http = ReqwestHttp::new().unwrap();
+        let got = fetch_usage_captured_at(&http, Provider::Openai, &server.uri(), "t").await;
+        match got.extra {
+            Some(ExtraLine::ResetCredits(r)) => {
+                assert_eq!(r.available, 1);
+                assert_eq!(r.applicable, 0);
+            }
+            other => panic!("expected reset credits, got {other:?}"),
+        }
     }
 }
