@@ -35,8 +35,12 @@ const two: AccountView[] = [
     state: { kind: 'loading' },
   },
   {
+    // A different provider from the row above on purpose: a test that gave
+    // both rows the same provider could not tell "the right provider was
+    // forwarded" from "some provider was forwarded" — see the assertion
+    // below.
     account_id: 'uuid-home',
-    provider: 'anthropic',
+    provider: 'openai',
     label: 'home',
     email: 'home@example.com',
     state: { kind: 'loading' },
@@ -45,26 +49,28 @@ const two: AccountView[] = [
 
 describe('Widget refresh', () => {
   /**
-   * The account_id, never the index and never the label: CLAUDE.md makes the
-   * pair the primary key, and both other candidates are wrong here — labels
-   * are user-editable and may be duplicated, and `usage://updated` replaces
-   * the whole array so an index captured at render time goes stale. Asserting
-   * on the *second* row is what makes a hard-wired first id fail.
+   * The (account_id, provider) pair, never the index and never the label:
+   * CLAUDE.md makes the pair the primary key, and both other candidates are
+   * wrong here — labels are user-editable and may be duplicated, and
+   * `usage://updated` replaces the whole array so an index captured at render
+   * time goes stale. Asserting on the *second* row is what makes a hard-wired
+   * first id fail.
    */
-  it('asks to refresh the row that was clicked', () => {
-    const refreshed: string[] = []
-    // A block body, not `(uuid) => refreshed.push(uuid)`: `onRefresh` returns
-    // `void | Promise<void>` because `AccountRow` awaits it, and that union
-    // does not get the return-value-ignoring latitude a bare `void` would.
+  it('asks to refresh the row that was clicked, by its own id and provider', () => {
+    const refreshed: Array<[string, string]> = []
+    // A block body, not `(uuid, provider) => refreshed.push(...)`: `onRefresh`
+    // returns `void | Promise<void>` because `AccountRow` awaits it, and that
+    // union does not get the return-value-ignoring latitude a bare `void`
+    // would.
     render(Widget, {
       accounts: two,
       warning: null,
-      onRefresh: (uuid: string) => {
-        refreshed.push(uuid)
+      onRefresh: (uuid: string, provider: string) => {
+        refreshed.push([uuid, provider])
       },
     })
     screen.getAllByRole('button', { name: 'Refresh now' })[1].click()
-    expect(refreshed).toEqual(['uuid-home'])
+    expect(refreshed).toEqual([['uuid-home', 'openai']])
   })
 
   it('gives every row its own button', () => {

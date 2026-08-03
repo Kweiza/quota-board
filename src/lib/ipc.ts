@@ -83,8 +83,8 @@ export const setWidgetVisible = (visible: boolean): Promise<void> =>
 export const onUsageUpdated = (fn: () => void): Promise<UnlistenFn> =>
   listen('usage://updated', fn)
 
-export const refreshAccount = (uuid: string): Promise<AccountState> =>
-  invoke('refresh_account', { uuid })
+export const refreshAccount = (uuid: string, provider: Provider): Promise<AccountState> =>
+  invoke('refresh_account', { uuid, provider })
 
 /** §10.3's flow, for whichever provider the user pressed the button for. */
 export const beginLogin = (provider: Provider): Promise<LoginUrls> =>
