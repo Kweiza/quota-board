@@ -314,7 +314,7 @@ struct Entry {
     ///
     /// Deliberately absent from `CachedSnapshot`: a credit figure carries no
     /// reset date (measured — the endpoint has none, see
-    /// `usage::parse::parse_credit`), so a snapshot restored across a month
+    /// `usage::anthropic::parse_credit`), so a snapshot restored across a month
     /// boundary would show last month's spend as this month's with no way to
     /// tell. Windows can be filtered on `resets_at`; this cannot, so it is not
     /// persisted at all and reappears on the first poll instead.

@@ -33,7 +33,7 @@ pub struct CreditSpend {
     pub exponent: u32,
     /// `used_minor / limit_minor` as a percentage. **Not the endpoint's own
     /// `spend.percent`**, and that is a deliberate divergence — see
-    /// `usage::parse::parse_credit`, which carries the measurement.
+    /// `usage::anthropic::parse_credit`, which carries the measurement.
     ///
     /// **May exceed 100.** Spending past the limit is exactly what this line
     /// exists to show, so no clamp happens here; the bar clamps when it draws.
