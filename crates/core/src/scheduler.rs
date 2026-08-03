@@ -157,6 +157,16 @@ pub struct PollPolicy {
 
 impl PollPolicy {
     /// Spec §6.1. This floor is set by the 429 throttle, not by cost.
+    ///
+    /// **This is the global clamp on the user-configurable interval, not the
+    /// per-account floor.** They happen to share Anthropic's value because
+    /// this constant predates a second provider existing at all. The
+    /// per-account floor a specific entry is actually held to is
+    /// `Provider::min_interval_secs`, read off that entry — see
+    /// `effective_interval`. A provider added later with a floor above this
+    /// constant is still enforced correctly; one added with a floor below it
+    /// is not reachable, because this clamp would raise the user's interval
+    /// past it regardless.
     pub const MIN_INTERVAL_SECS: i64 = 180;
     /// How long to back off after a `Retry-After: 0` (budget exhausted).
     ///
