@@ -4,6 +4,7 @@
   import { openUrl } from '@tauri-apps/plugin-opener'
   import AccountList from './AccountList.svelte'
   import { queriesPerDay } from '../lib/format'
+  import { accountKey } from '../lib/types'
   import {
     accountsWarning,
     beginLogin,
@@ -29,6 +30,7 @@
     AutostartView,
     LoginUrls,
     ManualFallback,
+    Provider,
     RawResponse,
     SettingsView,
     StoreStatus,
@@ -48,11 +50,14 @@
   let accounts: AccountView[] = []
   let error: string | null = null
   /**
-   * §6.4's refusal, per account: uuid → the instant a manual refresh may next
-   * fire. Not in `error`, because that banner is `warn` and reports failures —
-   * a refusal is §6.2's server-ordered wait being obeyed, which is the rate
-   * limiter working, and it is per-account, which a single line above the list
-   * cannot express.
+   * §6.4's refusal, per account: `accountKey(account_id, provider)` → the
+   * instant a manual refresh may next fire. Keyed by the pair, not the bare
+   * id — two accounts sharing an id under different providers must not share
+   * one refusal note, the same reason `AccountList`'s `{#each}` keys by the
+   * pair. Not in `error`, because that banner is `warn` and reports
+   * failures — a refusal is §6.2's server-ordered wait being obeyed, which is
+   * the rate limiter working, and it is per-account, which a single line
+   * above the list cannot express.
    *
    * **Only the server refuses now.** §6.1's client-side floor used to refuse
    * presses as well and was by far the commoner cause of this note; §6.4
@@ -80,28 +85,30 @@
   /** Fires once per live note, at its own `until`, and removes just that one. */
   let expiryTimers: Record<string, ReturnType<typeof setTimeout>> = {}
 
-  function forgetThrottle(uuid: string): void {
-    clearTimeout(expiryTimers[uuid])
-    delete expiryTimers[uuid]
-    if (!(uuid in throttledUntil)) return
+  /** `key` is `accountKey(account_id, provider)`, never the bare id alone. */
+  function forgetThrottle(key: string): void {
+    clearTimeout(expiryTimers[key])
+    delete expiryTimers[key]
+    if (!(key in throttledUntil)) return
     const next = { ...throttledUntil }
-    delete next[uuid]
+    delete next[key]
     throttledUntil = next
   }
 
-  function rememberThrottle(uuid: string, until: string): void {
-    clearTimeout(expiryTimers[uuid])
+  /** `key` is `accountKey(account_id, provider)`, never the bare id alone. */
+  function rememberThrottle(key: string, until: string): void {
+    clearTimeout(expiryTimers[key])
     const next = { ...throttledUntil }
-    next[uuid] = until
+    next[key] = until
     throttledUntil = next
     // `setTimeout` saturates above ~24.8 days; an `until` that far out would
     // fire immediately and retire a note that is still true. `record_throttle`
     // caps every wait at one hour, so this only guards a malformed value.
     const ms = new Date(until).getTime() - Date.now()
     if (Number.isFinite(ms) && ms > 0 && ms < 2_147_483_647) {
-      expiryTimers[uuid] = setTimeout(() => forgetThrottle(uuid), ms)
+      expiryTimers[key] = setTimeout(() => forgetThrottle(key), ms)
     } else {
-      forgetThrottle(uuid)
+      forgetThrottle(key)
     }
   }
 
@@ -145,6 +152,7 @@
   let passphrase = ''
   let busy = false
 
+  /** `accountKey(account_id, provider)` of the `<option>` picked, or `''`. */
   let selected = ''
   let captured: RawResponse | null = null
   /**
@@ -153,8 +161,9 @@
    * "loaded, and the answer was null", and collapsing the two tells the user an
    * account has never polled before they have pressed anything — the
    * confidently-wrong display CLAUDE.md calls this product's worst failure
-   * mode. Keying it by uuid rather than using a bare boolean also drops a body
-   * belonging to the previously selected account.
+   * mode. Keying it by the same `accountKey` as `selected`, rather than using
+   * a bare boolean, also drops a body belonging to the previously selected
+   * account.
    */
   let loadedFor: string | null = null
   $: loaded = selected !== '' && loadedFor === selected
@@ -169,13 +178,15 @@
       // Retire notes for accounts that are gone. `account_id` is stable across
       // a rename (§9.3), so removing an account and adding the same one back
       // reuses it — without this, a refusal from an earlier session reappears
-      // on a fresh row, quoting a wall clock the user never saw.
+      // on a fresh row, quoting a wall clock the user never saw. Reconciled by
+      // the pair, not the bare id: two accounts sharing an id under different
+      // providers must not retire each other's notes.
       // Only on a successful read: the `catch` below deliberately keeps the
       // last good list, and reconciling against a list we failed to fetch would
       // clear every note instead.
-      const live = new Set(accounts.map((a) => a.account_id))
+      const live = new Set(accounts.map((a) => accountKey(a.account_id, a.provider)))
       Object.keys(throttledUntil)
-        .filter((uuid) => !live.has(uuid))
+        .filter((key) => !live.has(key))
         .forEach(forgetThrottle)
     } catch (e) {
       // A failed read is not a reason to blank the list; the widget branch of
@@ -352,18 +363,20 @@
     }
   }
 
-  // `AccountList` reports a click by account_id alone (it never learns the
-  // provider), so every handler below resolves it here from `accounts` — the
-  // one place both halves of the key (§9.3) are already in hand.
-  function rename(uuid: string, label: string): void {
-    const current = accounts.find((a) => a.account_id === uuid)
+  // `AccountList` now reports both halves of the key on every click (§9.3),
+  // so none of the handlers below need to search `accounts` to recover the
+  // provider — searching by id alone is exactly the ambiguity that made
+  // pressing Remove/Rename/Refresh on the second of two same-id accounts act
+  // on the first one instead.
+  function rename(uuid: string, provider: Provider, label: string): void {
+    const current = accounts.find((a) => a.account_id === uuid && a.provider === provider)
     // Every blur fires this handler, including one that changed nothing.
     if (current === undefined || current.label === label) return
-    void guard(() => renameAccount(uuid, current.provider, label))
+    void guard(() => renameAccount(uuid, provider, label))
   }
 
-  function move(uuid: string, delta: number): void {
-    const from = accounts.findIndex((a) => a.account_id === uuid)
+  function move(uuid: string, provider: Provider, delta: number): void {
+    const from = accounts.findIndex((a) => a.account_id === uuid && a.provider === provider)
     const to = from + delta
     if (from < 0 || to < 0 || to >= accounts.length) return
     // The command takes the whole rearranged array, not a pair: `reorder`
@@ -373,13 +386,12 @@
     void guard(() => reorderAccounts(keys))
   }
 
-  function refresh(uuid: string): void {
-    const current = accounts.find((a) => a.account_id === uuid)
-    if (current === undefined) return
+  function refresh(uuid: string, provider: Provider): void {
+    const key = accountKey(uuid, provider)
     // `refresh_account` emits `usage://updated`, which only the widget listens
     // for, so this window re-reads the list itself.
     void guard(async () => {
-      const state = await refreshAccount(uuid, current.provider)
+      const state = await refreshAccount(uuid, provider)
       // Observed: "Refresh now does not work — the capture time never
       // changes." The cause then was §6.1's client-side floor, which §6.4 has
       // since dropped; what remains is §6.2's server-ordered wait, and §6.4
@@ -392,8 +404,8 @@
       // Both helpers assign a fresh object rather than mutating: legacy-mode
       // reactivity is driven by the assignment, so an in-place write would not
       // repaint.
-      if (state.kind === 'throttled') rememberThrottle(uuid, state.until)
-      else forgetThrottle(uuid)
+      if (state.kind === 'throttled') rememberThrottle(key, state.until)
+      else forgetThrottle(key)
       await pullAccounts()
     })
   }
@@ -433,10 +445,14 @@
 
   async function reloadRaw(): Promise<void> {
     if (selected === '') return
-    const uuid = selected
+    // `selected` is the composite key (§9.3); recover the pair `last_response`
+    // actually needs from the same `accounts` list the `<select>` was built
+    // from, rather than trying to parse the key back apart.
+    const current = accounts.find((a) => accountKey(a.account_id, a.provider) === selected)
+    if (current === undefined) return
     try {
-      captured = await lastResponse(uuid)
-      loadedFor = uuid
+      captured = await lastResponse(current.account_id, current.provider)
+      loadedFor = selected
       error = null
     } catch (e) {
       error = String(e)
@@ -462,10 +478,7 @@
   <section>
     <h2>Accounts</h2>
     <AccountList {accounts} {throttledUntil}
-                 onRemove={(uuid) => {
-                   const current = accounts.find((a) => a.account_id === uuid)
-                   if (current) void guard(() => removeAccount(uuid, current.provider))
-                 }}
+                 onRemove={(uuid, provider) => void guard(() => removeAccount(uuid, provider))}
                  onRename={rename} onMove={move} onRefresh={refresh} />
     {#if accounts.length === 0}
       <p class="hint">No accounts yet.</p>
@@ -633,8 +646,8 @@
     <label for="debug-account">Account</label>
     <select id="debug-account" bind:value={selected}>
       <option value="">—</option>
-      {#each accounts as a (a.account_id)}
-        <option value={a.account_id}>{a.label} ({a.email})</option>
+      {#each accounts as a (accountKey(a.account_id, a.provider))}
+        <option value={accountKey(a.account_id, a.provider)}>{a.label} ({a.email})</option>
       {/each}
     </select>
     <button on:click={reloadRaw}>Reload</button>

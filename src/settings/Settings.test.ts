@@ -4,6 +4,7 @@ import { clearMocks, mockIPC } from '@tauri-apps/api/mocks'
 import { tick } from 'svelte'
 import { afterEach, describe, expect, it } from 'vitest'
 import Settings from './Settings.svelte'
+import { accountKey } from '../lib/types'
 import type {
   AccountState,
   AccountView,
@@ -507,15 +508,19 @@ describe('Settings token store', () => {
 })
 
 describe('Settings debug panel', () => {
+  // `<option value>` is `accountKey(account_id, provider)` (§9.3), not the
+  // bare id — every account fixture in this file is `'anthropic'`, so that is
+  // the provider half here.
   const selectAccount = async (uuid: string): Promise<void> => {
+    const key = accountKey(uuid, 'anthropic')
     const select = (await screen.findByLabelText('Account')) as HTMLSelectElement
     // The options only exist after the awaited `list_accounts` resolves, and
     // assigning a value with no matching `<option>` is silently dropped — the
     // "nothing selected" branch would then render and a named assertion would
     // pass against the wrong thing.
     await waitFor(() => expect(select.options.length).toBe(two.length + 1))
-    await fireEvent.change(select, { target: { value: uuid } })
-    expect(select.value).toBe(uuid)
+    await fireEvent.change(select, { target: { value: key } })
+    expect(select.value).toBe(key)
   }
 
   it('an account with no retained body says so instead of rendering empty', async () => {
@@ -560,6 +565,45 @@ describe('Settings debug panel', () => {
     await fireEvent.click(screen.getByRole('button', { name: 'Reload' }))
     expect(await screen.findByText(/truncated at 64 KiB/)).toBeTruthy()
     expect(screen.getByText('{"five_hour":{"utilization":41}}')).toBeTruthy()
+  })
+
+  /**
+   * The actual collision `accountKey` exists for: two accounts sharing an id
+   * under different providers. Keying the `<option>` `{#each}` by
+   * `a.account_id` alone would make Svelte throw `each_key_duplicate` at
+   * render time — this test's `render()` call is where that would surface —
+   * and reloading the Codex option must send `last_response` *its* provider,
+   * not silently resolve to whichever account the bare id matches first.
+   */
+  it('offers two distinct options, and reloads with the selected one\'s own provider, for accounts sharing an id', async () => {
+    const claude: AccountView = {
+      account_id: 'same-id',
+      provider: 'anthropic',
+      label: 'Claude',
+      email: 'claude@example.com',
+      state: { kind: 'loading' },
+    }
+    const codex: AccountView = {
+      account_id: 'same-id',
+      provider: 'openai',
+      label: 'Codex',
+      email: 'codex@example.com',
+      state: { kind: 'loading' },
+    }
+    const calls = mockBackend({ accounts: [claude, codex], raw: null })
+    render(Settings)
+
+    const select = (await screen.findByLabelText('Account')) as HTMLSelectElement
+    await waitFor(() => expect(select.options.length).toBe(3))
+    const values = Array.from(select.options, (o) => o.value)
+    expect(new Set(values).size).toBe(3)
+
+    await fireEvent.change(select, { target: { value: accountKey('same-id', 'openai') } })
+    await fireEvent.click(screen.getByRole('button', { name: 'Reload' }))
+
+    await waitFor(() => expect(calls.some((c) => c.cmd === 'last_response')).toBe(true))
+    const sent = calls.find((c) => c.cmd === 'last_response')
+    expect(sent?.args).toEqual({ uuid: 'same-id', provider: 'openai' })
   })
 })
 

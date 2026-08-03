@@ -77,4 +77,32 @@ describe('Widget refresh', () => {
     render(Widget, { accounts: two, warning: null })
     expect(screen.getAllByRole('button', { name: 'Refresh now' })).toHaveLength(2)
   })
+
+  /**
+   * The actual collision the (provider, account_id) key exists for: two
+   * accounts sharing the same id. Keying the `{#each}` by `a.account_id`
+   * alone would make Svelte throw `each_key_duplicate` at render time — not
+   * merely mis-render, crash — so this test's `render()` call itself is
+   * where a regression would show up, before any assertion runs.
+   */
+  it('renders two accounts sharing an id under different providers without a duplicate-key crash', () => {
+    const sameId: AccountView[] = [
+      {
+        account_id: 'same-id',
+        provider: 'anthropic',
+        label: 'claude',
+        email: 'claude@example.com',
+        state: { kind: 'loading' },
+      },
+      {
+        account_id: 'same-id',
+        provider: 'openai',
+        label: 'codex',
+        email: 'codex@example.com',
+        state: { kind: 'loading' },
+      },
+    ]
+    render(Widget, { accounts: sameId, warning: null })
+    expect(screen.getAllByRole('button', { name: 'Refresh now' })).toHaveLength(2)
+  })
 })

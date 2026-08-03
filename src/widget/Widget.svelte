@@ -2,6 +2,7 @@
   import { onDestroy } from 'svelte'
   import AccountRow from './AccountRow.svelte'
   import { enableDrag } from '../lib/ipc'
+  import { accountKey } from '../lib/types'
   import type { AccountView, Provider } from '../lib/types'
 
   export let accounts: AccountView[] = []
@@ -40,7 +41,7 @@
   <div class="titlebar">
     <button class="gear" title="Settings" on:click={onOpenSettings}>⚙</button>
   </div>
-  {#each accounts as a (a.account_id)}
+  {#each accounts as a (accountKey(a.account_id, a.provider))}
     <AccountRow
       account={a}
       {now}

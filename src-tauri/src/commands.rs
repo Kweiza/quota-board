@@ -665,7 +665,7 @@ pub(crate) async fn remove_account_for(
     {
         eprintln!("{uuid}: the cached snapshot could not be removed: {e}");
     }
-    state.forget_raw(uuid);
+    state.forget_raw(provider, uuid);
 
     Ok(())
 }
@@ -955,8 +955,9 @@ pub async fn set_settings(
 pub async fn last_response(
     state: State<'_, AppState>,
     uuid: String,
+    provider: Provider,
 ) -> Result<Option<RawResponse>, String> {
-    Ok(state.last_raw_for(&uuid))
+    Ok(state.last_raw_for(provider, &uuid))
 }
 
 #[cfg(test)]
@@ -1359,6 +1360,35 @@ mod tests {
         assert!(
             anthropic_server.received_requests().await.unwrap().is_empty(),
             "a Codex refresh token was sent to Anthropic's revoke endpoint"
+        );
+    }
+
+    /// §9.3 again, one layer up from `usage::raw::RawLog`'s own pair-key test:
+    /// `remove_account_for` must forget only the (provider, id) pair it was
+    /// given. Mutating its `forget_raw` call back to a bare id — or to
+    /// `Provider::Anthropic` — would delete the Anthropic account's debug
+    /// capture when the Openai twin sharing its id is removed instead.
+    #[tokio::test]
+    async fn removing_a_codex_account_does_not_forget_the_anthropic_accounts_raw_capture() {
+        let state = app_state(Arc::new(MemoryStore::default()));
+        add_openai_twin_of_a(&state).await;
+
+        let v = serde_json::json!({ "five_hour": null });
+        {
+            let mut log = state.last_raw.lock().unwrap();
+            log.record(Provider::Anthropic, "a", RawResponse::capture(200, &v));
+            log.record(Provider::Openai, "a", RawResponse::capture(200, &v));
+        }
+
+        remove_account_for(&state, Provider::Openai, "a").await.unwrap();
+
+        assert!(
+            state.last_raw_for(Provider::Anthropic, "a").is_some(),
+            "removing the Openai twin erased the Anthropic account's raw capture"
+        );
+        assert!(
+            state.last_raw_for(Provider::Openai, "a").is_none(),
+            "the removed Openai account's raw capture was not forgotten"
         );
     }
 }

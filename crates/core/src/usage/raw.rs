@@ -9,6 +9,7 @@
 //! shipped twice in this repository, so the masking must sit where it can be
 //! back-tested.
 
+use crate::provider::Provider;
 use chrono::{DateTime, Utc};
 use serde::Serialize;
 use serde_json::Value;
@@ -82,10 +83,21 @@ impl RawResponse {
     }
 }
 
+/// Same shape as `scheduler::EntryKey` and `snapshots::cache_key`: the primary
+/// key is the pair, never the bare id alone (§9.3), or two accounts sharing an
+/// id across providers would share one raw slot — each poll overwriting the
+/// other's capture, and the debug panel showing whichever landed last
+/// regardless of the row selected.
+type RawKey = (Provider, String);
+
+fn raw_key(provider: Provider, uuid: &str) -> RawKey {
+    (provider, uuid.to_string())
+}
+
 /// The last response per account, bounded on both axes.
 #[derive(Debug, Default)]
 pub struct RawLog {
-    entries: HashMap<String, RawResponse>,
+    entries: HashMap<RawKey, RawResponse>,
 }
 
 impl RawLog {
@@ -93,33 +105,33 @@ impl RawLog {
     ///
     /// **There is no entry cap, deliberately.** The key set is a subset of the
     /// registered accounts — `record` is only ever reached from `poll_claimed`
-    /// with a uuid the scheduler owns — and `remove` is called when an account
-    /// is deleted, so the map's size is the account count and nothing else.
-    /// `snapshots` (crates/core/src/snapshots.rs:73-86) is the same shape for
-    /// the same reason and has no cap either. An arbitrary cap with eviction
-    /// was measured to be worse than the leak it prevents: with 20 accounts and
-    /// a cap of 16, four accounts read "no response captured yet" forever
-    /// despite polling successfully every cycle — a confidently wrong display,
-    /// and design.md:531 puts **no limit on account count**. The real bound is
-    /// [`MAX_BODY_BYTES`] per entry.
-    pub fn record(&mut self, uuid: &str, resp: RawResponse) {
-        self.entries.insert(uuid.to_string(), resp);
+    /// with a (provider, uuid) pair the scheduler owns — and `remove` is
+    /// called when an account is deleted, so the map's size is the account
+    /// count and nothing else. `snapshots` (crates/core/src/snapshots.rs:73-86)
+    /// is the same shape for the same reason and has no cap either. An
+    /// arbitrary cap with eviction was measured to be worse than the leak it
+    /// prevents: with 20 accounts and a cap of 16, four accounts read "no
+    /// response captured yet" forever despite polling successfully every
+    /// cycle — a confidently wrong display, and design.md:531 puts **no limit
+    /// on account count**. The real bound is [`MAX_BODY_BYTES`] per entry.
+    pub fn record(&mut self, provider: Provider, uuid: &str, resp: RawResponse) {
+        self.entries.insert(raw_key(provider, uuid), resp);
     }
 
     /// `None` means "nothing captured for this account yet". **Callers must
     /// render that as its own state**, never as an empty body — CLAUDE.md's
     /// "never demote a missing value" applies to a debug view exactly as it
     /// applies to a percentage.
-    pub fn get(&self, uuid: &str) -> Option<&RawResponse> {
-        self.entries.get(uuid)
+    pub fn get(&self, provider: Provider, uuid: &str) -> Option<&RawResponse> {
+        self.entries.get(&raw_key(provider, uuid))
     }
 
     /// Drops one account's entry. Called when an account is deleted, beside
     /// `snapshots::remove` — a deleted account's body must not be readable
-    /// afterwards, and a uuid that is deleted and re-added must not show the
-    /// body from before the deletion.
-    pub fn remove(&mut self, uuid: &str) {
-        self.entries.remove(uuid);
+    /// afterwards, and a (provider, uuid) pair that is deleted and re-added
+    /// must not show the body from before the deletion.
+    pub fn remove(&mut self, provider: Provider, uuid: &str) {
+        self.entries.remove(&raw_key(provider, uuid));
     }
 
     pub fn len(&self) -> usize {
@@ -545,10 +557,10 @@ mod tests {
     #[test]
     fn recording_the_same_account_twice_replaces_rather_than_grows() {
         let mut log = RawLog::default();
-        log.record("a", at(0));
-        log.record("a", at(1));
+        log.record(Provider::Anthropic, "a", at(0));
+        log.record(Provider::Anthropic, "a", at(1));
         assert_eq!(log.len(), 1);
-        assert_eq!(log.get("a").unwrap().body(), "body-1");
+        assert_eq!(log.get(Provider::Anthropic, "a").unwrap().body(), "body-1");
     }
 
     /// The log holds one entry per account and `remove` is the only way out.
@@ -561,24 +573,33 @@ mod tests {
         let v = serde_json::json!({ "five_hour": null });
         for _cycle in 0..3 {
             for i in 0..20 {
-                log.record(&format!("uuid-{i}"), RawResponse::capture(200, &v));
+                log.record(Provider::Anthropic, &format!("uuid-{i}"), RawResponse::capture(200, &v));
             }
         }
         assert_eq!(log.len(), 20, "an account that polled lost its entry");
         for i in 0..20 {
-            assert!(log.get(&format!("uuid-{i}")).is_some(), "uuid-{i} was evicted");
+            assert!(
+                log.get(Provider::Anthropic, &format!("uuid-{i}")).is_some(),
+                "uuid-{i} was evicted"
+            );
         }
     }
 
     #[test]
     fn removing_an_account_drops_its_capture() {
         let mut log = RawLog::default();
-        log.record("a", at(0));
-        log.record("b", at(1));
-        log.remove("a");
-        assert!(log.get("a").is_none(), "a deleted account's body must not stay readable");
-        assert!(log.get("b").is_some(), "removing one account must not drop the others");
-        log.remove("never-there");
+        log.record(Provider::Anthropic, "a", at(0));
+        log.record(Provider::Anthropic, "b", at(1));
+        log.remove(Provider::Anthropic, "a");
+        assert!(
+            log.get(Provider::Anthropic, "a").is_none(),
+            "a deleted account's body must not stay readable"
+        );
+        assert!(
+            log.get(Provider::Anthropic, "b").is_some(),
+            "removing one account must not drop the others"
+        );
+        log.remove(Provider::Anthropic, "never-there");
         assert_eq!(log.len(), 1, "removing an unknown uuid must be a no-op");
     }
 
@@ -587,7 +608,28 @@ mod tests {
     #[test]
     fn an_account_with_no_capture_reads_as_absent_not_as_an_empty_body() {
         let log = RawLog::default();
-        assert!(log.get("never-polled").is_none());
+        assert!(log.get(Provider::Anthropic, "never-polled").is_none());
+    }
+
+    /// §9.3: the primary key is the pair, not the bare id. Two accounts
+    /// sharing an id across providers must not share a raw slot — otherwise
+    /// each poll overwrites the other's capture, and `remove`ing one deletes
+    /// both.
+    #[test]
+    fn two_providers_sharing_an_id_keep_separate_captures() {
+        let mut log = RawLog::default();
+        log.record(Provider::Anthropic, "same-id", at(0));
+        log.record(Provider::Openai, "same-id", at(1));
+        assert_eq!(log.len(), 2, "the two providers' captures collapsed into one");
+        assert_eq!(log.get(Provider::Anthropic, "same-id").unwrap().body(), "body-0");
+        assert_eq!(log.get(Provider::Openai, "same-id").unwrap().body(), "body-1");
+
+        log.remove(Provider::Openai, "same-id");
+        assert!(
+            log.get(Provider::Anthropic, "same-id").is_some(),
+            "removing the Openai account's capture removed the Anthropic one sharing its id"
+        );
+        assert!(log.get(Provider::Openai, "same-id").is_none());
     }
 
     /// docs/design.md:266-270 (§5.5) names `spend{}`, `extra_usage{}` and
