@@ -17,6 +17,7 @@ import {
   setWidgetVisible,
 } from './lib/ipc'
 import { widgetProps } from './lib/props.svelte'
+import type { Provider } from './lib/types'
 
 /** docs/design.md §8.1: "Fixed width of about 280px; height follows content." */
 const WIDGET_WIDTH = 280
@@ -87,9 +88,9 @@ if (isSettingsWindow()) {
   // button disabled for the duration, and the press can wait on §6.1's global
   // permit. A failure is logged and swallowed — never allowed to reject into
   // the row, which would leave the button disabled forever.
-  widgetProps.onRefresh = async (uuid: string) => {
+  widgetProps.onRefresh = async (uuid: string, provider: Provider) => {
     try {
-      await refreshAccount(uuid)
+      await refreshAccount(uuid, provider)
     } catch (e) {
       console.error('quota-board: refresh_account failed', e)
     }

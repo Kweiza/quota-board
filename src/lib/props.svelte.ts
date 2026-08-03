@@ -1,4 +1,4 @@
-import type { AccountView } from './types'
+import type { AccountView, Provider } from './types'
 
 export interface WidgetProps {
   accounts: AccountView[]
@@ -14,9 +14,11 @@ export interface WidgetProps {
   /**
    * Returns a promise so `AccountRow` can disable its own button until the
    * refresh settles — the press waits for §6.1's global permit, so it is not
-   * instantaneous.
+   * instantaneous. `provider` is the other half of the primary key (§9.3):
+   * `refresh_account` needs it to act on the row actually pressed rather than
+   * on whichever provider's account happens to share its id.
    */
-  onRefresh: (uuid: string) => void | Promise<void>
+  onRefresh: (uuid: string, provider: Provider) => void | Promise<void>
 }
 
 /**

@@ -374,10 +374,12 @@
   }
 
   function refresh(uuid: string): void {
+    const current = accounts.find((a) => a.account_id === uuid)
+    if (current === undefined) return
     // `refresh_account` emits `usage://updated`, which only the widget listens
     // for, so this window re-reads the list itself.
     void guard(async () => {
-      const state = await refreshAccount(uuid)
+      const state = await refreshAccount(uuid, current.provider)
       // Observed: "Refresh now does not work — the capture time never
       // changes." The cause then was §6.1's client-side floor, which §6.4 has
       // since dropped; what remains is §6.2's server-ordered wait, and §6.4

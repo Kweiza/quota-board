@@ -2,7 +2,7 @@
   import { onDestroy } from 'svelte'
   import AccountRow from './AccountRow.svelte'
   import { enableDrag } from '../lib/ipc'
-  import type { AccountView } from '../lib/types'
+  import type { AccountView, Provider } from '../lib/types'
 
   export let accounts: AccountView[] = []
   export let warning: string | null = null
@@ -15,10 +15,14 @@
   // owns the re-login (`begin_login`) and the unlock prompt (`unlock_secrets`).
   export let onRelogin: (uuid: string) => void = () => {}
   export let onUnlock: (uuid: string) => void = () => {}
-  // §6.4's manual refresh. Same keying rule as the two above — uuid, never the
-  // index and never the label. The promise is passed straight through rather
-  // than swallowed: `AccountRow` awaits it to disable its own button.
-  export let onRefresh: (uuid: string) => void | Promise<void> = () => {}
+  /**
+   * §6.4's manual refresh. Same keying rule as the two above, plus `provider`:
+   * `refresh_account` acts on the (provider, id) pair, so a press on this row
+   * must carry both halves, not just the id half the other two get away
+   * without. The promise is passed straight through rather than swallowed:
+   * `AccountRow` awaits it to disable its own button.
+   */
+  export let onRefresh: (uuid: string, provider: Provider) => void | Promise<void> = () => {}
 
   // Re-render relative times once a minute. This never refetches, and a minute is the
   // finest unit relativeAge and formatReset can show, so a faster tick paints nothing new.
@@ -42,7 +46,7 @@
       {now}
       onRelogin={() => onRelogin(a.account_id)}
       onUnlock={() => onUnlock(a.account_id)}
-      onRefresh={() => onRefresh(a.account_id)}
+      onRefresh={() => onRefresh(a.account_id, a.provider)}
     />
   {/each}
   {#if warning}

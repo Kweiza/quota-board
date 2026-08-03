@@ -14,6 +14,7 @@ import {
   onAccountsChanged,
   onAuthFailed,
   openSettings,
+  refreshAccount,
   renameAccount,
   reorderAccounts,
   setSettings,
@@ -246,6 +247,19 @@ describe('command wrappers', () => {
     await expect(setSettings(300)).resolves.toEqual(view)
 
     expect(calls).toEqual([{ cmd: 'set_settings', args: { pollIntervalSecs: 300 } }])
+  })
+
+  /**
+   * §9.3: the primary key is the pair, so a refresh press has to name which
+   * provider's account it means — the fourth command this same rule binds,
+   * alongside remove/rename/reorder.
+   */
+  it('refreshAccount sends the uuid and the provider, in that shape', async () => {
+    const calls = recordArgs((cmd) => (cmd === 'refresh_account' ? { kind: 'loading' } : null))
+
+    await refreshAccount('acct-1', 'openai')
+
+    expect(calls).toEqual([{ cmd: 'refresh_account', args: { uuid: 'acct-1', provider: 'openai' } }])
   })
 
   it('renameAccount sends the uuid, the provider and the label, in that shape', async () => {

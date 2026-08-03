@@ -93,7 +93,33 @@ pub async fn refresh_account(
     app: tauri::AppHandle,
     state: State<'_, AppState>,
     uuid: String,
+    provider: Provider,
 ) -> Result<AccountState, String> {
+    let (result, polled) = refresh_account_for(&state, provider, &uuid).await;
+    // Only when a poll actually ran — not on the two early-return paths below.
+    // Emitting there too would cost nothing functionally (every listener just
+    // re-reads the list), but it is not what the pre-Task-9 behavior did, and
+    // this task changes only *which account* is reached, never *when* this
+    // fires.
+    if polled {
+        let _ = app.emit("usage://updated", ());
+    }
+    result
+}
+
+/// The whole of `refresh_account` except the event, so it can be tested
+/// without an `AppHandle` — the same split `remove_account_for` uses.
+///
+/// Returns whether a poll actually ran, alongside the answer: the two early
+/// returns below (throttled, already refreshing) must not fire
+/// `usage://updated`, only the path that actually touched the network should,
+/// and that is a fact about which branch ran, not about whether the final
+/// `Result` came back `Ok`.
+pub(crate) async fn refresh_account_for(
+    state: &AppState,
+    provider: Provider,
+    uuid: &str,
+) -> (Result<AccountState, String>, bool) {
     {
         let sched = state.scheduler.lock().await;
         // Already throttled by the server (§6.2), and this is now the **only**
@@ -107,16 +133,8 @@ pub async fn refresh_account(
         // `AccountRow.svelte`'s `throttled` branch renders this state as
         // "throttled, after HH:MM" and `AccountList.svelte` renders it as
         // "throttled, available after HH:MM". Cited by name: both files move.
-        //
-        // `Provider::Anthropic` stopgap, still not resolved: `uuid` is a bare
-        // id from the wire, not (provider, id). Task 9 made `remove_account`,
-        // `reorder_accounts` and `rename_account` provider-aware but left this
-        // command as it was — every account it reaches today is still
-        // Anthropic in practice, but that is an assumption this command
-        // trusts rather than one the wire enforces (see the same note a few
-        // lines down on `is_refreshing`).
-        if let Some(s @ AccountState::Throttled { .. }) = sched.state(Provider::Anthropic, &uuid) {
-            return Ok(s);
+        if let Some(s @ AccountState::Throttled { .. }) = sched.state(provider, uuid) {
+            return (Ok(s), false);
         }
     }
     // The braces above are load-bearing: a `MutexGuard` created in an `if let`
@@ -127,11 +145,8 @@ pub async fn refresh_account(
     // Answer with it instead of blocking this UI command on the refresh mutex
     // for up to 30 seconds. `is_refreshing` is advisory by design
     // (auth/stored.rs:98-103) and drives a display state only.
-    //
-    // `Provider::Anthropic` stopgap, still not resolved — see the same note
-    // above `refresh_account`'s `Throttled` check.
-    if state.refresh_locks.is_refreshing(Provider::Anthropic, &uuid) {
-        return Ok(AccountState::AuthExpired);
+    if state.refresh_locks.is_refreshing(provider, uuid) {
+        return (Ok(AccountState::AuthExpired), false);
     }
 
     // `poll_one`, not `try_poll_one`: §6.4 requires the press to load, and
@@ -141,14 +156,14 @@ pub async fn refresh_account(
     // by one poll (`IN_FLIGHT_RECLAIM_SECS`, derived in scheduler.rs), and this
     // is an async command, so the wait costs a task and not the UI thread.
     // `AccountRow.svelte` disables its button for the duration.
-    state.poll_one(Provider::Anthropic, &uuid).await;
-    let _ = app.emit("usage://updated", ());
-    state
+    state.poll_one(provider, uuid).await;
+    let result = state
         .scheduler
         .lock()
         .await
-        .state(Provider::Anthropic, &uuid)
-        .ok_or_else(|| "unknown account".to_string())
+        .state(provider, uuid)
+        .ok_or_else(|| "unknown account".to_string());
+    (result, true)
 }
 
 /// One login at a time (§10.3). The second click is refused rather than
@@ -596,7 +611,13 @@ pub(crate) async fn remove_account_for(
     };
     if let Ok(Ok(Some(raw))) = raw {
         if let Ok(t) = serde_json::from_slice::<TokenSet>(&raw) {
-            revoke(&state.http, &state.cfg, &t.refresh_token).await;
+            // `login_cfg`, not `state.cfg`: the token being revoked belongs to
+            // whichever provider this account is, and `state.cfg` is always
+            // Anthropic's spec. Sending an OpenAI refresh token to
+            // `state.cfg.revoke_url` would post a live Codex credential to
+            // `platform.claude.com` — not a silent no-op, a working credential
+            // reaching a vendor it does not belong to.
+            revoke(&state.http, &login_cfg(state, provider), &t.refresh_token).await;
         }
     }
     // **Not `let _ =`.** The comment above marks the server-side *revocation*
@@ -1161,6 +1182,31 @@ mod tests {
         assert!(state.pending_manual.lock().unwrap().is_some(), "a refusal disarmed the form");
     }
 
+    /// The fourth provider-blind command, missed by this task's own brief and
+    /// found only once the other three were fixed: `refresh_account` is the
+    /// per-row refresh button, so a bare-id lookup would let a press on a
+    /// Codex row read (or wait on, or poll) whichever provider's account
+    /// happens to share the pressed id.
+    ///
+    /// `app_state` already registers Anthropic "a" in the scheduler; this adds
+    /// an Openai "a" beside it and throttles *only* the Anthropic one. A press
+    /// for the Openai account must not read that throttle — reading it is
+    /// exactly what `Provider::Anthropic` hardcoded into the lookup would do.
+    #[tokio::test]
+    async fn refresh_account_acts_on_the_matching_provider() {
+        let state = app_state(Arc::new(MemoryStore::default()));
+        state.scheduler.lock().await.add(Provider::Openai, "a");
+        state.scheduler.lock().await.record_throttle(Provider::Anthropic, "a", 60);
+
+        let (result, polled) = refresh_account_for(&state, Provider::Openai, "a").await;
+
+        assert!(
+            !matches!(result, Ok(AccountState::Throttled { .. })),
+            "the press for the Openai account read the Anthropic account's throttle instead: {result:?}"
+        );
+        assert!(polled, "the Openai account's refresh press never polled");
+    }
+
     /// Clones `app_state`'s Anthropic "a" into an Openai account sharing the
     /// same id — the exact collision (provider, id) exists to resolve. Reusing
     /// the seeded account rather than hand-building one keeps this test in the
@@ -1263,5 +1309,56 @@ mod tests {
             .find(|a| a.account_id == "a" && a.provider == Provider::Openai)
             .expect("the Openai twin vanished");
         assert_eq!(openai_a.display_label, "renamed");
+    }
+
+    /// The one call inside `remove_account_for` that did not get the provider:
+    /// server-side revocation. Sending an OpenAI refresh token to Anthropic's
+    /// revoke endpoint is not a silent no-op — it is a live credential
+    /// reaching a vendor it does not belong to, which is exactly what
+    /// CLAUDE.md's token rules exist to prevent.
+    ///
+    /// Two separate mock servers, no mock mounted on the Anthropic one: if
+    /// the Codex removal reached it anyway, wiremock would still answer with
+    /// its own default 404 and the call would swallow that outcome (§10.6) —
+    /// the point is caught by `received_requests()` below, not by whether
+    /// `remove_account_for` itself failed. Same shape as
+    /// `a_codex_account_is_polled_against_its_own_url_not_anthropics` in
+    /// `state.rs`.
+    #[tokio::test]
+    async fn removing_a_codex_account_revokes_against_the_openai_endpoint_not_anthropics() {
+        let anthropic_server = MockServer::start().await;
+        let openai_server = MockServer::start().await;
+        Mock::given(method("POST")).respond_with(ResponseTemplate::new(200)).mount(&openai_server).await;
+        // Deliberately no `Mock` mounted on `anthropic_server` — see the doc
+        // comment above.
+
+        let mut state = app_state(Arc::new(MemoryStore::default()));
+        state.cfg.revoke_url = format!("{}/v1/oauth/token/revoke", anthropic_server.uri());
+        state.openai_cfg.revoke_url = format!("{}/api/accounts/oauth/revoke", openai_server.uri());
+        add_openai_twin_of_a(&state).await;
+
+        let tokens = TokenSet {
+            access_token: "codex-access".into(),
+            refresh_token: "codex-refresh".into(),
+            expires_at: chrono::Utc::now() + chrono::TimeDelta::hours(1),
+            refresh_token_expires_at: chrono::Utc::now() + chrono::TimeDelta::days(30),
+            scopes: vec![],
+            client_id: "test".into(),
+        };
+        state
+            .secrets()
+            .put(&token_key(Provider::Openai, "a"), &serde_json::to_vec(&tokens).unwrap())
+            .unwrap();
+
+        remove_account_for(&state, Provider::Openai, "a").await.unwrap();
+
+        assert!(
+            !openai_server.received_requests().await.unwrap().is_empty(),
+            "the Codex account's revoke never reached its own endpoint"
+        );
+        assert!(
+            anthropic_server.received_requests().await.unwrap().is_empty(),
+            "a Codex refresh token was sent to Anthropic's revoke endpoint"
+        );
     }
 }
