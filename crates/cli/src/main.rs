@@ -7,7 +7,7 @@
 
 use quota_core::accounts::{Account, AccountStore};
 use quota_core::auth::callback::Callback;
-use quota_core::auth::pkce::{begin, success_redirect, AuthConfig};
+use quota_core::auth::pkce::{begin, success_redirect};
 use quota_core::auth::stored::{ensure_fresh, RefreshLocks};
 use quota_core::auth::token::{exchange_code, refresh, ReqwestHttp, TokenSet};
 use quota_core::paths::accounts_file;
@@ -30,7 +30,7 @@ fn open_store() -> Box<dyn SecretStore> {
 }
 
 async fn cmd_login() -> Result<(), Box<dyn std::error::Error>> {
-    let cfg = AuthConfig::default();
+    let cfg = Provider::Anthropic.spec();
     let cb = Callback::bind().await?;
     let (pending, url) = begin(&cfg, &cb.redirect_uri())?;
 
@@ -80,7 +80,7 @@ async fn cmd_show(only: Option<&str>) -> Result<(), Box<dyn std::error::Error>> 
     let store = open_store();
     let accounts = AccountStore::load(&accounts_file());
     let http = ReqwestHttp::new()?;
-    let cfg = AuthConfig::default();
+    let cfg = Provider::Anthropic.spec();
 
     // Task 10b owns the read -> refresh -> write sequence. Reimplementing it
     // inline here would produce a second copy with neither the lock nor the CAS.
@@ -137,7 +137,7 @@ async fn cmd_refresh(uuid: &str) -> Result<(), Box<dyn std::error::Error>> {
         .ok_or("no token is stored for that uuid")?;
     let tokens: TokenSet = serde_json::from_slice(&raw)?;
     let http = ReqwestHttp::new()?;
-    let new = refresh(&http, &AuthConfig::default(), &tokens).await?;
+    let new = refresh(&http, &Provider::Anthropic.spec(), &tokens).await?;
     store.put(&token_key(Provider::Anthropic, uuid), &serde_json::to_vec(&new)?)?;
     println!("refreshed. new expiry: {}", new.expires_at);
     println!("scopes: {}", new.scopes.join(" "));

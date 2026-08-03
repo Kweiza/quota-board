@@ -8,10 +8,9 @@ mod state;
 mod tray;
 
 use quota_core::accounts::AccountStore;
-use quota_core::auth::pkce::AuthConfig;
 use quota_core::auth::stored::RefreshLocks;
 use quota_core::auth::token::{ReqwestHttp, TokenSet};
-use quota_core::provider::{token_key, Provider};
+use quota_core::provider::{token_key, Provider, ProviderSpec};
 use quota_core::scheduler::{register_accounts, Scheduler, SystemClock};
 use quota_core::secrets::{keychain::KeychainStore, timeout::TimeoutStore, SecretStore, SERVICE};
 /// Named only inside the `QUOTA_FORCE_FALLBACK` block below, which is itself
@@ -199,7 +198,7 @@ fn main() {
                 last_raw: std::sync::Mutex::new(quota_core::usage::raw::RawLog::default()),
                 pending_manual: std::sync::Mutex::new(None),
                 http: ReqwestHttp::new()?,
-                cfg: AuthConfig { token_url: token_url(), ..AuthConfig::default() },
+                cfg: ProviderSpec { token_url: token_url(), ..Provider::Anthropic.spec() },
                 refresh_locks: RefreshLocks::default(),
                 poll_permit: tokio::sync::Mutex::new(()),
                 snapshots_path,
@@ -283,7 +282,7 @@ fn main() {
 /// only.** In a release build the environment cannot point this binary at
 /// another host: the token endpoint receives a refresh token, so an
 /// env-settable URL in a shipped binary would be a credential exfiltration
-/// switch. Production values are §5.1's URL and `AuthConfig::default()`.
+/// switch. Production values are §5.1's URL and `Provider::Anthropic.spec()`.
 #[cfg(debug_assertions)]
 fn usage_url() -> String {
     std::env::var("QUOTA_USAGE_URL")
@@ -310,9 +309,9 @@ fn openai_usage_url() -> String {
 
 #[cfg(debug_assertions)]
 fn token_url() -> String {
-    std::env::var("QUOTA_TOKEN_URL").unwrap_or_else(|_| AuthConfig::default().token_url)
+    std::env::var("QUOTA_TOKEN_URL").unwrap_or_else(|_| Provider::Anthropic.spec().token_url)
 }
 #[cfg(not(debug_assertions))]
 fn token_url() -> String {
-    AuthConfig::default().token_url
+    Provider::Anthropic.spec().token_url
 }
