@@ -452,7 +452,7 @@ impl AppState {
         if let Some(raw) = fetched.raw {
             self.record_raw(uuid, raw);
         }
-        let credit = fetched.credit;
+        let extra = fetched.extra;
         match fetched.outcome {
             Ok(windows) => {
                 // The fingerprint is taken from the token that produced *this*
@@ -460,7 +460,7 @@ impl AppState {
                 let fp = fingerprint(&fresh.tokens.access_token);
                 let snap = {
                     let mut sched = self.scheduler.lock().await;
-                    sched.record_success(uuid, windows, credit);
+                    sched.record_success(uuid, windows, extra);
                     sched.snapshot(uuid, &fp)
                 };
                 // Taken from the snapshot rather than read off the clock again,

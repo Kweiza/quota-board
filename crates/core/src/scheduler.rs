@@ -1,7 +1,7 @@
 use crate::accounts::{Account, AccountError, AccountStore};
 use crate::auth::stored::StoredTokenError;
 use crate::auth::token::AuthError;
-use crate::model::{AccountState, CreditSpend, UsageWindow};
+use crate::model::{AccountState, ExtraLine, UsageWindow};
 use crate::secrets::SecretError;
 use crate::snapshots::CachedSnapshot;
 use crate::usage::http::UsageError;
@@ -259,7 +259,7 @@ pub const SCHEDULER_STATE_VERSION: u32 = 1;
 
 /// One account's timing, in a form that survives the process.
 ///
-/// **Deliberately not the whole `Entry`.** `last_windows`, `last_credit` and
+/// **Deliberately not the whole `Entry`.** `last_windows`, `last_extra` and
 /// `last_fetched_at` are absent because `snapshots.json` already persists them
 /// and restores them through `seed_from_cache`, which carries the age §7.1
 /// requires. Duplicating them here would give the same data two sources of
@@ -310,7 +310,7 @@ struct Entry {
     next_due_at: DateTime<Utc>,
     backoff_level: u32,
     last_windows: Option<Vec<UsageWindow>>,
-    /// The credit spend from the last successful poll **of this process**.
+    /// The extra line from the last successful poll **of this process**.
     ///
     /// Deliberately absent from `CachedSnapshot`: a credit figure carries no
     /// reset date (measured — the endpoint has none, see
@@ -318,7 +318,7 @@ struct Entry {
     /// boundary would show last month's spend as this month's with no way to
     /// tell. Windows can be filtered on `resets_at`; this cannot, so it is not
     /// persisted at all and reappears on the first poll instead.
-    last_credit: Option<CreditSpend>,
+    last_extra: Option<ExtraLine>,
     last_fetched_at: Option<DateTime<Utc>>,
     last_failure: Option<FailureKind>,
     throttled_until: Option<DateTime<Utc>>,
@@ -402,7 +402,7 @@ impl<C: Clock> Scheduler<C> {
                 next_due_at: self.clock.now() + offset,
                 backoff_level: 0,
                 last_windows: None,
-                last_credit: None,
+                last_extra: None,
                 last_fetched_at: None,
                 last_failure: None,
                 throttled_until: None,
@@ -612,20 +612,20 @@ impl<C: Clock> Scheduler<C> {
         self.entries.get(uuid).map(|e| e.next_due_at)
     }
 
-    /// `credit` is overwritten on every success, `None` included: an account
+    /// `extra` is overwritten on every success, `None` included: an account
     /// whose spending limit was removed must lose its credit line, not keep the
     /// last figure it ever reported.
     pub fn record_success(
         &mut self,
         uuid: &str,
         windows: Vec<UsageWindow>,
-        credit: Option<CreditSpend>,
+        extra: Option<ExtraLine>,
     ) {
         let now = self.clock.now();
         let interval = self.policy.interval;
         if let Some(e) = self.entries.get_mut(uuid) {
             e.last_windows = Some(windows);
-            e.last_credit = credit;
+            e.last_extra = extra;
             e.last_fetched_at = Some(now);
             e.last_failure = None;
             e.throttled_until = None;
@@ -681,10 +681,10 @@ impl<C: Clock> Scheduler<C> {
     pub fn seed(&mut self, uuid: &str, windows: Vec<UsageWindow>, fetched_at: DateTime<Utc>) {
         if let Some(e) = self.entries.get_mut(uuid) {
             e.last_windows = Some(windows);
-            // A restored snapshot carries no credit — see `Entry::last_credit`.
+            // A restored snapshot carries no extra line — see `Entry::last_extra`.
             // Cleared rather than left alone so a re-seed cannot strand a figure
             // from an earlier poll beside a much older `fetched_at`.
-            e.last_credit = None;
+            e.last_extra = None;
             e.last_fetched_at = Some(fetched_at);
             // §7.4: a restored snapshot reads as STALE until the first poll of
             // this process confirms it, regardless of age. Without this a
@@ -893,11 +893,11 @@ impl<C: Clock> Scheduler<C> {
             (Some(w), Some(at)) => {
                 // Failed, or past the staleness boundary: Stale.
                 let too_old = now - at > self.policy.interval * 2;
-                let credit = e.last_credit.clone();
+                let extra = e.last_extra.clone();
                 if e.last_failure.is_some() || too_old {
-                    Some(AccountState::Stale { windows: w.clone(), credit, fetched_at: at })
+                    Some(AccountState::Stale { windows: w.clone(), extra, fetched_at: at })
                 } else {
-                    Some(AccountState::Ok { windows: w.clone(), credit, fetched_at: at })
+                    Some(AccountState::Ok { windows: w.clone(), extra, fetched_at: at })
                 }
             }
             // Never succeeded yet — show the failure itself.
