@@ -11,6 +11,7 @@
 //! that stays in the wiring.
 
 use crate::model::UsageWindow;
+use crate::provider::Provider;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -59,6 +60,13 @@ pub fn load(path: &Path) -> HashMap<String, CachedSnapshot> {
         .unwrap_or_default()
 }
 
+/// Symmetric, unlike `provider::token_key`, and for a measured difference in
+/// cost: an orphaned cache entry is one cold start, while an orphaned keychain
+/// entry is a forced re-login. Making the two agree is not itself a goal.
+fn cache_key(provider: Provider, account_id: &str) -> String {
+    format!("{}:{}", provider.as_str(), account_id)
+}
+
 /// Writes **one** account's entry, merging into whatever is already on disk.
 ///
 /// Rebuilding the whole map on every call and writing it over the file deletes
@@ -70,16 +78,21 @@ pub fn load(path: &Path) -> HashMap<String, CachedSnapshot> {
 /// edge one" — the file became literally `{}`. With more than one account, the
 /// entire premise of this product, §7.4's restore would only ever work for
 /// whichever account polled first. Removal happens only through `remove`.
-pub fn save(path: &Path, uuid: &str, snap: &CachedSnapshot) -> std::io::Result<()> {
+pub fn save(
+    path: &Path,
+    provider: Provider,
+    uuid: &str,
+    snap: &CachedSnapshot,
+) -> std::io::Result<()> {
     let mut map = load(path);
-    map.insert(uuid.to_string(), snap.clone());
+    map.insert(cache_key(provider, uuid), snap.clone());
     write_map(path, &map)
 }
 
 /// Drops one account's entry. Called when an account is deleted (Task 18).
-pub fn remove(path: &Path, uuid: &str) -> std::io::Result<()> {
+pub fn remove(path: &Path, provider: Provider, uuid: &str) -> std::io::Result<()> {
     let mut map = load(path);
-    if map.remove(uuid).is_none() {
+    if map.remove(&cache_key(provider, uuid)).is_none() {
         return Ok(());
     }
     write_map(path, &map)
@@ -185,19 +198,37 @@ mod tests {
     #[test]
     fn saving_one_account_does_not_delete_the_others() {
         let path = tmp();
-        save(&path, "a", &snap(11.0, "fp-a")).unwrap();
-        save(&path, "b", &snap(22.0, "fp-b")).unwrap();
+        save(&path, Provider::Anthropic, "a", &snap(11.0, "fp-a")).unwrap();
+        save(&path, Provider::Anthropic, "b", &snap(22.0, "fp-b")).unwrap();
 
         let map = load(&path);
         assert_eq!(map.len(), 2, "the second write dropped the first account: {:?}", map.keys());
-        assert_eq!(map["a"].windows[0].percent, 11.0);
-        assert_eq!(map["b"].windows[0].percent, 22.0);
+        assert_eq!(map["anthropic:a"].windows[0].percent, 11.0);
+        assert_eq!(map["anthropic:b"].windows[0].percent, 22.0);
 
         // `remove` is the only path that may drop an entry.
-        remove(&path, "a").unwrap();
+        remove(&path, Provider::Anthropic, "a").unwrap();
         let map = load(&path);
         assert_eq!(map.len(), 1);
-        assert!(map.contains_key("b"));
+        assert!(map.contains_key("anthropic:b"));
+        std::fs::remove_file(&path).ok();
+    }
+
+    /// docs/design.md §9.3, applied to the cache rather than the token store:
+    /// two providers issuing the same account id must land in two entries, not
+    /// one overwriting the other. Unlike `provider::token_key`, this is not
+    /// load-bearing for credential safety — an orphaned cache entry costs one
+    /// cold start — but it must still hold, or a Codex account with the same id
+    /// as an existing Anthropic account would silently steal its cached
+    /// snapshot (or vice versa).
+    #[test]
+    fn two_providers_do_not_share_a_cache_entry() {
+        let path = tmp();
+        let f = fingerprint("tok");
+        save(&path, Provider::Anthropic, "same", &snap(10.0, &f)).unwrap();
+        save(&path, Provider::Openai, "same", &snap(90.0, &f)).unwrap();
+        let map = load(&path);
+        assert_eq!(map.len(), 2, "one provider overwrote the other: {:?}", map.keys());
         std::fs::remove_file(&path).ok();
     }
 
@@ -223,10 +254,10 @@ mod tests {
         // And the real path end to end, twice — the second write goes through
         // rename over an existing file, which is where a mode can be lost.
         let path = tmp();
-        save(&path, "a", &snap(1.0, "fp")).unwrap();
+        save(&path, Provider::Anthropic, "a", &snap(1.0, "fp")).unwrap();
         let after_first = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
         assert_eq!(after_first, 0o600, "the cache file did not end up owner-only");
-        save(&path, "b", &snap(2.0, "fp")).unwrap();
+        save(&path, Provider::Anthropic, "b", &snap(2.0, "fp")).unwrap();
         let after_second = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
         assert_eq!(after_second, 0o600, "the second write widened the mode");
         std::fs::remove_file(&path).ok();
@@ -257,7 +288,8 @@ mod tests {
         };
 
         let path = tmp();
-        save(&path, "uuid-a", &snap(42.0, &fingerprint(&tokens.access_token))).unwrap();
+        save(&path, Provider::Anthropic, "uuid-a", &snap(42.0, &fingerprint(&tokens.access_token)))
+            .unwrap();
 
         let bytes = std::fs::read(&path).unwrap();
         let text = String::from_utf8_lossy(&bytes);

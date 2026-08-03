@@ -3,10 +3,9 @@ use quota_core::auth::callback::Callback;
 use quota_core::auth::pkce::{
     authorize_url_for, begin, manual_redirect_uri, parse_manual_code, success_redirect, PendingAuth,
 };
-use quota_core::auth::stored::token_key;
 use quota_core::auth::token::{exchange_code, revoke, TokenSet};
 use quota_core::model::AccountState;
-use quota_core::provider::Provider;
+use quota_core::provider::{token_key, Provider};
 use quota_core::scheduler::PollPolicy;
 use quota_core::secrets::{encrypted_file::EncryptedFileStore, timeout::TimeoutStore, SecretStore};
 use quota_core::usage::raw::RawResponse;
@@ -115,7 +114,10 @@ pub async fn refresh_account(
     // Answer with it instead of blocking this UI command on the refresh mutex
     // for up to 30 seconds. `is_refreshing` is advisory by design
     // (auth/stored.rs:98-103) and drives a display state only.
-    if state.refresh_locks.is_refreshing(&uuid) {
+    //
+    // `Provider::Anthropic` stopgap: `uuid` is a bare id from the wire, not
+    // (provider, id) — Task 9 makes the frontend provider-aware.
+    if state.refresh_locks.is_refreshing(Provider::Anthropic, &uuid) {
         return Ok(AccountState::AuthExpired);
     }
 
@@ -478,7 +480,9 @@ pub(crate) async fn complete_login(
     // principle `refresh_account` applies when it answers AUTH_EXPIRED instead
     // of waiting on the refresh mutex.
     let store = state.secrets();
-    let key = token_key(&identity.uuid);
+    // `Provider::Anthropic`: this login flow is Anthropic's OAuth exchange —
+    // there is no Codex login path yet for it to be anything else.
+    let key = token_key(Provider::Anthropic, &identity.uuid);
     tauri::async_runtime::spawn_blocking(move || store.put(&key, &blob))
         .await
         .map_err(|e| format!("the token store task failed: {e}"))?
@@ -502,7 +506,9 @@ pub(crate) async fn complete_login(
 #[tauri::command]
 pub async fn remove_account(app: tauri::AppHandle, uuid: String) -> Result<(), String> {
     let state = app.state::<AppState>();
-    let key = token_key(&uuid);
+    // `uuid` here is a bare account id from the wire, not (provider, id) — see
+    // the `Provider::Anthropic` stopgap on `AccountStore::remove` below.
+    let key = token_key(Provider::Anthropic, &uuid);
     let store = state.secrets();
 
     // Both store calls run on a blocking thread. `SecretStore` is synchronous
@@ -570,9 +576,11 @@ pub async fn remove_account(app: tauri::AppHandle, uuid: String) -> Result<(), S
     // caller.
     let path = state.snapshots_path.clone();
     let id = uuid.clone();
-    if let Ok(Err(e)) =
-        tauri::async_runtime::spawn_blocking(move || quota_core::snapshots::remove(&path, &id))
-            .await
+    if let Ok(Err(e)) = tauri::async_runtime::spawn_blocking(move || {
+        // `Provider::Anthropic` stopgap — see `AccountStore::remove` above.
+        quota_core::snapshots::remove(&path, Provider::Anthropic, &id)
+    })
+    .await
     {
         eprintln!("{uuid}: the cached snapshot could not be removed: {e}");
     }
@@ -935,7 +943,7 @@ mod tests {
 
         finish_manual_login(&state, "  the-code#s-state \n").await.unwrap();
 
-        let stored = state.secrets().get(&token_key("u-42")).unwrap();
+        let stored = state.secrets().get(&token_key(Provider::Anthropic, "u-42")).unwrap();
         assert!(stored.is_some(), "the token never reached the store");
         let tokens: TokenSet = serde_json::from_slice(&stored.unwrap()).unwrap();
         assert_eq!(tokens.access_token, "at-1");

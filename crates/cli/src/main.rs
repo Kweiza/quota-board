@@ -8,10 +8,10 @@
 use quota_core::accounts::{Account, AccountStore};
 use quota_core::auth::callback::Callback;
 use quota_core::auth::pkce::{begin, success_redirect, AuthConfig};
-use quota_core::auth::stored::{ensure_fresh, token_key, RefreshLocks};
+use quota_core::auth::stored::{ensure_fresh, RefreshLocks};
 use quota_core::auth::token::{exchange_code, refresh, ReqwestHttp, TokenSet};
 use quota_core::paths::accounts_file;
-use quota_core::provider::Provider;
+use quota_core::provider::{token_key, Provider};
 use quota_core::secrets::{keychain::KeychainStore, SecretStore, SERVICE};
 use quota_core::usage::http::fetch_usage;
 
@@ -45,9 +45,11 @@ async fn cmd_login() -> Result<(), Box<dyn std::error::Error>> {
     let (tokens, identity) = exchange_code(&http, &cfg, &pending, code, state).await?;
     let identity = identity.ok_or("the token response carried no account block — there is no uuid to key by")?;
 
-    // The token key format belongs to Task 10b's `auth::stored` — not
-    // re-derived here, `token_key` above is the only place it is built.
-    open_store().put(&token_key(&identity.uuid), &serde_json::to_vec(&tokens)?)?;
+    // The token key format belongs to `provider::token_key` — not re-derived
+    // here, that is the only place it is built. `Provider::Anthropic` because
+    // this CLI has no Codex login flow yet.
+    open_store()
+        .put(&token_key(Provider::Anthropic, &identity.uuid), &serde_json::to_vec(&tokens)?)?;
 
     let mut accounts = AccountStore::load(&accounts_file());
     accounts.upsert(Account {
@@ -88,7 +90,16 @@ async fn cmd_show(only: Option<&str>) -> Result<(), Box<dyn std::error::Error>> 
         if only.is_some_and(|u| u != a.account_id) {
             continue;
         }
-        let fresh = match ensure_fresh(&http, &cfg, store.as_ref(), &locks, &a.account_id).await {
+        let fresh = match ensure_fresh(
+            &http,
+            &cfg,
+            store.as_ref(),
+            &locks,
+            Provider::Anthropic,
+            &a.account_id,
+        )
+        .await
+        {
             Ok(f) => f,
             Err(e) => {
                 println!("{}: {e}", a.display_label);
@@ -117,15 +128,17 @@ async fn cmd_show(only: Option<&str>) -> Result<(), Box<dyn std::error::Error>> 
 /// command exists to **force** a rotation: it is how refresh behaviour is
 /// observed on a real account at all — what the server rotates, what expiry it
 /// returns, and whether a chain elsewhere is disturbed. Only the key format is
-/// borrowed from `auth::stored`. This is a one-shot smoke command, not a
+/// borrowed from `provider::token_key`. This is a one-shot smoke command, not a
 /// concurrent path, so it needs no lock.
 async fn cmd_refresh(uuid: &str) -> Result<(), Box<dyn std::error::Error>> {
     let store = open_store();
-    let raw = store.get(&token_key(uuid))?.ok_or("no token is stored for that uuid")?;
+    let raw = store
+        .get(&token_key(Provider::Anthropic, uuid))?
+        .ok_or("no token is stored for that uuid")?;
     let tokens: TokenSet = serde_json::from_slice(&raw)?;
     let http = ReqwestHttp::new()?;
     let new = refresh(&http, &AuthConfig::default(), &tokens).await?;
-    store.put(&token_key(uuid), &serde_json::to_vec(&new)?)?;
+    store.put(&token_key(Provider::Anthropic, uuid), &serde_json::to_vec(&new)?)?;
     println!("refreshed. new expiry: {}", new.expires_at);
     println!("scopes: {}", new.scopes.join(" "));
     Ok(())
