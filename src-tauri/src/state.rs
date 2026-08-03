@@ -1047,4 +1047,72 @@ pub(crate) mod tests {
             "registering one account moved another account's schedule"
         );
     }
+
+    /// **The one behavioral change in this diff that would be silently wrong
+    /// if the two match arms in `poll_claimed`'s `usage_url` routing were
+    /// swapped.** Every other poll-path test points `usage_url` and
+    /// `openai_usage_url` at the same dead address (`app_state_with`), so none
+    /// of them can tell the two fields apart. This one binds them to two
+    /// *different* mock servers and asserts both halves positively: the Codex
+    /// account's poll reached its own mock, and Anthropic's received nothing
+    /// at all — not merely "the fetch succeeded", which a swapped routing
+    /// would also produce if the wrong mock happened to answer.
+    #[tokio::test]
+    async fn a_codex_account_is_polled_against_its_own_url_not_anthropics() {
+        use quota_core::auth::token::TokenSet;
+        use quota_core::provider::token_key;
+        use wiremock::matchers::method;
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let anthropic_server = MockServer::start().await;
+        let openai_server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(
+                r#"{"rate_limit":{"primary_window":{"used_percent":10,
+                    "limit_window_seconds":604800,"reset_after_seconds":604800,
+                    "reset_at":9999999999},"secondary_window":null}}"#,
+            ))
+            .mount(&openai_server)
+            .await;
+        // Deliberately no `Mock` mounted on `anthropic_server`. If the Codex
+        // account's poll reached it anyway, wiremock would still answer with
+        // its own default 404 — the point is caught by
+        // `received_requests()` below, not by whether the fetch succeeded.
+
+        let mut state = app_state(Arc::new(quota_core::secrets::MemoryStore::default()));
+        state.usage_url = anthropic_server.uri();
+        state.openai_usage_url = openai_server.uri();
+
+        let tokens = TokenSet {
+            access_token: "codex-access".into(),
+            refresh_token: "codex-refresh".into(),
+            expires_at: Utc::now() + chrono::TimeDelta::hours(1),
+            refresh_token_expires_at: Utc::now() + chrono::TimeDelta::days(30),
+            scopes: vec![],
+            client_id: "test".into(),
+        };
+        state
+            .secrets()
+            .put(&token_key(Provider::Openai, "codex-a"), &serde_json::to_vec(&tokens).unwrap())
+            .unwrap();
+        state.scheduler.lock().await.add(Provider::Openai, "codex-a");
+
+        state.poll_one(Provider::Openai, "codex-a").await;
+
+        assert!(
+            matches!(
+                state.scheduler.lock().await.state(Provider::Openai, "codex-a"),
+                Some(AccountState::Ok { .. })
+            ),
+            "the Codex account's poll did not read as a successful fetch"
+        );
+        assert!(
+            !openai_server.received_requests().await.unwrap().is_empty(),
+            "the Codex account's poll never reached its own URL"
+        );
+        assert!(
+            anthropic_server.received_requests().await.unwrap().is_empty(),
+            "the Codex account's poll reached Anthropic's URL instead of its own"
+        );
+    }
 }
