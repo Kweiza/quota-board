@@ -251,6 +251,66 @@ until something contradicted it, and the same shapes will recur.
    the overwrite. The script now refuses to write into a directory that already
    holds a run.
 
+---
+
+# Spike G — the 429 boundary, not found
+
+Run date: 2026-08-03
+User-Agent: `quota-board/0.2.1-spike`
+Script: `scripts/spike-codex-throttle.sh`
+Account: one, `plus`, with no usage in flight.
+Raw log: `.local/research/codex-throttle-log.tsv`, not committed.
+
+Method mirrors `spike-throttle.sh` so the two are comparable: 90 iterations at
+60-second intervals against `wham/usage`, one account, honest User-Agent.
+Measured inter-request intervals were 59 s once, 60 s forty times and 61 s
+forty-eight times — the loop's `sleep 60` plus round-trip time, the same drift
+Spike B saw.
+
+## Result
+
+| | |
+|---|---|
+| HTTP 200 | **90 of 90** |
+| HTTP 429 | **0** |
+| Answered by the backend (`x-oai-request-id`) | 90 of 90 |
+| `Retry-After` seen | never |
+| Elapsed | 89 minutes |
+
+**No throttle boundary was found.** Spike B drove Anthropic's endpoint the same
+way and saw 26 consecutive successes before the first 429, then a sustained
+alternating rhythm. This run found nothing to alternate with.
+
+## What that does and does not establish
+
+**Measured:** one account polled every 60 seconds for 89 minutes is not
+throttled, and every response came from the API rather than from the edge.
+
+**Not measured, and the list matters more than the result:**
+
+- **Any interval below 60 seconds.** No boundary was located, so the shortest
+  safe interval is unknown — 60 s is a point known to be safe, not a floor
+  derived from a measured limit. Spike B's 180 s came from halving a measured
+  120 s floor and adding margin; there is no equivalent arithmetic to do here,
+  because nothing failed.
+- **More than one account.** Spike D established that Anthropic's 429 budget is
+  per account. Nothing here tests whether that holds for OpenAI, so the request
+  rate of N accounts polling at this interval is unbounded by this measurement.
+- **Anything past 89 minutes.** A daily or weekly request cap would not appear
+  in this window.
+- **Whether a 429 exists on this endpoint at all**, and therefore whether
+  `Retry-After` is ever sent or what it would carry. "Never seen" here is the
+  absence of an event, not a property of the server — the same shape of claim
+  Spike B made about `Retry-After: 0` and Spike D refuted.
+
+## The consumption question, at 90 reads
+
+`used_percent` held at 0 and `reset_after_seconds` at 604800 across all 90
+requests. That is a far larger sample than Spike F's twelve, and it is still
+the same weak direction of evidence: the account had no usage in flight, so 0
+is a floor the value cannot fall below. It remains consistent with reads being
+free and with the instrument being too blunt at this scale.
+
 ## Scope limits
 
 - **Two accounts, one machine, one day, and neither had usage in flight.**
