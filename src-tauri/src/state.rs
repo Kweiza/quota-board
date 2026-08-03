@@ -80,6 +80,12 @@ pub struct AppState {
     /// Its `redirect_uri` is always the manual one, so `complete_login` needs no
     /// branch: `exchange_code` replays whatever is in here.
     ///
+    /// **Carries the `Provider` alongside the `PendingAuth`.** A login started
+    /// for Codex must be finished against Codex's token endpoint, not
+    /// Anthropic's — `finish_manual_login` has no other way to know which
+    /// provider a pasted code belongs to, since the paste itself is just a
+    /// `code#state` line.
+    ///
     /// **Written on every `begin_login`, not only when the loopback fails.**
     /// Two of the four ways the loopback can fail are detected in the webview —
     /// a `Callback::bind` that never happened and an `openUrl` that threw — and
@@ -95,7 +101,7 @@ pub struct AppState {
     ///
     /// Same `std::sync` rule as `secrets`: taken and released inside one
     /// statement, never across an `await`.
-    pub(crate) pending_manual: std::sync::Mutex<Option<PendingAuth>>,
+    pub(crate) pending_manual: std::sync::Mutex<Option<(Provider, PendingAuth)>>,
     pub http: ReqwestHttp,
     pub cfg: ProviderSpec,
     /// Per-account refresh locks (Task 10b). **Exactly one instance may exist
@@ -350,6 +356,7 @@ impl AppState {
     /// the user is trying to recover a quarantined account.
     pub async fn register_authenticated(
         &self,
+        provider: Provider,
         uuid: &str,
         email: &str,
     ) -> Result<(), quota_core::accounts::AccountError> {
@@ -357,10 +364,18 @@ impl AppState {
         let mut sched = self.scheduler.lock().await;
         let mut accounts = self.accounts.lock().await;
 
-        let existing = accounts.list().iter().find(|a| a.account_id == uuid).cloned();
+        // Matched on **(provider, uuid)**, not on `uuid` alone: docs/design.md
+        // §9.3 records that nothing stops two providers from issuing the same
+        // id string, and this is the one lookup in the application that used
+        // to get away with ignoring that, because it was only ever called for
+        // Anthropic. A Codex login sharing an id with an existing Anthropic
+        // account must not inherit that account's `display_label`,
+        // `created_at`, or `last_ok_at`.
+        let existing =
+            accounts.list().iter().find(|a| a.account_id == uuid && a.provider == provider).cloned();
         accounts.upsert(Account {
             account_id: uuid.to_string(),
-            provider: Provider::Anthropic,
+            provider,
             display_label: existing
                 .as_ref()
                 .map(|a| a.display_label.clone())
@@ -379,13 +394,8 @@ impl AppState {
         // it alone would leave a quarantined entry AUTH_DEAD forever — and
         // Task 17 persists `quarantined`, so that now survives every restart.
         // Drop the entry and rebuild it.
-        //
-        // `Provider::Anthropic`: this login flow is Anthropic's OAuth exchange
-        // — there is no Codex login path yet for it to be anything else, the
-        // same reason `finish_manual_login` in `commands.rs` hardcodes it for
-        // `token_key`.
-        sched.remove(Provider::Anthropic, uuid);
-        sched.add(Provider::Anthropic, uuid);
+        sched.remove(provider, uuid);
+        sched.add(provider, uuid);
         // ...which hands the rebuilt entry `add`'s startup stagger, and — since
         // it goes to the end of `order` — the largest offset of the lot.
         // Measured on the device: the third account added through the settings
@@ -394,7 +404,7 @@ impl AppState {
         // worst case. §6.1's stagger is about startup and about staying
         // de-synchronised over time; one deliberate registration is neither, and
         // §6.1's floor is untouched — see `make_due_now`.
-        sched.make_due_now(Provider::Anthropic, uuid);
+        sched.make_due_now(provider, uuid);
         Ok(())
     }
 
@@ -829,7 +839,7 @@ pub(crate) mod tests {
         tokio::time::sleep(Duration::from_millis(50)).await;
         let login = {
             let s = Arc::clone(&state);
-            tokio::spawn(async move { s.register_authenticated("a", "a@example.invalid").await })
+            tokio::spawn(async move { s.register_authenticated(Provider::Anthropic, "a", "a@example.invalid").await })
         };
 
         let both = tokio::time::timeout(Duration::from_secs(3), async {
@@ -875,7 +885,7 @@ pub(crate) mod tests {
             "premise: the account reads as quarantined before the re-login"
         );
 
-        state.register_authenticated("a", "different@example.invalid").await.unwrap();
+        state.register_authenticated(Provider::Anthropic, "a", "different@example.invalid").await.unwrap();
 
         {
             let accounts = state.accounts.lock().await;
@@ -899,6 +909,71 @@ pub(crate) mod tests {
             Some(AccountState::AuthDead),
             "the scheduler entry still reads AUTH_DEAD after a successful re-login"
         );
+    }
+
+    /// docs/design.md §9.3: nothing stops two providers from issuing the same
+    /// id string, and a Codex login sharing an id with an existing Anthropic
+    /// account must not collide with it — the account this task adds carries
+    /// its own `Provider`, and the two rows coexist untouched by each other.
+    ///
+    /// Back-tested: matching `existing` on `uuid` alone (as this lookup did
+    /// before this task, when the function was Anthropic-only) makes this
+    /// fail — the Codex account would inherit the Anthropic account's
+    /// `display_label` and `created_at` instead of getting its own.
+    #[tokio::test]
+    async fn a_codex_login_does_not_collide_with_an_anthropic_account_sharing_the_same_id() {
+        let state = app_state(Arc::new(quota_core::secrets::MemoryStore::default()));
+        let anthropic_created = Utc::now() - chrono::TimeDelta::days(10);
+        {
+            let mut accounts = state.accounts.lock().await;
+            accounts
+                .upsert(Account {
+                    account_id: "shared-id".into(),
+                    provider: Provider::Anthropic,
+                    display_label: "claude work".into(),
+                    email: "claude@example.invalid".into(),
+                    created_at: anthropic_created,
+                    last_ok_at: None,
+                    quarantined: false,
+                    sort_order: 0,
+                })
+                .unwrap();
+        }
+
+        state
+            .register_authenticated(Provider::Openai, "shared-id", "codex@example.invalid")
+            .await
+            .unwrap();
+
+        let accounts = state.accounts.lock().await;
+        assert_eq!(
+            accounts.list().iter().filter(|a| a.account_id == "shared-id").count(),
+            2,
+            "the two providers' accounts sharing this id collapsed into one"
+        );
+
+        let codex = accounts
+            .list()
+            .iter()
+            .find(|a| a.account_id == "shared-id" && a.provider == Provider::Openai)
+            .expect("the Codex account was not registered");
+        assert_eq!(codex.email, "codex@example.invalid");
+        // A fresh account, not the Anthropic one's metadata leaking across the
+        // provider boundary.
+        assert_eq!(codex.display_label, "codex@example.invalid");
+        assert!(codex.created_at > anthropic_created);
+
+        let claude = accounts
+            .list()
+            .iter()
+            .find(|a| a.account_id == "shared-id" && a.provider == Provider::Anthropic)
+            .expect("the Anthropic account was dropped");
+        assert_eq!(claude.display_label, "claude work", "the Codex login mutated the Anthropic account");
+
+        assert!(matches!(
+            state.scheduler.lock().await.state(Provider::Openai, "shared-id"),
+            Some(AccountState::Loading)
+        ));
     }
 
     /// **docs/design.md §9.2's fallback had never been exercised by the
@@ -1031,7 +1106,7 @@ pub(crate) mod tests {
         let state = app_state(Arc::new(LockedStore));
         let b_before = state.scheduler.lock().await.next_wake(Provider::Anthropic, "b").unwrap();
 
-        state.register_authenticated("c", "c@example.invalid").await.unwrap();
+        state.register_authenticated(Provider::Anthropic, "c", "c@example.invalid").await.unwrap();
 
         let sched = state.scheduler.lock().await;
         assert!(

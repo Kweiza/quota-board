@@ -147,7 +147,13 @@ pub async fn fetch_usage_captured_at(
 /// Returns the status beside the body so the debug view reports the status that
 /// actually arrived. A 2xx that is not 200 is precisely the drift §12.4 asks
 /// this window to make visible, and a hardcoded 200 would hide it.
-async fn fetch_usage_body_at(
+///
+/// **`pub(crate)`, not private.** `auth::token`'s add-account path (Step 5 of
+/// the Codex login task) needs exactly this half — the raw body, before
+/// masking or parsing — to read an email out of a response it would otherwise
+/// throw away. Routing that through `fetch_usage_captured_at` instead would
+/// pay for masking and parsing that path never uses.
+pub(crate) async fn fetch_usage_body_at(
     http: &ReqwestHttp,
     provider: Provider,
     url: &str,

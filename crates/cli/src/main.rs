@@ -42,7 +42,8 @@ async fn cmd_login() -> Result<(), Box<dyn std::error::Error>> {
     let state = params.get("state").ok_or("the callback carried no state")?;
 
     let http = ReqwestHttp::new()?;
-    let (tokens, identity) = exchange_code(&http, &cfg, &pending, code, state).await?;
+    // `Provider::Anthropic`: this CLI has no Codex login flow yet.
+    let (tokens, identity) = exchange_code(&http, &cfg, Provider::Anthropic, &pending, code, state).await?;
     let identity = identity.ok_or("the token response carried no account block — there is no uuid to key by")?;
 
     // The token key format belongs to `provider::token_key` — not re-derived

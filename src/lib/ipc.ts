@@ -85,7 +85,16 @@ export const onUsageUpdated = (fn: () => void): Promise<UnlistenFn> =>
 export const refreshAccount = (uuid: string): Promise<AccountState> =>
   invoke('refresh_account', { uuid })
 
-export const beginLogin = (): Promise<LoginUrls> => invoke('begin_login')
+/**
+ * §10.3's flow, for whichever provider the user pressed the button for.
+ *
+ * `'anthropic' | 'openai'` rather than a shared `Provider` type from
+ * `./types`: that file still describes the pre-`ExtraLine` shape and bringing
+ * it in line is a separate task, so this stays a narrow literal union scoped
+ * to the one argument that needs it.
+ */
+export const beginLogin = (provider: 'anthropic' | 'openai'): Promise<LoginUrls> =>
+  invoke('begin_login', { provider })
 
 /** §10.3's paste path. Rejects with a sentence meant for the user. */
 export const submitManualCode = (pasted: string): Promise<void> =>

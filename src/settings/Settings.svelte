@@ -288,7 +288,7 @@
     expiryTimers = {}
   })
 
-  async function addAccount(): Promise<void> {
+  async function addAccount(provider: 'anthropic' | 'openai'): Promise<void> {
     // No local "pending" flag. The Rust side is the single-flight
     // (`begin_login` answers `a login is already in progress`), and a second
     // disabled state here would be the two-sources-disagree hazard §7.1 exists
@@ -297,7 +297,7 @@
     // disable the button for the life of the process.
     let urls: LoginUrls
     try {
-      urls = await beginLogin()
+      urls = await beginLogin(provider)
     } catch (e) {
       // `begin_login` refused outright — a login is already in progress, or the
       // authorize URL is misconfigured (§10.2). There is no manual URL to fall
@@ -462,7 +462,8 @@
     {#if accounts.length === 0}
       <p class="hint">No accounts yet.</p>
     {/if}
-    <button on:click={addAccount}>Add account</button>
+    <button type="button" on:click={() => addAccount('anthropic')}>Add Claude account</button>
+    <button type="button" on:click={() => addAccount('openai')}>Add Codex account</button>
 
     <!-- docs/design.md §10.3. Shown only after the automatic half has given up;
          until then this whole block is absent, which is the decision recorded

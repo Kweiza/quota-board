@@ -240,7 +240,7 @@ describe('Settings error banner', () => {
     // Before the click: this helper emits the very event under test.
     await whenSubscribed(calls)
 
-    await fireEvent.click(await screen.findByRole('button', { name: 'Add account' }))
+    await fireEvent.click(await screen.findByRole('button', { name: 'Add Claude account' }))
     expect(await screen.findByRole('alert')).toBeTruthy()
     expect(screen.getByText('a login is already in progress')).toBeTruthy()
 
@@ -265,6 +265,33 @@ describe('Settings error banner', () => {
 
     expect(screen.getByText('the login timed out')).toBeTruthy()
     expect(screen.getByRole('alert')).toBeTruthy()
+  })
+})
+
+/**
+ * Two buttons rather than a picker (Task 8): the whole flow is two clicks and
+ * a browser round trip, and a select that must be set before the button is one
+ * more state to get wrong. What matters here is only that each button tells
+ * the core which provider it is adding — `begin_login`'s own behaviour is
+ * covered by the tests above and in `crates/core`.
+ */
+describe('Settings add account buttons', () => {
+  it('asks the core which provider is being added', async () => {
+    const calls = mockBackend({ loginUrls: { loopback: null, manual: 'x' } })
+
+    render(Settings)
+    await fireEvent.click(await screen.findByRole('button', { name: /add codex account/i }))
+
+    expect(calls).toContainEqual({ cmd: 'begin_login', args: { provider: 'openai' } })
+  })
+
+  it('asks the core for the Claude provider when that button is pressed', async () => {
+    const calls = mockBackend({ loginUrls: { loopback: null, manual: 'x' } })
+
+    render(Settings)
+    await fireEvent.click(await screen.findByRole('button', { name: /add claude account/i }))
+
+    expect(calls).toContainEqual({ cmd: 'begin_login', args: { provider: 'anthropic' } })
   })
 })
 
@@ -588,7 +615,7 @@ describe('Settings manual login fallback', () => {
     render(Settings)
     await settle()
 
-    await fireEvent.click(screen.getByText('Add account'))
+    await fireEvent.click(screen.getByText('Add Claude account'))
     await settle()
 
     expect(screen.getByText(MANUAL)).toBeTruthy()
@@ -599,7 +626,7 @@ describe('Settings manual login fallback', () => {
     const calls = mockBackend({ loginUrls: { loopback: null, manual: MANUAL } })
     render(Settings)
     await settle()
-    await fireEvent.click(screen.getByText('Add account'))
+    await fireEvent.click(screen.getByText('Add Claude account'))
     await settle()
 
     await fireEvent.input(screen.getByLabelText('Code from the page'), {
@@ -642,7 +669,7 @@ describe('Settings manual login fallback', () => {
     })
     render(Settings)
     await settle()
-    await fireEvent.click(screen.getByText('Add account'))
+    await fireEvent.click(screen.getByText('Add Claude account'))
     await settle()
 
     await fireEvent.input(screen.getByLabelText('Code from the page'), {

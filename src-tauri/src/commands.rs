@@ -3,9 +3,9 @@ use quota_core::auth::callback::Callback;
 use quota_core::auth::pkce::{
     authorize_url_for, begin, manual_redirect_uri, parse_manual_code, success_redirect, PendingAuth,
 };
-use quota_core::auth::token::{exchange_code, revoke, TokenSet};
+use quota_core::auth::token::{backfill_email, exchange_code, revoke, TokenSet};
 use quota_core::model::AccountState;
-use quota_core::provider::{token_key, Provider};
+use quota_core::provider::{token_key, Provider, ProviderSpec};
 use quota_core::scheduler::PollPolicy;
 use quota_core::secrets::{encrypted_file::EncryptedFileStore, timeout::TimeoutStore, SecretStore};
 use quota_core::usage::raw::RawResponse;
@@ -211,6 +211,20 @@ pub struct ManualFallback {
     pub reason: String,
 }
 
+/// Which `ProviderSpec` a login should use.
+///
+/// **Anthropic's carries `state.cfg`'s debug-only `token_url` override**
+/// (`main.rs`'s `token_url()`), used for Step 11's local-mock verification.
+/// **OpenAI has none** — no authorization flow has ever been run against it,
+/// so there is nothing yet to point at a mock for — and its login always uses
+/// the production spec.
+fn login_cfg(state: &AppState, provider: Provider) -> ProviderSpec {
+    match provider {
+        Provider::Anthropic => state.cfg.clone(),
+        Provider::Openai => provider.spec(),
+    }
+}
+
 /// Starts a login. Returns both authorize URLs; the loopback callback, when
 /// there is one, is awaited in the background.
 ///
@@ -218,7 +232,7 @@ pub struct ManualFallback {
 /// definitely cannot be recovered, and `auth://manual-fallback` when the
 /// loopback path gave up but §10.3's paste path still can finish it.
 #[tauri::command]
-pub async fn begin_login(app: tauri::AppHandle) -> Result<LoginUrls, String> {
+pub async fn begin_login(app: tauri::AppHandle, provider: Provider) -> Result<LoginUrls, String> {
     if LOGIN_IN_FLIGHT
         .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
         .is_err()
@@ -227,7 +241,7 @@ pub async fn begin_login(app: tauri::AppHandle) -> Result<LoginUrls, String> {
     }
     let guard = LoginGuard;
 
-    let cfg = app.state::<AppState>().cfg.clone();
+    let cfg = login_cfg(&app.state::<AppState>(), provider);
 
     // Bind before building the authorize URL: `redirect_uri` must carry the
     // real port, and that exact string is replayed at token exchange
@@ -255,12 +269,17 @@ pub async fn begin_login(app: tauri::AppHandle) -> Result<LoginUrls, String> {
 
     // Stored before either path runs — see `AppState::pending_manual`. Only the
     // redirect_uri differs from `pending`; sharing the verifier and state is
-    // what lets a code issued for either URL be exchanged here.
-    *app.state::<AppState>().pending_manual.lock().unwrap() = Some(PendingAuth {
-        verifier: pending.verifier.clone(),
-        state: pending.state.clone(),
-        redirect_uri: manual_redirect_uri().to_string(),
-    });
+    // what lets a code issued for either URL be exchanged here. `provider`
+    // travels alongside it so `finish_manual_login` knows which token endpoint
+    // a pasted code belongs to.
+    *app.state::<AppState>().pending_manual.lock().unwrap() = Some((
+        provider,
+        PendingAuth {
+            verifier: pending.verifier.clone(),
+            state: pending.state.clone(),
+            redirect_uri: manual_redirect_uri().to_string(),
+        },
+    ));
 
     let Ok(cb) = cb else {
         // Nothing to wait on, so `guard` drops here and releases the
@@ -332,7 +351,7 @@ pub async fn begin_login(app: tauri::AppHandle) -> Result<LoginUrls, String> {
 
         // This path reports both outcomes as events, because nobody is waiting
         // on its return value — it runs in a detached task.
-        match complete_login(&state, &pending, code, returned_state).await {
+        match complete_login(&state, provider, &pending, code, returned_state).await {
             Ok(()) => {
                 let _ = handle.emit("accounts://changed", ());
             }
@@ -418,8 +437,10 @@ pub(crate) async fn finish_manual_login(state: &AppState, pasted: &str) -> Resul
     )?;
 
     // Cloned out from under the lock rather than held across the exchange: this
-    // is a `std::sync` guard and `complete_login` awaits.
-    let pending = state
+    // is a `std::sync` guard and `complete_login` awaits. `provider` travels
+    // with `pending` — see `AppState::pending_manual` — so a pasted Codex code
+    // is exchanged against Codex's token endpoint, not Anthropic's.
+    let (provider, pending) = state
         .pending_manual
         .lock()
         .unwrap()
@@ -438,7 +459,7 @@ pub(crate) async fn finish_manual_login(state: &AppState, pasted: &str) -> Resul
             .into());
     }
 
-    complete_login(state, &pending, code, returned_state).await
+    complete_login(state, provider, &pending, code, returned_state).await
 }
 
 /// Exchanges an authorization code, stores the token, and registers the
@@ -461,16 +482,33 @@ pub(crate) async fn finish_manual_login(state: &AppState, pasted: &str) -> Resul
 /// without one.
 pub(crate) async fn complete_login(
     state: &AppState,
+    provider: Provider,
     pending: &PendingAuth,
     code: &str,
     returned_state: &str,
 ) -> Result<(), String> {
-    let (tokens, identity) = exchange_code(&state.http, &state.cfg, pending, code, returned_state)
+    let cfg = login_cfg(state, provider);
+    let (tokens, identity) = exchange_code(&state.http, &cfg, provider, pending, code, returned_state)
         .await
         .map_err(|e| e.to_string())?;
-    // Without `account.uuid` there is no key. Never substitute the email
-    // (§9.3) — it is display-only and user-editable.
-    let identity = identity.ok_or("the token response carried no account block")?;
+    // Without an identifier there is no key. Never substitute the email
+    // (§9.3) — it is display-only and user-editable. Reachable only for
+    // Anthropic: `exchange_code` never returns `Ok((_, None))` for OpenAI,
+    // whose absence instead fails loudly through `AuthError::NoAccountIdentifier`
+    // above (Step 3 of the Codex login task).
+    let mut identity = identity.ok_or("the token response carried no account block")?;
+
+    // §9.3: OpenAI's token response may carry no email at all — that shape has
+    // never been measured — and a row whose label defaults to an empty string
+    // is one the user cannot tell apart from another. A no-op for Anthropic,
+    // whose response always carries one. A failed usage fetch here must not
+    // fail a login that already succeeded — `backfill_email` swallows it and
+    // leaves the label blank instead, which the user can rename.
+    let usage_url = match provider {
+        Provider::Anthropic => &state.usage_url,
+        Provider::Openai => &state.openai_usage_url,
+    };
+    backfill_email(&state.http, provider, usage_url, &mut identity, &tokens.access_token).await;
 
     // Serialization failure fails loudly. Falling through to the account write
     // would register an account with no credential behind it: `ensure_fresh`
@@ -485,16 +523,14 @@ pub(crate) async fn complete_login(
     // principle `refresh_account` applies when it answers AUTH_EXPIRED instead
     // of waiting on the refresh mutex.
     let store = state.secrets();
-    // `Provider::Anthropic`: this login flow is Anthropic's OAuth exchange —
-    // there is no Codex login path yet for it to be anything else.
-    let key = token_key(Provider::Anthropic, &identity.uuid);
+    let key = token_key(provider, &identity.uuid);
     tauri::async_runtime::spawn_blocking(move || store.put(&key, &blob))
         .await
         .map_err(|e| format!("the token store task failed: {e}"))?
         .map_err(|e| format!("the token could not be stored: {e}"))?;
 
     state
-        .register_authenticated(&identity.uuid, &identity.email)
+        .register_authenticated(provider, &identity.uuid, &identity.email)
         .await
         .map_err(|e| format!("the account could not be saved: {e}"))?;
 
@@ -869,15 +905,32 @@ mod tests {
     use wiremock::matchers::{method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
-    /// The manual pending a `begin_login` would have left behind.
+    /// The manual pending a `begin_login` would have left behind, for an
+    /// Anthropic login — every test below exercises that path, since
+    /// `Provider::Openai.spec()` has no mockable override (see `login_cfg`)
+    /// and so cannot be driven against a local server here.
     fn armed(state: &AppState) -> PendingAuth {
         let pending = PendingAuth {
             verifier: "v-verifier".into(),
             state: "s-state".into(),
             redirect_uri: manual_redirect_uri().to_string(),
         };
-        *state.pending_manual.lock().unwrap() = Some(pending.clone());
+        *state.pending_manual.lock().unwrap() = Some((Provider::Anthropic, pending.clone()));
         pending
+    }
+
+    /// `login_cfg` is the one place `begin_login` and `complete_login` decide
+    /// which endpoints a login talks to — Anthropic's carries whatever
+    /// `state.cfg` was overridden to (Step 11's local-mock verification);
+    /// OpenAI has no such override, so its login always resolves to the
+    /// production spec.
+    #[test]
+    fn anthropics_login_cfg_carries_the_override_openais_does_not() {
+        let mut state = app_state(Arc::new(MemoryStore::default()));
+        state.cfg.token_url = "http://127.0.0.1:1/overridden-for-a-test".into();
+
+        assert_eq!(login_cfg(&state, Provider::Anthropic).token_url, state.cfg.token_url);
+        assert_eq!(login_cfg(&state, Provider::Openai).token_url, Provider::Openai.spec().token_url);
     }
 
     fn token_body(account: Option<serde_json::Value>) -> serde_json::Value {
