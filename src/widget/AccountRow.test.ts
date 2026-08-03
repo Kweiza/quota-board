@@ -447,3 +447,81 @@ describe('AccountRow credit line', () => {
     expect(stale).toBeLessThan(read(freshRow.container))
   })
 })
+
+describe('AccountRow reset-credits line', () => {
+  it('renders nothing when there are no reset credits', () => {
+    render(AccountRow, {
+      account: acct({
+        provider: 'openai',
+        state: { kind: 'ok', windows: [], extra: null, fetched_at: NOW.toISOString() },
+      }),
+    })
+    expect(screen.queryByText(/reset credits/i)).toBeNull()
+  })
+
+  it('shows both counts when they differ', () => {
+    render(AccountRow, {
+      account: acct({
+        provider: 'openai',
+        state: {
+          kind: 'ok', windows: [], fetched_at: NOW.toISOString(),
+          extra: { kind: 'reset_credits', available: 1, applicable: 0 },
+        },
+      }),
+    })
+    expect(screen.getByText(/1 \(0 applicable\)/)).toBeTruthy()
+  })
+
+  it('shows one count when they agree', () => {
+    render(AccountRow, {
+      account: acct({
+        provider: 'openai',
+        state: {
+          kind: 'ok', windows: [], fetched_at: NOW.toISOString(),
+          extra: { kind: 'reset_credits', available: 2, applicable: 2 },
+        },
+      }),
+    })
+    expect(screen.getByText('2')).toBeTruthy()
+    expect(screen.queryByText(/applicable/)).toBeNull()
+  })
+
+  /**
+   * `.account.stale :global(.amounts)` reaches `CreditLine`'s third column by
+   * class name alone, with no `ResetCreditsLine`-specific rule — so this either
+   * already works because the class name matches, or the dimming silently does
+   * not reach a stale Codex row's figure, which is the exact bug `.amounts`
+   * joined that selector's list to fix in the first place (see the CSS comment
+   * above `.account.stale :global(.amounts)`). Confirmed rather than assumed.
+   */
+  it('dims the reset-credits figure on a stale row', () => {
+    const read = (root: HTMLElement) =>
+      Number(getComputedStyle(root.querySelector('.amounts') as HTMLElement).opacity)
+    const fetched = new Date(NOW.getTime() - 12 * 60_000).toISOString()
+
+    const staleRow = render(AccountRow, {
+      account: acct({
+        provider: 'openai',
+        state: {
+          kind: 'stale', windows: [], fetched_at: fetched,
+          extra: { kind: 'reset_credits', available: 1, applicable: 0 },
+        },
+      }),
+      now: NOW,
+    })
+    const stale = read(staleRow.container)
+    staleRow.unmount()
+
+    const freshRow = render(AccountRow, {
+      account: acct({
+        provider: 'openai',
+        state: {
+          kind: 'ok', windows: [], fetched_at: NOW.toISOString(),
+          extra: { kind: 'reset_credits', available: 1, applicable: 0 },
+        },
+      }),
+      now: NOW,
+    })
+    expect(stale).toBeLessThan(read(freshRow.container))
+  })
+})

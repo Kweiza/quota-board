@@ -1,6 +1,7 @@
 <script lang="ts">
   import Bar from './Bar.svelte'
   import CreditLine from './CreditLine.svelte'
+  import ResetCreditsLine from './ResetCreditsLine.svelte'
   import { relativeAge, untilHhMm } from '../lib/format'
   import type { AccountView, Provider } from '../lib/types'
 
@@ -75,13 +76,6 @@
    * cannot date (see `Entry::last_extra`).
    */
   $: extra = state.kind === 'ok' || state.kind === 'stale' ? state.extra : null
-  /**
-   * Filtered to the `credit` variant alone: `CreditLine` still expects
-   * `CreditSpend`'s shape, and dispatching the `reset_credits` variant onto
-   * its own line is a later task's job — this one only carries the `credit` →
-   * `extra` rename through without changing what a Claude row renders.
-   */
-  $: credit = extra !== null && extra.kind === 'credit' ? extra : null
   $: isStale = state.kind === 'stale'
 </script>
 
@@ -118,8 +112,10 @@
     {#if !hasWeekly}
       <div class="note small">weekly not reported</div>
     {/if}
-    {#if credit}
-      <CreditLine {credit} />
+    {#if extra?.kind === 'credit'}
+      <CreditLine credit={extra} />
+    {:else if extra?.kind === 'reset_credits'}
+      <ResetCreditsLine credits={extra} />
     {/if}
   {:else if state.kind === 'loading'}
     <div class="note">…</div>
