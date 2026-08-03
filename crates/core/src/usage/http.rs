@@ -1,5 +1,5 @@
 use crate::auth::token::{ReqwestHttp, ANTHROPIC_BETA};
-use crate::model::{CreditSpend, UsageWindow};
+use crate::model::{ExtraLine, UsageWindow};
 use crate::usage::parse::{parse_credit, parse_usage, ParseError};
 use crate::usage::raw::RawResponse;
 
@@ -74,12 +74,12 @@ pub struct CapturedFetch {
     /// non-2xx status. **Never a fabricated empty body** (CLAUDE.md: never
     /// demote a missing value).
     pub raw: Option<RawResponse>,
-    /// The monthly credit spend, when this account has a spending limit.
+    /// The optional line under the bars, when this account has one.
     ///
     /// Read beside `outcome` rather than folded into it: an account can have a
-    /// perfectly readable credit block in a body whose windows fail to parse,
-    /// and vice versa. Tying the two would drop one because the other broke.
-    pub credit: Option<CreditSpend>,
+    /// perfectly readable extra line in a body whose windows fail to parse, and
+    /// vice versa. Tying the two would drop one because the other broke.
+    pub extra: Option<ExtraLine>,
     pub outcome: Result<Vec<UsageWindow>, UsageError>,
 }
 
@@ -93,14 +93,14 @@ pub async fn fetch_usage_captured_at(
 ) -> CapturedFetch {
     let (status, body) = match fetch_usage_body_at(http, url, access_token).await {
         Ok(pair) => pair,
-        Err(e) => return CapturedFetch { raw: None, credit: None, outcome: Err(e) },
+        Err(e) => return CapturedFetch { raw: None, extra: None, outcome: Err(e) },
     };
     // Captured before parsing, deliberately: the body the debug window most
     // needs is the one `windows_from_body` is about to reject.
     let raw = Some(RawResponse::capture(status, &body));
     CapturedFetch {
         raw,
-        credit: parse_credit(&body),
+        extra: parse_credit(&body).map(ExtraLine::Credit),
         outcome: windows_from_body(&body),
     }
 }

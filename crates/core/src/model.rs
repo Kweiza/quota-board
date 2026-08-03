@@ -40,6 +40,37 @@ pub struct CreditSpend {
     pub percent: f64,
 }
 
+/// Codex's rate-limit reset credits.
+///
+/// **Not `CreditSpend`.** That type is money, with a limit and a percentage of
+/// it consumed. This is a count of one-shot resets, and it has no limit and no
+/// percentage — modelling it as money would put a meaningless denominator on
+/// screen.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ResetCredits {
+    /// Reset credits on the account.
+    pub available: u32,
+    /// The subset applicable to the limit currently in force.
+    ///
+    /// **Measured 0 while `available` was 1** (Spike F), so the two are not
+    /// interchangeable: an account can hold a credit that does nothing for the
+    /// limit it is actually hitting.
+    pub applicable: u32,
+}
+
+/// The one optional line a row may carry under its bars.
+///
+/// An enum rather than two `Option` fields because the two are mutually
+/// exclusive *per provider* — an Anthropic account has no reset credits and a
+/// Codex account has no monthly spend. The enum makes that a fact the type
+/// system holds rather than a convention a reader has to know.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum ExtraLine {
+    Credit(CreditSpend),
+    ResetCredits(ResetCredits),
+}
+
 /// Spec §7.1. All of these are user-visible states.
 ///
 /// **The serialized form must match the `AccountState` union in
@@ -50,19 +81,21 @@ pub struct CreditSpend {
 pub enum AccountState {
     /// Right after the account is added, before the first fetch.
     Loading,
-    /// `credit` is `None` for an account with no spending limit, which is the
-    /// normal case — it is not a failure and renders as no credit line at all.
-    /// Never a zero: see `usage::parse::parse_credit`.
+    /// `extra` is `None` for an account with nothing to show under its bars —
+    /// an Anthropic account with no spending limit, or a Codex account with no
+    /// reset credits. Both are the normal case and render as no line at all.
+    /// Never a zero: see `usage::anthropic::parse_credit` and
+    /// `usage::openai::parse_reset_credits`.
     Ok {
         windows: Vec<UsageWindow>,
-        credit: Option<CreditSpend>,
+        extra: Option<ExtraLine>,
         fetched_at: DateTime<Utc>,
     },
     /// Automatic polling failed but the last known value is kept. **Never
     /// render without its age.**
     Stale {
         windows: Vec<UsageWindow>,
-        credit: Option<CreditSpend>,
+        extra: Option<ExtraLine>,
         fetched_at: DateTime<Utc>,
     },
     Throttled { until: DateTime<Utc> },
@@ -135,5 +168,36 @@ mod tests {
         assert_eq!(Severity::from_percent(89.9), Severity::Yellow);
         assert_eq!(Severity::from_percent(90.0), Severity::Red);
         assert_eq!(Severity::from_percent(100.0), Severity::Red);
+    }
+
+    /// The serialized form is a contract with `src/lib/types.ts`. `tag = "kind"`
+    /// plus snake_case on the outside, and an internally tagged `extra` whose own
+    /// tag the TypeScript union switches on.
+    #[test]
+    fn extra_line_serializes_as_the_typescript_union_expects() {
+        let credit = ExtraLine::Credit(CreditSpend {
+            used_minor: 2231,
+            limit_minor: 2000,
+            currency: "USD".into(),
+            exponent: 2,
+            percent: 111.55,
+        });
+        let v = serde_json::to_value(&credit).unwrap();
+        assert_eq!(v["kind"], "credit");
+        assert_eq!(v["used_minor"], 2231);
+
+        let resets = ExtraLine::ResetCredits(ResetCredits { available: 1, applicable: 0 });
+        let v = serde_json::to_value(&resets).unwrap();
+        assert_eq!(v["kind"], "reset_credits");
+        assert_eq!(v["available"], 1);
+        assert_eq!(v["applicable"], 0);
+    }
+
+    /// Measured 2026-08-03: available 1, applicable 0. Collapsing them into one
+    /// number would tell the user they hold a usable credit when they do not.
+    #[test]
+    fn reset_credits_keeps_the_two_counts_apart() {
+        let r = ResetCredits { available: 1, applicable: 0 };
+        assert_ne!(r.available, r.applicable);
     }
 }
