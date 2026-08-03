@@ -50,7 +50,7 @@ pub async fn list_accounts(state: State<'_, AppState>) -> Result<Vec<AccountView
             uuid: a.account_id.clone(),
             label: a.display_label.clone(),
             email: a.email.clone(),
-            state: sched.state(&a.account_id).unwrap_or(AccountState::Loading),
+            state: sched.state(a.provider, &a.account_id).unwrap_or(AccountState::Loading),
         })
         .collect())
 }
@@ -102,7 +102,12 @@ pub async fn refresh_account(
         // `AccountRow.svelte`'s `throttled` branch renders this state as
         // "throttled, after HH:MM" and `AccountList.svelte` renders it as
         // "throttled, available after HH:MM". Cited by name: both files move.
-        if let Some(s @ AccountState::Throttled { .. }) = sched.state(&uuid) {
+        //
+        // `Provider::Anthropic` stopgap: `uuid` is a bare id from the wire, not
+        // (provider, id) — Task 9 makes the frontend provider-aware. Every
+        // account this command can reach today is Anthropic (see the same note
+        // a few lines down on `is_refreshing`).
+        if let Some(s @ AccountState::Throttled { .. }) = sched.state(Provider::Anthropic, &uuid) {
             return Ok(s);
         }
     }
@@ -128,13 +133,13 @@ pub async fn refresh_account(
     // by one poll (`IN_FLIGHT_RECLAIM_SECS`, derived in scheduler.rs), and this
     // is an async command, so the wait costs a task and not the UI thread.
     // `AccountRow.svelte` disables its button for the duration.
-    state.poll_one(&uuid).await;
+    state.poll_one(Provider::Anthropic, &uuid).await;
     let _ = app.emit("usage://updated", ());
     state
         .scheduler
         .lock()
         .await
-        .state(&uuid)
+        .state(Provider::Anthropic, &uuid)
         .ok_or_else(|| "unknown account".to_string())
 }
 
@@ -552,10 +557,11 @@ pub async fn remove_account(app: tauri::AppHandle, uuid: String) -> Result<(), S
     }
 
     // Lock order: scheduler before accounts.
-    state.scheduler.lock().await.remove(&uuid);
+    //
     // `uuid` here is a bare account id from the wire, not (provider, id) —
     // Task 9 makes the frontend provider-aware. Every account this command can
     // reach today is Anthropic, so that is the provider half of the key.
+    state.scheduler.lock().await.remove(Provider::Anthropic, &uuid);
     let removed = state
         .accounts
         .lock()
