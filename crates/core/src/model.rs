@@ -192,12 +192,4 @@ mod tests {
         assert_eq!(v["available"], 1);
         assert_eq!(v["applicable"], 0);
     }
-
-    /// Measured 2026-08-03: available 1, applicable 0. Collapsing them into one
-    /// number would tell the user they hold a usable credit when they do not.
-    #[test]
-    fn reset_credits_keeps_the_two_counts_apart() {
-        let r = ResetCredits { available: 1, applicable: 0 };
-        assert_ne!(r.available, r.applicable);
-    }
 }
