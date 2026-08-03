@@ -213,15 +213,17 @@ pub struct ManualFallback {
 
 /// Which `ProviderSpec` a login should use.
 ///
-/// **Anthropic's carries `state.cfg`'s debug-only `token_url` override**
-/// (`main.rs`'s `token_url()`), used for Step 11's local-mock verification.
-/// **OpenAI has none** — no authorization flow has ever been run against it,
-/// so there is nothing yet to point at a mock for — and its login always uses
-/// the production spec.
+/// Both carry a debug-only `token_url` override (`main.rs`'s `token_url()`
+/// and `openai_token_url()`), used for Step 11's local-mock verification —
+/// the same seam `usage_url`/`openai_usage_url` already give the usage
+/// endpoint. Without OpenAI's half, `Provider::Openai` always resolved to the
+/// real `auth.openai.com`, and nothing could exercise a Codex login —
+/// `begin_login` → `complete_login` → `register_authenticated` — without
+/// reaching the real network, which CLAUDE.md forbids a test to do.
 fn login_cfg(state: &AppState, provider: Provider) -> ProviderSpec {
     match provider {
         Provider::Anthropic => state.cfg.clone(),
-        Provider::Openai => provider.spec(),
+        Provider::Openai => state.openai_cfg.clone(),
     }
 }
 
@@ -905,32 +907,43 @@ mod tests {
     use wiremock::matchers::{method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
-    /// The manual pending a `begin_login` would have left behind, for an
-    /// Anthropic login — every test below exercises that path, since
-    /// `Provider::Openai.spec()` has no mockable override (see `login_cfg`)
-    /// and so cannot be driven against a local server here.
-    fn armed(state: &AppState) -> PendingAuth {
+    /// The manual pending a `begin_login` would have left behind, for the
+    /// given provider.
+    fn armed_as(state: &AppState, provider: Provider) -> PendingAuth {
         let pending = PendingAuth {
             verifier: "v-verifier".into(),
             state: "s-state".into(),
             redirect_uri: manual_redirect_uri().to_string(),
         };
-        *state.pending_manual.lock().unwrap() = Some((Provider::Anthropic, pending.clone()));
+        *state.pending_manual.lock().unwrap() = Some((provider, pending.clone()));
         pending
     }
 
+    /// `armed_as` fixed to `Provider::Anthropic`, which is what every test in
+    /// this module needed before Codex had a login path of its own.
+    fn armed(state: &AppState) -> PendingAuth {
+        armed_as(state, Provider::Anthropic)
+    }
+
     /// `login_cfg` is the one place `begin_login` and `complete_login` decide
-    /// which endpoints a login talks to — Anthropic's carries whatever
-    /// `state.cfg` was overridden to (Step 11's local-mock verification);
-    /// OpenAI has no such override, so its login always resolves to the
-    /// production spec.
+    /// which endpoints a login talks to. Each provider carries its own
+    /// debug-only override (`main.rs`'s `token_url()` / `openai_token_url()`),
+    /// and the two must stay independent — overriding one must never leak
+    /// into the other, which is the whole reason `AppState` carries `cfg` and
+    /// `openai_cfg` as two fields rather than one.
     #[test]
-    fn anthropics_login_cfg_carries_the_override_openais_does_not() {
+    fn each_providers_login_cfg_carries_its_own_override() {
         let mut state = app_state(Arc::new(MemoryStore::default()));
-        state.cfg.token_url = "http://127.0.0.1:1/overridden-for-a-test".into();
+        state.cfg.token_url = "http://127.0.0.1:1/overridden-anthropic".into();
+        state.openai_cfg.token_url = "http://127.0.0.1:1/overridden-openai".into();
 
         assert_eq!(login_cfg(&state, Provider::Anthropic).token_url, state.cfg.token_url);
-        assert_eq!(login_cfg(&state, Provider::Openai).token_url, Provider::Openai.spec().token_url);
+        assert_eq!(login_cfg(&state, Provider::Openai).token_url, state.openai_cfg.token_url);
+        assert_ne!(
+            login_cfg(&state, Provider::Anthropic).token_url,
+            login_cfg(&state, Provider::Openai).token_url,
+            "the two providers' overrides must not collide"
+        );
     }
 
     fn token_body(account: Option<serde_json::Value>) -> serde_json::Value {
@@ -950,6 +963,14 @@ mod tests {
     async fn state_against(server: &MockServer) -> AppState {
         let mut state = app_state(Arc::new(MemoryStore::default()));
         state.cfg.token_url = format!("{}/v1/oauth/token", server.uri());
+        state
+    }
+
+    /// Codex's half of `state_against`, pointed at `openai_cfg` instead of
+    /// `cfg` — what makes a Codex login reachable against a mock at all.
+    async fn state_against_openai(server: &MockServer) -> AppState {
+        let mut state = app_state(Arc::new(MemoryStore::default()));
+        state.openai_cfg.token_url = format!("{}/oauth/token", server.uri());
         state
     }
 
@@ -1014,6 +1035,59 @@ mod tests {
 
         // The login is over; the paste form must not stay armed with a value
         // that would refuse every later code as belonging to an older attempt.
+        assert!(
+            state.pending_manual.lock().unwrap().is_none(),
+            "the finished login was left armed"
+        );
+    }
+
+    /// The Codex counterpart to the test above — the same coverage
+    /// `Provider::Anthropic` already had, driven through `finish_manual_login`
+    /// → `complete_login` → `register_authenticated` for `Provider::Openai`
+    /// against a mock standing in for `auth.openai.com`. `begin_login` itself
+    /// still cannot be called directly (it needs a real `AppHandle`), the
+    /// same reason the Anthropic test above goes through the paste path
+    /// rather than the loopback one.
+    ///
+    /// `state_against_openai`'s `openai_cfg.token_url` override is what makes
+    /// this reachable at all: before it existed, `login_cfg` resolved every
+    /// `Provider::Openai` login straight to the real `auth.openai.com`, and
+    /// no test could drive this path without reaching the real network,
+    /// which CLAUDE.md forbids.
+    #[tokio::test]
+    async fn a_good_codex_paste_stores_the_token_and_registers_the_account() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/oauth/token"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "access_token": "codex-at-1",
+                "refresh_token": "codex-rt-1",
+                "expires_in": 28799,
+                // OpenAI's shape has never been measured — `account_id` is one
+                // of `account_id_from`'s three guessed candidates.
+                "account_id": "codex-user-1"
+            })))
+            .mount(&server)
+            .await;
+
+        let state = state_against_openai(&server).await;
+        armed_as(&state, Provider::Openai);
+
+        finish_manual_login(&state, "the-code#s-state").await.unwrap();
+
+        let stored = state.secrets().get(&token_key(Provider::Openai, "codex-user-1")).unwrap();
+        assert!(stored.is_some(), "the token never reached the store");
+        let tokens: TokenSet = serde_json::from_slice(&stored.unwrap()).unwrap();
+        assert_eq!(tokens.access_token, "codex-at-1");
+
+        let accounts = state.accounts.lock().await;
+        let a = accounts
+            .list()
+            .iter()
+            .find(|a| a.account_id == "codex-user-1")
+            .expect("the Codex account was not registered");
+        assert_eq!(a.provider, Provider::Openai, "the account did not carry the Codex provider");
+
         assert!(
             state.pending_manual.lock().unwrap().is_none(),
             "the finished login was left armed"

@@ -199,6 +199,7 @@ fn main() {
                 pending_manual: std::sync::Mutex::new(None),
                 http: ReqwestHttp::new()?,
                 cfg: ProviderSpec { token_url: token_url(), ..Provider::Anthropic.spec() },
+                openai_cfg: ProviderSpec { token_url: openai_token_url(), ..Provider::Openai.spec() },
                 refresh_locks: RefreshLocks::default(),
                 poll_permit: tokio::sync::Mutex::new(()),
                 snapshots_path,
@@ -314,4 +315,19 @@ fn token_url() -> String {
 #[cfg(not(debug_assertions))]
 fn token_url() -> String {
     Provider::Anthropic.spec().token_url
+}
+
+/// Codex's half of the same override. Its own env var rather than reusing
+/// `QUOTA_TOKEN_URL` for both, the same reason `openai_usage_url()` above has
+/// its own: a local run exercising both providers side by side needs two
+/// independent mock servers. **Debug-only for the same reason `token_url()`
+/// is** — the token endpoint receives a refresh token, so an env-settable URL
+/// in a shipped binary would be a credential exfiltration switch.
+#[cfg(debug_assertions)]
+fn openai_token_url() -> String {
+    std::env::var("QUOTA_OPENAI_TOKEN_URL").unwrap_or_else(|_| Provider::Openai.spec().token_url)
+}
+#[cfg(not(debug_assertions))]
+fn openai_token_url() -> String {
+    Provider::Openai.spec().token_url
 }
