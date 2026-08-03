@@ -204,6 +204,7 @@ fn main() {
                 poll_permit: tokio::sync::Mutex::new(()),
                 snapshots_path,
                 usage_url: usage_url(),
+                openai_usage_url: openai_usage_url(),
                 webview_visible: AtomicBool::new(true),
             });
 
@@ -291,6 +292,20 @@ fn usage_url() -> String {
 #[cfg(not(debug_assertions))]
 fn usage_url() -> String {
     quota_core::usage::http::USAGE_URL.to_string()
+}
+
+/// Codex's half of the same override. Its own env var rather than reusing
+/// `QUOTA_USAGE_URL` for both: the two providers are fetched from different
+/// mock servers whenever a local run needs to exercise them side by side, the
+/// same reason `AppState` carries two fields rather than one.
+#[cfg(debug_assertions)]
+fn openai_usage_url() -> String {
+    std::env::var("QUOTA_OPENAI_USAGE_URL")
+        .unwrap_or_else(|_| quota_core::usage::http::OPENAI_USAGE_URL.to_string())
+}
+#[cfg(not(debug_assertions))]
+fn openai_usage_url() -> String {
+    quota_core::usage::http::OPENAI_USAGE_URL.to_string()
 }
 
 #[cfg(debug_assertions)]

@@ -126,7 +126,17 @@ pub struct AppState {
     /// hardcodes §5.1's production URL (`USAGE_URL` in usage/http.rs). This is
     /// what makes Step 11 executable at all. **Do not add a trait to `usage`**
     /// — CLAUDE.md and design.md §4.3 forbid it; the URL is the seam.
+    ///
+    /// Anthropic's half of the pair. A single field here — before this task —
+    /// sent every account through the same URL regardless of its provider, so
+    /// a Codex account would have been queried against `api.anthropic.com`
+    /// with an OpenAI access token. See `openai_usage_url` below.
     pub usage_url: String,
+    /// Codex's half of the pair. Kept as its own field rather than a map:
+    /// `Provider` is "a closed set of two" (provider.rs's own doc comment),
+    /// and a `HashMap` would buy nothing over one field per variant while
+    /// making a typo'd key a runtime `None` instead of a compile error.
+    pub openai_usage_url: String,
     /// §6.3. What the widget webview last reported. Defaults to `true` so a
     /// webview that never reports at all cannot freeze polling. Combined with
     /// the window's own state by the loop, which is the single writer of
@@ -369,8 +379,13 @@ impl AppState {
         // it alone would leave a quarantined entry AUTH_DEAD forever — and
         // Task 17 persists `quarantined`, so that now survives every restart.
         // Drop the entry and rebuild it.
-        sched.remove(uuid);
-        sched.add(uuid);
+        //
+        // `Provider::Anthropic`: this login flow is Anthropic's OAuth exchange
+        // — there is no Codex login path yet for it to be anything else, the
+        // same reason `finish_manual_login` in `commands.rs` hardcodes it for
+        // `token_key`.
+        sched.remove(Provider::Anthropic, uuid);
+        sched.add(Provider::Anthropic, uuid);
         // ...which hands the rebuilt entry `add`'s startup stagger, and — since
         // it goes to the end of `order` — the largest offset of the lot.
         // Measured on the device: the third account added through the settings
@@ -379,23 +394,23 @@ impl AppState {
         // worst case. §6.1's stagger is about startup and about staying
         // de-synchronised over time; one deliberate registration is neither, and
         // §6.1's floor is untouched — see `make_due_now`.
-        sched.make_due_now(uuid);
+        sched.make_due_now(Provider::Anthropic, uuid);
         Ok(())
     }
 
     /// The polling loop's entry point: waits for the global permit.
-    pub async fn poll_one(&self, uuid: &str) {
+    pub async fn poll_one(&self, provider: Provider, uuid: &str) {
         let _permit = self.poll_permit.lock().await;
-        self.poll_guarded(uuid).await;
+        self.poll_guarded(provider, uuid).await;
     }
 
-    async fn poll_guarded(&self, uuid: &str) {
+    async fn poll_guarded(&self, provider: Provider, uuid: &str) {
         // Per-account exclusion, and the reclaim that covers an early return.
-        if !self.scheduler.lock().await.begin_poll(uuid) {
+        if !self.scheduler.lock().await.begin_poll(provider, uuid) {
             return;
         }
-        self.poll_claimed(uuid).await;
-        self.scheduler.lock().await.end_poll(uuid);
+        self.poll_claimed(provider, uuid).await;
+        self.scheduler.lock().await.end_poll(provider, uuid);
     }
 
     /// **A panic here stops all polling for the life of the process.** This is
@@ -408,7 +423,7 @@ impl AppState {
     ///
     /// Nothing below may therefore panic on input it does not control, which is
     /// why the unclassifiable-error arm degrades instead of asserting.
-    async fn poll_claimed(&self, uuid: &str) {
+    async fn poll_claimed(&self, provider: Provider, uuid: &str) {
         // Task 10b owns read -> refresh -> write. Inlining it here would let
         // scheduler polls and manual refreshes invalidate each other's refresh
         // tokens (§10.5).
@@ -416,15 +431,12 @@ impl AppState {
         // one. A store swapped in mid-poll therefore takes effect from the
         // next poll, and this one finishes against the store it started with.
         let store = self.secrets();
-        // `Provider::Anthropic` is temporary, matching `fetch_usage_captured_at`
-        // below: this account's own provider is not yet threaded through the
-        // polling loop. Task 6 replaces both with the account's provider.
         let fresh = match ensure_fresh(
             &self.http,
             &self.cfg,
             store.as_ref(),
             &self.refresh_locks,
-            Provider::Anthropic,
+            provider,
             uuid,
         )
         .await
@@ -434,7 +446,7 @@ impl AppState {
                 // §7.1: "There is one mapping, in the core, and every caller
                 // uses it rather than deriving its own." Not re-written here.
                 let kind = FailureKind::from_stored_token_error(&e);
-                self.record(uuid, kind).await;
+                self.record(provider, uuid, kind).await;
                 return;
             }
         };
@@ -451,18 +463,13 @@ impl AppState {
 
         // §5.5: capture before classifying, so the body that failed to parse —
         // the one the debug window exists for — is retained too.
-        //
-        // `Provider::Anthropic` is temporary: this account's own provider is
-        // not yet threaded through the polling loop. Task 6 replaces this with
-        // the account's provider, alongside `self.usage_url` becoming
-        // per-provider.
-        let fetched = fetch_usage_captured_at(
-            &self.http,
-            Provider::Anthropic,
-            &self.usage_url,
-            &fresh.tokens.access_token,
-        )
-        .await;
+        let usage_url = match provider {
+            Provider::Anthropic => &self.usage_url,
+            Provider::Openai => &self.openai_usage_url,
+        };
+        let fetched =
+            fetch_usage_captured_at(&self.http, provider, usage_url, &fresh.tokens.access_token)
+                .await;
         if let Some(raw) = fetched.raw {
             self.record_raw(uuid, raw);
         }
@@ -474,8 +481,8 @@ impl AppState {
                 let fp = fingerprint(&fresh.tokens.access_token);
                 let snap = {
                     let mut sched = self.scheduler.lock().await;
-                    sched.record_success(uuid, windows, extra);
-                    sched.snapshot(uuid, &fp)
+                    sched.record_success(provider, uuid, windows, extra);
+                    sched.snapshot(provider, uuid, &fp)
                 };
                 // Taken from the snapshot rather than read off the clock again,
                 // so the file and the screen cannot disagree about when this
@@ -486,9 +493,7 @@ impl AppState {
                     let path = self.snapshots_path.clone();
                     let id = uuid.to_string();
                     let written = tauri::async_runtime::spawn_blocking(move || {
-                        // `Provider::Anthropic` stopgap — see `ensure_fresh`
-                        // above.
-                        save_snapshot(&path, Provider::Anthropic, &id, &snap)
+                        save_snapshot(&path, provider, &id, &snap)
                     })
                     .await;
                     // Not swallowed with `let _ =`: a cache that silently never
@@ -504,7 +509,7 @@ impl AppState {
                 // test below pins.
                 if let Some(at) = polled_at {
                     let mut accounts = self.accounts.lock().await;
-                    if let Err(e) = persist_last_ok(&mut accounts, uuid, at) {
+                    if let Err(e) = persist_last_ok(&mut accounts, provider, uuid, at) {
                         eprintln!("{uuid}: the successful poll could not be recorded: {e}");
                     }
                 }
@@ -513,7 +518,7 @@ impl AppState {
             // for, by design: folding it into `record_failure` would discard the
             // `Retry-After` that §6.2 makes the entire input to the policy.
             Err(UsageError::Throttled { retry_after_secs }) => {
-                self.scheduler.lock().await.record_throttle(uuid, retry_after_secs)
+                self.scheduler.lock().await.record_throttle(provider, uuid, retry_after_secs)
             }
             Err(e) => {
                 // `Throttled` is the only `None` today, and it is handled
@@ -533,16 +538,16 @@ impl AppState {
                     );
                     FailureKind::Network
                 });
-                self.record(uuid, kind).await;
+                self.record(provider, uuid, kind).await;
             }
         }
     }
 
-    async fn record(&self, uuid: &str, kind: FailureKind) {
-        self.scheduler.lock().await.record_failure(uuid, kind);
+    async fn record(&self, provider: Provider, uuid: &str, kind: FailureKind) {
+        self.scheduler.lock().await.record_failure(provider, uuid, kind);
         if kind == FailureKind::AuthDead {
             let mut accounts = self.accounts.lock().await;
-            if let Err(e) = persist_quarantine(&mut accounts, uuid) {
+            if let Err(e) = persist_quarantine(&mut accounts, provider, uuid) {
                 eprintln!("{uuid}: the quarantine could not be persisted: {e}");
             }
         }
@@ -579,9 +584,9 @@ pub async fn poll_loop(handle: tauri::AppHandle) {
         let visible = shown && state.webview_visible.load(Ordering::Relaxed);
         state.scheduler.lock().await.set_visible(visible);
 
-        let due: Vec<String> = state.scheduler.lock().await.due();
-        for uuid in due {
-            state.poll_one(&uuid).await;
+        let due: Vec<(Provider, String)> = state.scheduler.lock().await.due();
+        for (provider, uuid) in due {
+            state.poll_one(provider, &uuid).await;
             let _ = handle.emit("usage://updated", ());
         }
     }
@@ -671,7 +676,7 @@ pub(crate) mod tests {
         let mut scheduler = Scheduler::new(PollPolicy::with_interval_secs(300), SystemClock);
         for id in ["a", "b"] {
             accounts.upsert(account(id)).unwrap();
-            scheduler.add(id);
+            scheduler.add(Provider::Anthropic, id);
         }
         AppState {
             scheduler: Mutex::new(scheduler),
@@ -690,6 +695,7 @@ pub(crate) mod tests {
             poll_permit: Mutex::new(()),
             snapshots_path: tmp("snapshots"),
             usage_url: "http://127.0.0.1:1/never".into(),
+            openai_usage_url: "http://127.0.0.1:1/never".into(),
             webview_visible: AtomicBool::new(true),
         }
     }
@@ -720,10 +726,10 @@ pub(crate) mod tests {
         let state = app_state(secrets);
 
         let started = Instant::now();
-        state.poll_one("a").await;
+        state.poll_one(Provider::Anthropic, "a").await;
         // The second account is the real assertion: it only gets here if a
         // released `poll_permit`.
-        state.poll_one("b").await;
+        state.poll_one(Provider::Anthropic, "b").await;
         let waited = started.elapsed();
 
         assert!(
@@ -734,7 +740,7 @@ pub(crate) mod tests {
         let sched = state.scheduler.lock().await;
         for id in ["a", "b"] {
             assert_eq!(
-                sched.state(id),
+                sched.state(Provider::Anthropic, id),
                 Some(AccountState::SecretsLocked),
                 "{id} should have recorded a locked store and moved on"
             );
@@ -745,7 +751,7 @@ pub(crate) mod tests {
         // reports nothing. This assertion has to be able to fail out loud.
         drop(sched);
         assert!(
-            tokio::time::timeout(Duration::from_secs(5), state.poll_one("a"))
+            tokio::time::timeout(Duration::from_secs(5), state.poll_one(Provider::Anthropic, "a"))
                 .await
                 .is_ok(),
             "the global poll permit was never released"
@@ -772,9 +778,9 @@ pub(crate) mod tests {
         // without ever blocking. What matters is that it is reached at all: a
         // timed-out store would read `SECRETS_LOCKED` instead.
         let state = app_state(secrets);
-        state.poll_one("a").await;
+        state.poll_one(Provider::Anthropic, "a").await;
         assert_eq!(
-            state.scheduler.lock().await.state("a"),
+            state.scheduler.lock().await.state(Provider::Anthropic, "a"),
             Some(AccountState::AuthDead),
             "a healthy store must reach the credential check, not report a locked store"
         );
@@ -817,7 +823,7 @@ pub(crate) mod tests {
                 let sched = s.scheduler.lock().await;
                 tokio::time::sleep(Duration::from_millis(200)).await;
                 let accounts = s.accounts.lock().await;
-                accounts.list().len() + usize::from(sched.state("a").is_some())
+                accounts.list().len() + usize::from(sched.state(Provider::Anthropic, "a").is_some())
             })
         };
         tokio::time::sleep(Duration::from_millis(50)).await;
@@ -862,9 +868,9 @@ pub(crate) mod tests {
                 })
                 .unwrap();
         }
-        state.scheduler.lock().await.record_failure("a", FailureKind::AuthDead);
+        state.scheduler.lock().await.record_failure(Provider::Anthropic, "a", FailureKind::AuthDead);
         assert_eq!(
-            state.scheduler.lock().await.state("a"),
+            state.scheduler.lock().await.state(Provider::Anthropic, "a"),
             Some(AccountState::AuthDead),
             "premise: the account reads as quarantined before the re-login"
         );
@@ -889,7 +895,7 @@ pub(crate) mod tests {
             assert!(!a.quarantined, "the quarantine survived the re-login on disk");
         }
         assert_ne!(
-            state.scheduler.lock().await.state("a"),
+            state.scheduler.lock().await.state(Provider::Anthropic, "a"),
             Some(AccountState::AuthDead),
             "the scheduler entry still reads AUTH_DEAD after a successful re-login"
         );
@@ -935,9 +941,9 @@ pub(crate) mod tests {
         }
 
         let state = app_state_with(Arc::new(LockedStore), StoreKind::NoBackend, tmp("settings"));
-        state.poll_one("a").await;
+        state.poll_one(Provider::Anthropic, "a").await;
         assert_eq!(
-            state.scheduler.lock().await.state("a"),
+            state.scheduler.lock().await.state(Provider::Anthropic, "a"),
             Some(AccountState::SecretsLocked),
             "premise: with no store open every account reads as locked (§7.1)"
         );
@@ -951,9 +957,9 @@ pub(crate) mod tests {
         drop(state.install_store(Arc::new(opened), StoreKind::EncryptedFile));
         assert_eq!(state.store_kind(), StoreKind::EncryptedFile);
 
-        state.poll_one("a").await;
+        state.poll_one(Provider::Anthropic, "a").await;
         assert_eq!(
-            state.scheduler.lock().await.state("a"),
+            state.scheduler.lock().await.state(Provider::Anthropic, "a"),
             Some(AccountState::Network),
             "the fallback store was installed but the poll path did not read it"
         );
@@ -1023,20 +1029,20 @@ pub(crate) mod tests {
     #[tokio::test]
     async fn an_account_registered_through_the_login_flow_is_polled_at_once() {
         let state = app_state(Arc::new(LockedStore));
-        let b_before = state.scheduler.lock().await.next_wake("b").unwrap();
+        let b_before = state.scheduler.lock().await.next_wake(Provider::Anthropic, "b").unwrap();
 
         state.register_authenticated("c", "c@example.invalid").await.unwrap();
 
         let sched = state.scheduler.lock().await;
         assert!(
-            sched.next_wake("c").unwrap() <= Utc::now(),
+            sched.next_wake(Provider::Anthropic, "c").unwrap() <= Utc::now(),
             "the account the user just added waits out the startup stagger"
         );
         // Single-account by design: §6.1's stagger is what buys the deliberate
         // decision not to implement jitter, so registering one account must not
         // flatten the schedule of the others.
         assert_eq!(
-            sched.next_wake("b").unwrap(),
+            sched.next_wake(Provider::Anthropic, "b").unwrap(),
             b_before,
             "registering one account moved another account's schedule"
         );

@@ -282,6 +282,14 @@ pub const SCHEDULER_STATE_VERSION: u32 = 1;
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct EntryTiming {
     pub uuid: String,
+    /// The other half of the entry key. `#[serde(default)]` so a file written
+    /// before this field existed keeps loading: every entry in such a file was
+    /// necessarily Anthropic's, which is exactly what `Provider::Default`
+    /// gives it. No version bump is needed — the *meaning* of every existing
+    /// field is unchanged, and the default reconstructs the one provider that
+    /// could have written the old file.
+    #[serde(default)]
+    pub provider: Provider,
     pub next_due_at: DateTime<Utc>,
     pub backoff_level: u32,
     /// §6.2's server-ordered wait. **The reason this type exists.**
@@ -314,6 +322,10 @@ pub struct UnsupportedStateVersion {
 }
 
 struct Entry {
+    /// §6.1's per-provider floor lives here, on the entry, because the account
+    /// it belongs to is the unit a floor applies to — not the schedule as a
+    /// whole. See `effective_interval`.
+    provider: Provider,
     next_due_at: DateTime<Utc>,
     backoff_level: u32,
     last_windows: Option<Vec<UsageWindow>>,
@@ -384,11 +396,39 @@ impl Entry {
     }
 }
 
+/// The entry map's key. A bare id is not unique: two providers may issue the
+/// same account id (measured, `docs/research/codex-usage-endpoint.md`), and a
+/// map keyed on the id alone would let the second `add` silently overwrite the
+/// first — one of the user's accounts would vanish from the widget with no
+/// error anywhere.
+type EntryKey = (Provider, String);
+
+fn entry_key(provider: Provider, uuid: &str) -> EntryKey {
+    (provider, uuid.to_string())
+}
+
+/// The user's chosen interval, raised to this account's provider floor.
+///
+/// Raised rather than rejected: a user who sets 180s and adds a provider
+/// with a higher floor should keep their Claude accounts at 180 rather than
+/// have every account slowed to the strictest floor in the list.
+///
+/// A free function rather than a `Scheduler` method taking `&self`: every
+/// call site needs it in the same breath as a mutable borrow of
+/// `self.entries` (to read `e.provider` off the entry it is about to update),
+/// and a method borrowing the whole `Scheduler` cannot be called while any
+/// part of it is already borrowed mutably. Taking the two plain values it
+/// actually needs sidesteps that instead of fighting it.
+fn effective_interval(policy_interval: TimeDelta, provider: Provider) -> TimeDelta {
+    let floor = TimeDelta::seconds(provider.min_interval_secs() as i64);
+    policy_interval.max(floor)
+}
+
 pub struct Scheduler<C: Clock> {
     policy: PollPolicy,
     clock: C,
-    entries: HashMap<String, Entry>,
-    order: Vec<String>,
+    entries: HashMap<EntryKey, Entry>,
+    order: Vec<EntryKey>,
     visible: bool,
 }
 
@@ -397,15 +437,17 @@ impl<C: Clock> Scheduler<C> {
         Self { policy, clock, entries: HashMap::new(), order: Vec::new(), visible: true }
     }
 
-    pub fn add(&mut self, uuid: &str) {
-        if self.entries.contains_key(uuid) {
+    pub fn add(&mut self, provider: Provider, uuid: &str) {
+        let key = entry_key(provider, uuid);
+        if self.entries.contains_key(&key) {
             return;
         }
         // Stagger: the nth account is first polled n * stagger later.
         let offset = self.policy.stagger * self.order.len() as i32;
         self.entries.insert(
-            uuid.to_string(),
+            key.clone(),
             Entry {
+                provider,
                 next_due_at: self.clock.now() + offset,
                 backoff_level: 0,
                 last_windows: None,
@@ -418,12 +460,13 @@ impl<C: Clock> Scheduler<C> {
                 last_attempt_at: None,
             },
         );
-        self.order.push(uuid.to_string());
+        self.order.push(key);
     }
 
-    pub fn remove(&mut self, uuid: &str) {
-        self.entries.remove(uuid);
-        self.order.retain(|x| x != uuid);
+    pub fn remove(&mut self, provider: Provider, uuid: &str) {
+        let key = entry_key(provider, uuid);
+        self.entries.remove(&key);
+        self.order.retain(|k| *k != key);
     }
 
     /// The policy the loop is **actually** running under. `get_settings` reads
@@ -459,12 +502,13 @@ impl<C: Clock> Scheduler<C> {
     pub fn set_policy(&mut self, policy: PollPolicy) {
         self.policy = policy;
         let now = self.clock.now();
-        let interval = self.policy.interval;
+        let policy_interval = self.policy.interval;
         for e in self.entries.values_mut() {
             if e.quarantined || e.throttled_until.is_some_and(|t| t > now) {
                 continue;
             }
             let Some(attempted) = e.last_attempt_at else { continue };
+            let interval = effective_interval(policy_interval, e.provider);
             let factor = 1i32 << e.backoff_level;
             e.next_due_at = interval
                 .checked_mul(factor)
@@ -489,8 +533,8 @@ impl<C: Clock> Scheduler<C> {
     /// the two exclusions, so `make_due_now` cannot drift from either.
     fn pull_forward(&mut self) {
         let now = self.clock.now();
-        let floor = TimeDelta::seconds(PollPolicy::MIN_INTERVAL_SECS);
         for e in self.entries.values_mut() {
+            let floor = TimeDelta::seconds(e.provider.min_interval_secs() as i64);
             e.pull_forward(now, floor);
         }
     }
@@ -548,26 +592,30 @@ impl<C: Clock> Scheduler<C> {
     /// `register_authenticated` has already cleared the quarantine before it
     /// gets here, so that exclusion is defence in depth against a future caller
     /// rather than a case this one can reach.
-    pub fn make_due_now(&mut self, uuid: &str) {
+    pub fn make_due_now(&mut self, provider: Provider, uuid: &str) {
         let now = self.clock.now();
-        let floor = TimeDelta::seconds(PollPolicy::MIN_INTERVAL_SECS);
-        if let Some(e) = self.entries.get_mut(uuid) {
+        if let Some(e) = self.entries.get_mut(&entry_key(provider, uuid)) {
+            let floor = TimeDelta::seconds(e.provider.min_interval_secs() as i64);
             e.pull_forward(now, floor);
         }
     }
 
     /// Accounts that should be polled right now. **At most one** — global
     /// concurrency of 1.
-    pub fn due(&self) -> Vec<String> {
+    ///
+    /// Returns the `(Provider, uuid)` pair, not the bare id: two providers may
+    /// issue the same account id, and a caller that gets only the id back has
+    /// no way to tell the two apart when it acts on the result.
+    pub fn due(&self) -> Vec<(Provider, String)> {
         if !self.visible {
             return Vec::new();
         }
         let now = self.clock.now();
-        let floor = TimeDelta::seconds(PollPolicy::MIN_INTERVAL_SECS);
         self.order
             .iter()
-            .filter(|id| {
-                self.entries.get(*id).is_some_and(|e| {
+            .filter(|key| {
+                self.entries.get(*key).is_some_and(|e| {
+                    let floor = TimeDelta::seconds(e.provider.min_interval_secs() as i64);
                     !e.quarantined
                         && e.throttled_until.is_none_or(|t| t <= now)
                         && e.next_due_at <= now
@@ -597,9 +645,9 @@ impl<C: Clock> Scheduler<C> {
     /// it for the polling loop via `.take(1)`, but manual refresh never goes
     /// through `due()` — this is what covers that path. An unknown uuid is
     /// refused too: there is nothing to poll.
-    pub fn begin_poll(&mut self, uuid: &str) -> bool {
+    pub fn begin_poll(&mut self, provider: Provider, uuid: &str) -> bool {
         let now = self.clock.now();
-        match self.entries.get_mut(uuid) {
+        match self.entries.get_mut(&entry_key(provider, uuid)) {
             Some(e) if !e.is_in_flight(now) => {
                 e.in_flight_since = Some(now);
                 e.last_attempt_at = Some(now);
@@ -609,14 +657,14 @@ impl<C: Clock> Scheduler<C> {
         }
     }
 
-    pub fn end_poll(&mut self, uuid: &str) {
-        if let Some(e) = self.entries.get_mut(uuid) {
+    pub fn end_poll(&mut self, provider: Provider, uuid: &str) {
+        if let Some(e) = self.entries.get_mut(&entry_key(provider, uuid)) {
             e.in_flight_since = None;
         }
     }
 
-    pub fn next_wake(&self, uuid: &str) -> Option<DateTime<Utc>> {
-        self.entries.get(uuid).map(|e| e.next_due_at)
+    pub fn next_wake(&self, provider: Provider, uuid: &str) -> Option<DateTime<Utc>> {
+        self.entries.get(&entry_key(provider, uuid)).map(|e| e.next_due_at)
     }
 
     /// `extra` is overwritten on every success, `None` included: an account
@@ -624,27 +672,28 @@ impl<C: Clock> Scheduler<C> {
     /// last figure it ever reported.
     pub fn record_success(
         &mut self,
+        provider: Provider,
         uuid: &str,
         windows: Vec<UsageWindow>,
         extra: Option<ExtraLine>,
     ) {
         let now = self.clock.now();
-        let interval = self.policy.interval;
-        if let Some(e) = self.entries.get_mut(uuid) {
+        let policy_interval = self.policy.interval;
+        if let Some(e) = self.entries.get_mut(&entry_key(provider, uuid)) {
             e.last_windows = Some(windows);
             e.last_extra = extra;
             e.last_fetched_at = Some(now);
             e.last_failure = None;
             e.throttled_until = None;
             e.backoff_level = 0;
-            e.next_due_at = now + interval;
+            e.next_due_at = now + effective_interval(policy_interval, e.provider);
         }
     }
 
-    pub fn record_failure(&mut self, uuid: &str, kind: FailureKind) {
+    pub fn record_failure(&mut self, provider: Provider, uuid: &str, kind: FailureKind) {
         let now = self.clock.now();
-        let interval = self.policy.interval;
-        if let Some(e) = self.entries.get_mut(uuid) {
+        let policy_interval = self.policy.interval;
+        if let Some(e) = self.entries.get_mut(&entry_key(provider, uuid)) {
             e.last_failure = Some(kind);
             if kind == FailureKind::AuthDead {
                 // One-strike quarantine. Never retried.
@@ -659,6 +708,7 @@ impl<C: Clock> Scheduler<C> {
             // below instead, which reaches 64x the interval — cheap enough to
             // leave running, frequent enough to notice a fix within hours.
             e.backoff_level = (e.backoff_level + 1).min(MAX_BACKOFF_LEVEL);
+            let interval = effective_interval(policy_interval, e.provider);
             let factor = 1i32 << e.backoff_level; // 2, 4, 8, ... up to 64x
             // `TimeDelta`'s `Mul` and `DateTime`'s `Add` both **panic** on
             // overflow, and the interval is caller-supplied. Saturating is the
@@ -685,8 +735,14 @@ impl<C: Clock> Scheduler<C> {
     ///
     /// Deliberately does **not** touch `next_due_at`. Restoring a cache is not
     /// a poll and must neither delay the first one nor pull it forward.
-    pub fn seed(&mut self, uuid: &str, windows: Vec<UsageWindow>, fetched_at: DateTime<Utc>) {
-        if let Some(e) = self.entries.get_mut(uuid) {
+    pub fn seed(
+        &mut self,
+        provider: Provider,
+        uuid: &str,
+        windows: Vec<UsageWindow>,
+        fetched_at: DateTime<Utc>,
+    ) {
+        if let Some(e) = self.entries.get_mut(&entry_key(provider, uuid)) {
             e.last_windows = Some(windows);
             // A restored snapshot carries no extra line — see `Entry::last_extra`.
             // Cleared rather than left alone so a re-seed cannot strand a figure
@@ -712,7 +768,13 @@ impl<C: Clock> Scheduler<C> {
     /// 12:00:15 / 12:00:30 to all three at 12:00:00, and the shipped guard test
     /// `seeding_does_not_make_an_account_due_earlier_than_its_schedule` could
     /// not see it because it names the other function.
-    pub fn seed_from_cache(&mut self, uuid: &str, snap: CachedSnapshot, current_fp: &str) {
+    pub fn seed_from_cache(
+        &mut self,
+        provider: Provider,
+        uuid: &str,
+        snap: CachedSnapshot,
+        current_fp: &str,
+    ) {
         // §9.3: a fingerprint that does not match means "cannot verify", and an
         // unverified cache is not shown. This is ccstatusline #459 — stale
         // values surviving an account switch until the TTL.
@@ -734,7 +796,7 @@ impl<C: Clock> Scheduler<C> {
         if live.is_empty() {
             return;
         }
-        self.seed(uuid, live, snap.fetched_at);
+        self.seed(provider, uuid, live, snap.fetched_at);
     }
 
     /// The value to persist for this account, stamped with the fingerprint of
@@ -745,8 +807,13 @@ impl<C: Clock> Scheduler<C> {
     /// (`fresh.tokens.access_token`) and re-reading the store to hash it would
     /// pull a live credential — access **and** refresh token, in plaintext —
     /// into the persistence path for nothing.
-    pub fn snapshot(&self, uuid: &str, token_fingerprint: &str) -> Option<CachedSnapshot> {
-        let e = self.entries.get(uuid)?;
+    pub fn snapshot(
+        &self,
+        provider: Provider,
+        uuid: &str,
+        token_fingerprint: &str,
+    ) -> Option<CachedSnapshot> {
+        let e = self.entries.get(&entry_key(provider, uuid))?;
         Some(CachedSnapshot {
             windows: e.last_windows.clone()?,
             fetched_at: e.last_fetched_at?,
@@ -770,7 +837,7 @@ impl<C: Clock> Scheduler<C> {
     ///     the one mechanism this module exists to provide.
     ///
     /// Cap it. An hour is far beyond any legitimate value.
-    pub fn record_throttle(&mut self, uuid: &str, retry_after_secs: u64) {
+    pub fn record_throttle(&mut self, provider: Provider, uuid: &str, retry_after_secs: u64) {
         let now = self.clock.now();
         let retry_after_secs = retry_after_secs.min(PollPolicy::MAX_RETRY_AFTER_SECS);
         let wait = if retry_after_secs > 0 {
@@ -783,7 +850,7 @@ impl<C: Clock> Scheduler<C> {
         } else {
             TimeDelta::seconds(PollPolicy::SATURATED_BACKOFF_SECS)
         };
-        if let Some(e) = self.entries.get_mut(uuid) {
+        if let Some(e) = self.entries.get_mut(&entry_key(provider, uuid)) {
             e.throttled_until = Some(now + wait);
             e.next_due_at = now + wait;
         }
@@ -799,8 +866,9 @@ impl<C: Clock> Scheduler<C> {
         let mut entries: Vec<EntryTiming> = self
             .entries
             .iter()
-            .map(|(uuid, e)| EntryTiming {
+            .map(|((provider, uuid), e)| EntryTiming {
                 uuid: uuid.clone(),
+                provider: *provider,
                 next_due_at: e.next_due_at,
                 backoff_level: e.backoff_level,
                 throttled_until: e.throttled_until,
@@ -811,7 +879,13 @@ impl<C: Clock> Scheduler<C> {
         // `HashMap` iteration order is not stable, and an unstable order would
         // rewrite the persisted file on every tick with identical content —
         // pointless disk churn, and it makes a diff of two states unreadable.
-        entries.sort_by(|a, b| a.uuid.cmp(&b.uuid));
+        // Ordered by the full key, not the uuid alone: two providers sharing an
+        // id would otherwise compare equal and leave their relative order to
+        // whatever `HashMap` happened to iterate, defeating the point of a
+        // stable sort.
+        entries.sort_by(|a, b| {
+            (a.uuid.as_str(), a.provider.as_str()).cmp(&(b.uuid.as_str(), b.provider.as_str()))
+        });
         SchedulerState { version: SCHEDULER_STATE_VERSION, entries }
     }
 
@@ -842,7 +916,7 @@ impl<C: Clock> Scheduler<C> {
         }
         let mut applied = 0;
         for t in &state.entries {
-            let Some(e) = self.entries.get_mut(&t.uuid) else { continue };
+            let Some(e) = self.entries.get_mut(&entry_key(t.provider, &t.uuid)) else { continue };
             e.next_due_at = t.next_due_at;
             e.backoff_level = t.backoff_level;
             e.throttled_until = t.throttled_until;
@@ -858,8 +932,8 @@ impl<C: Clock> Scheduler<C> {
         Ok(applied)
     }
 
-    pub fn state(&self, uuid: &str) -> Option<AccountState> {
-        let e = self.entries.get(uuid)?;
+    pub fn state(&self, provider: Provider, uuid: &str) -> Option<AccountState> {
+        let e = self.entries.get(&entry_key(provider, uuid))?;
         let now = self.clock.now();
 
         if e.quarantined {
@@ -899,7 +973,7 @@ impl<C: Clock> Scheduler<C> {
         match (&e.last_windows, e.last_fetched_at) {
             (Some(w), Some(at)) => {
                 // Failed, or past the staleness boundary: Stale.
-                let too_old = now - at > self.policy.interval * 2;
+                let too_old = now - at > effective_interval(self.policy.interval, e.provider) * 2;
                 let extra = e.last_extra.clone();
                 if e.last_failure.is_some() || too_old {
                     Some(AccountState::Stale { windows: w.clone(), extra, fetched_at: at })
@@ -948,10 +1022,10 @@ pub fn register_accounts<C: Clock>(
     current_fingerprint: &dyn Fn(Provider, &str) -> Option<String>,
 ) {
     for a in accounts {
-        sched.add(&a.account_id);
+        sched.add(a.provider, &a.account_id);
         if let Some(snap) = cache.remove(&cache_key(a.provider, &a.account_id)) {
             if let Some(fp) = current_fingerprint(a.provider, &a.account_id) {
-                sched.seed_from_cache(&a.account_id, snap, &fp);
+                sched.seed_from_cache(a.provider, &a.account_id, snap, &fp);
             }
         }
         if a.quarantined {
@@ -961,7 +1035,7 @@ pub fn register_accounts<C: Clock>(
             // backoff (its `AuthDead` early return). Order against the seed
             // above does not matter: `state()` checks `quarantined` before
             // anything else.
-            sched.record_failure(&a.account_id, FailureKind::AuthDead);
+            sched.record_failure(a.provider, &a.account_id, FailureKind::AuthDead);
         }
     }
 }
@@ -976,9 +1050,15 @@ pub fn register_accounts<C: Clock>(
 /// silently discard each other's writes.
 pub fn persist_quarantine(
     accounts: &mut AccountStore,
+    provider: Provider,
     uuid: &str,
 ) -> Result<bool, AccountError> {
-    let Some(mut a) = accounts.list().iter().find(|a| a.account_id == uuid).cloned() else {
+    // The pair, not the id alone: `AccountStore` is keyed on (provider, id)
+    // (accounts.rs:115-135), and a lookup by id alone would quarantine
+    // whichever of two same-id accounts happens to come first in the list.
+    let Some(mut a) =
+        accounts.list().iter().find(|a| a.account_id == uuid && a.provider == provider).cloned()
+    else {
         return Ok(false);
     };
     if a.quarantined {
@@ -1006,10 +1086,14 @@ pub fn persist_quarantine(
 /// write frequency cannot tear the file (accounts.rs:143-160).
 pub fn persist_last_ok(
     accounts: &mut AccountStore,
+    provider: Provider,
     uuid: &str,
     at: DateTime<Utc>,
 ) -> Result<bool, AccountError> {
-    let Some(mut a) = accounts.list().iter().find(|a| a.account_id == uuid).cloned() else {
+    // The pair, not the id alone — same reasoning as `persist_quarantine`.
+    let Some(mut a) =
+        accounts.list().iter().find(|a| a.account_id == uuid && a.provider == provider).cloned()
+    else {
         return Ok(false);
     };
     a.last_ok_at = Some(at);
@@ -1140,21 +1224,21 @@ mod tests {
     #[test]
     fn a_new_account_is_due_immediately_and_starts_loading() {
         let (mut s, _c) = sched();
-        s.add("a");
-        assert_eq!(s.state("a"), Some(AccountState::Loading));
-        assert_eq!(s.due(), vec!["a"]);
+        s.add(Provider::Anthropic, "a");
+        assert_eq!(s.state(Provider::Anthropic, "a"), Some(AccountState::Loading));
+        assert_eq!(s.due(), vec![(Provider::Anthropic, "a".to_string())]);
     }
 
     #[test]
     fn success_schedules_the_next_poll_one_interval_later() {
         let (mut s, c) = sched();
-        s.add("a");
-        s.record_success("a", win(20.0), None);
+        s.add(Provider::Anthropic, "a");
+        s.record_success(Provider::Anthropic, "a", win(20.0), None);
         assert!(s.due().is_empty(), "just fetched, so wait");
         c.advance_secs(299);
         assert!(s.due().is_empty());
         c.advance_secs(2);
-        assert_eq!(s.due(), vec!["a"], "due again once the interval passes");
+        assert_eq!(s.due(), vec![(Provider::Anthropic, "a".to_string())], "due again once the interval passes");
     }
 
     /// Spec §6.1: stagger accounts to avoid a startup burst.
@@ -1166,16 +1250,16 @@ mod tests {
     #[test]
     fn accounts_are_staggered_so_startup_never_bursts() {
         let (mut s, _c) = sched();
-        s.add("a");
-        s.add("b");
-        s.add("c");
+        s.add(Provider::Anthropic, "a");
+        s.add(Provider::Anthropic, "b");
+        s.add(Provider::Anthropic, "c");
 
         let stagger = PollPolicy::default().stagger();
         assert!(stagger > TimeDelta::zero(), "a zero stagger would make this test catch nothing");
 
-        let a = s.next_wake("a").unwrap();
-        assert_eq!(s.next_wake("b").unwrap() - a, stagger, "the second account is one stagger behind");
-        assert_eq!(s.next_wake("c").unwrap() - a, stagger * 2, "the third is two staggers behind");
+        let a = s.next_wake(Provider::Anthropic, "a").unwrap();
+        assert_eq!(s.next_wake(Provider::Anthropic, "b").unwrap() - a, stagger, "the second account is one stagger behind");
+        assert_eq!(s.next_wake(Provider::Anthropic, "c").unwrap() - a, stagger * 2, "the third is two staggers behind");
     }
 
     /// Spec §6.1: global concurrency of 1.
@@ -1183,8 +1267,8 @@ mod tests {
     fn due_returns_at_most_one_account() {
         let (mut s, c) = sched();
         for id in ["a", "b", "c"] {
-            s.add(id);
-            s.record_success(id, win(10.0), None);
+            s.add(Provider::Anthropic, id);
+            s.record_success(Provider::Anthropic, id, win(10.0), None);
         }
         c.advance_secs(3600);
         assert_eq!(s.due().len(), 1);
@@ -1194,11 +1278,11 @@ mod tests {
     #[test]
     fn failure_keeps_the_last_good_value_as_stale() {
         let (mut s, c) = sched();
-        s.add("a");
-        s.record_success("a", win(42.0), None);
+        s.add(Provider::Anthropic, "a");
+        s.record_success(Provider::Anthropic, "a", win(42.0), None);
         c.advance_secs(400);
-        s.record_failure("a", FailureKind::Network);
-        match s.state("a").unwrap() {
+        s.record_failure(Provider::Anthropic, "a", FailureKind::Network);
+        match s.state(Provider::Anthropic, "a").unwrap() {
             AccountState::Stale { windows, .. } => assert_eq!(windows[0].percent, 42.0),
             other => panic!("expected Stale, got {other:?}"),
         }
@@ -1208,9 +1292,9 @@ mod tests {
     #[test]
     fn failure_without_a_previous_value_is_not_stale() {
         let (mut s, _c) = sched();
-        s.add("a");
-        s.record_failure("a", FailureKind::Network);
-        assert_eq!(s.state("a"), Some(AccountState::Network));
+        s.add(Provider::Anthropic, "a");
+        s.record_failure(Provider::Anthropic, "a", FailureKind::Network);
+        assert_eq!(s.state(Provider::Anthropic, "a"), Some(AccountState::Network));
     }
 
     /// Spec §6.2: Retry-After: 0 = budget exhausted. Back off by
@@ -1219,12 +1303,12 @@ mod tests {
     #[test]
     fn retry_after_zero_backs_off_by_the_measured_recovery_time() {
         let (mut s, c) = sched();
-        s.add("a");
-        s.record_throttle("a", 0);
+        s.add(Provider::Anthropic, "a");
+        s.record_throttle(Provider::Anthropic, "a", 0);
         c.advance_secs(PollPolicy::SATURATED_BACKOFF_SECS - 1);
         assert!(s.due().is_empty(), "don't probe before the recovery time");
         c.advance_secs(2);
-        assert_eq!(s.due(), vec!["a"], "resume once the recovery time passes");
+        assert_eq!(s.due(), vec![(Provider::Anthropic, "a".to_string())], "resume once the recovery time passes");
     }
 
     /// An excessive backoff like 3600s would kill the widget for an hour on a
@@ -1248,12 +1332,12 @@ mod tests {
     #[test]
     fn retry_after_n_sleeps_exactly_n() {
         let (mut s, c) = sched();
-        s.add("a");
-        s.record_throttle("a", 120);
+        s.add(Provider::Anthropic, "a");
+        s.record_throttle(Provider::Anthropic, "a", 120);
         c.advance_secs(119);
         assert!(s.due().is_empty());
         c.advance_secs(2);
-        assert_eq!(s.due(), vec!["a"]);
+        assert_eq!(s.due(), vec![(Provider::Anthropic, "a".to_string())]);
     }
 
     /// Neither the clock nor `due()` appears between the iterations below, and
@@ -1265,16 +1349,16 @@ mod tests {
     #[test]
     fn repeated_failures_back_off_exponentially_and_reset_on_success() {
         let (mut s, c) = sched();
-        s.add("a");
-        s.record_success("a", win(1.0), None);
+        s.add(Provider::Anthropic, "a");
+        s.record_success(Provider::Anthropic, "a", win(1.0), None);
         let mut waits = vec![];
         for _ in 0..3 {
-            s.record_failure("a", FailureKind::Network);
-            waits.push(s.next_wake("a").unwrap() - c.now());
+            s.record_failure(Provider::Anthropic, "a", FailureKind::Network);
+            waits.push(s.next_wake(Provider::Anthropic, "a").unwrap() - c.now());
         }
         assert!(waits[1] > waits[0] && waits[2] > waits[1], "intervals must grow: {waits:?}");
-        s.record_success("a", win(1.0), None);
-        let after = s.next_wake("a").unwrap() - c.now();
+        s.record_success(Provider::Anthropic, "a", win(1.0), None);
+        let after = s.next_wake(Provider::Anthropic, "a").unwrap() - c.now();
         assert!(after <= PollPolicy::default().interval(), "success resets the backoff");
     }
 
@@ -1282,7 +1366,7 @@ mod tests {
     #[test]
     fn hidden_widget_produces_no_work() {
         let (mut s, c) = sched();
-        s.add("a");
+        s.add(Provider::Anthropic, "a");
         s.set_visible(false);
         c.advance_secs(10_000);
         assert!(s.due().is_empty());
@@ -1292,21 +1376,21 @@ mod tests {
     #[test]
     fn becoming_visible_makes_everything_due_at_once() {
         let (mut s, c) = sched();
-        s.add("a");
-        s.record_success("a", win(5.0), None);
+        s.add(Provider::Anthropic, "a");
+        s.record_success(Provider::Anthropic, "a", win(5.0), None);
         s.set_visible(false);
         c.advance_secs(60);
         s.set_visible(true);
-        assert_eq!(s.due(), vec!["a"], "refresh immediately regardless of how long it was hidden");
+        assert_eq!(s.due(), vec![(Provider::Anthropic, "a".to_string())], "refresh immediately regardless of how long it was hidden");
     }
 
     /// Spec §7.2: invalid_grant is one-strike quarantine. Never polled again.
     #[test]
     fn auth_dead_is_quarantined_forever() {
         let (mut s, c) = sched();
-        s.add("a");
-        s.record_failure("a", FailureKind::AuthDead);
-        assert_eq!(s.state("a"), Some(AccountState::AuthDead));
+        s.add(Provider::Anthropic, "a");
+        s.record_failure(Provider::Anthropic, "a", FailureKind::AuthDead);
+        assert_eq!(s.state(Provider::Anthropic, "a"), Some(AccountState::AuthDead));
         c.advance_secs(100_000);
         assert!(s.due().is_empty(), "a quarantined account is never polled again");
     }
@@ -1321,12 +1405,12 @@ mod tests {
     #[test]
     fn an_oauth_refusal_is_neither_a_spinner_nor_a_dead_grant() {
         let (mut s, _c) = sched();
-        s.add("a");
-        s.record_failure("a", FailureKind::OauthNotAllowed);
+        s.add(Provider::Anthropic, "a");
+        s.record_failure(Provider::Anthropic, "a", FailureKind::OauthNotAllowed);
 
-        assert_eq!(s.state("a"), Some(AccountState::OauthNotAllowed));
-        assert_ne!(s.state("a"), Some(AccountState::AuthExpired), "not a spinner");
-        assert_ne!(s.state("a"), Some(AccountState::AuthDead), "not a dead grant");
+        assert_eq!(s.state(Provider::Anthropic, "a"), Some(AccountState::OauthNotAllowed));
+        assert_ne!(s.state(Provider::Anthropic, "a"), Some(AccountState::AuthExpired), "not a spinner");
+        assert_ne!(s.state(Provider::Anthropic, "a"), Some(AccountState::AuthDead), "not a dead grant");
     }
 
     /// **It is not permanent, and an earlier revision had this wrong.** The
@@ -1338,24 +1422,24 @@ mod tests {
     #[test]
     fn an_oauth_refusal_recovers_on_its_own_and_is_never_quarantined() {
         let (mut s, c) = sched();
-        s.add("a");
-        s.record_failure("a", FailureKind::OauthNotAllowed);
+        s.add(Provider::Anthropic, "a");
+        s.record_failure(Provider::Anthropic, "a", FailureKind::OauthNotAllowed);
 
         // Backed off, not quarantined: it comes back, just not soon.
         assert!(s.due().is_empty(), "must back off rather than hammer");
         c.advance_secs(100_000);
         assert_eq!(
             s.due(),
-            vec!["a"],
+            vec![(Provider::Anthropic, "a".to_string())],
             "a quarantined account would never be due again; this one must be"
         );
 
         // And once the server relents, the account is simply well again — no
         // re-login, no remove-and-re-add.
-        s.begin_poll("a");
-        s.record_success("a", win(12.0), None);
+        s.begin_poll(Provider::Anthropic, "a");
+        s.record_success(Provider::Anthropic, "a", win(12.0), None);
         assert!(
-            matches!(s.state("a"), Some(AccountState::Ok { .. })),
+            matches!(s.state(Provider::Anthropic, "a"), Some(AccountState::Ok { .. })),
             "recovery must need no user action"
         );
     }
@@ -1368,15 +1452,15 @@ mod tests {
     #[test]
     fn an_oauth_refusal_beats_a_cached_snapshot() {
         let (mut s, c) = sched();
-        s.add("a");
-        s.begin_poll("a");
-        s.record_success("a", win(42.0), None);
-        assert!(matches!(s.state("a"), Some(AccountState::Ok { .. })));
+        s.add(Provider::Anthropic, "a");
+        s.begin_poll(Provider::Anthropic, "a");
+        s.record_success(Provider::Anthropic, "a", win(42.0), None);
+        assert!(matches!(s.state(Provider::Anthropic, "a"), Some(AccountState::Ok { .. })));
 
         c.advance_secs(10);
-        s.record_failure("a", FailureKind::OauthNotAllowed);
+        s.record_failure(Provider::Anthropic, "a", FailureKind::OauthNotAllowed);
         assert_eq!(
-            s.state("a"),
+            s.state(Provider::Anthropic, "a"),
             Some(AccountState::OauthNotAllowed),
             "a stale reading with an age would imply this is transient"
         );
@@ -1391,28 +1475,28 @@ mod tests {
     #[test]
     fn a_server_ordered_wait_survives_a_restart() {
         let (mut before, c1) = sched();
-        before.add("a");
-        before.record_throttle("a", 600);
-        assert!(matches!(before.state("a"), Some(AccountState::Throttled { .. })));
+        before.add(Provider::Anthropic, "a");
+        before.record_throttle(Provider::Anthropic, "a", 600);
+        assert!(matches!(before.state(Provider::Anthropic, "a"), Some(AccountState::Throttled { .. })));
         let saved = before.export_state();
 
         // A brand-new scheduler, as after a cold start.
         let (mut after, c2) = sched_at(c1.now());
-        after.add("a");
+        after.add(Provider::Anthropic, "a");
         assert!(
-            !after.due().is_empty() || after.state("a") == Some(AccountState::Loading),
+            !after.due().is_empty() || after.state(Provider::Anthropic, "a") == Some(AccountState::Loading),
             "precondition: a fresh scheduler has no idea it was throttled"
         );
 
         assert_eq!(after.restore_state(&saved), Ok(1));
         assert!(
-            matches!(after.state("a"), Some(AccountState::Throttled { .. })),
+            matches!(after.state(Provider::Anthropic, "a"), Some(AccountState::Throttled { .. })),
             "the wait was forgotten across the restart"
         );
         assert!(after.due().is_empty(), "and it must not be polled during it");
 
         c2.advance_secs(601);
-        assert_eq!(after.due(), vec!["a"], "but it does become due once the wait passes");
+        assert_eq!(after.due(), vec![(Provider::Anthropic, "a".to_string())], "but it does become due once the wait passes");
     }
 
     /// §6.1's floor is satisfied vacuously when `last_attempt_at` is `None`,
@@ -1421,13 +1505,13 @@ mod tests {
     #[test]
     fn the_per_account_floor_survives_a_restart() {
         let (mut before, c1) = sched();
-        before.add("a");
-        before.begin_poll("a");
-        before.end_poll("a");
+        before.add(Provider::Anthropic, "a");
+        before.begin_poll(Provider::Anthropic, "a");
+        before.end_poll(Provider::Anthropic, "a");
         let saved = before.export_state();
 
         let (mut after, _c2) = sched_at(c1.now());
-        after.add("a");
+        after.add(Provider::Anthropic, "a");
         after.restore_state(&saved).unwrap();
         assert!(
             after.due().is_empty(),
@@ -1439,12 +1523,12 @@ mod tests {
     #[test]
     fn an_in_flight_poll_is_not_restored() {
         let (mut before, c1) = sched();
-        before.add("a");
-        before.begin_poll("a"); // deliberately no end_poll: the process "died"
+        before.add(Provider::Anthropic, "a");
+        before.begin_poll(Provider::Anthropic, "a"); // deliberately no end_poll: the process "died"
         let saved = before.export_state();
 
         let (mut after, c2) = sched_at(c1.now());
-        after.add("a");
+        after.add(Provider::Anthropic, "a");
         after.restore_state(&saved).unwrap();
 
         // The floor still applies, so move past it; what must NOT apply is a
@@ -1452,7 +1536,7 @@ mod tests {
         c2.advance_secs(181);
         assert_eq!(
             after.due(),
-            vec!["a"],
+            vec![(Provider::Anthropic, "a".to_string())],
             "a dead process's in-flight poll must not strand the account"
         );
     }
@@ -1460,19 +1544,19 @@ mod tests {
     #[test]
     fn restore_ignores_accounts_that_no_longer_exist_and_leaves_new_ones_fresh() {
         let (mut before, c1) = sched();
-        before.add("gone");
-        before.record_throttle("gone", 600);
+        before.add(Provider::Anthropic, "gone");
+        before.record_throttle(Provider::Anthropic, "gone", 600);
         let saved = before.export_state();
 
         let (mut after, _c2) = sched_at(c1.now());
-        after.add("fresh");
+        after.add(Provider::Anthropic, "fresh");
         assert_eq!(
             after.restore_state(&saved),
             Ok(0),
             "an entry for a removed account must not resurrect it"
         );
-        assert!(after.state("gone").is_none());
-        assert_eq!(after.state("fresh"), Some(AccountState::Loading));
+        assert!(after.state(Provider::Anthropic, "gone").is_none());
+        assert_eq!(after.state(Provider::Anthropic, "fresh"), Some(AccountState::Loading));
     }
 
     /// Refused whole, not partially applied: half a schedule is one nobody
@@ -1480,18 +1564,18 @@ mod tests {
     #[test]
     fn an_unknown_state_version_is_refused_rather_than_partly_applied() {
         let (mut before, c1) = sched();
-        before.add("a");
-        before.record_throttle("a", 600);
+        before.add(Provider::Anthropic, "a");
+        before.record_throttle(Provider::Anthropic, "a", 600);
         let mut saved = before.export_state();
         saved.version = SCHEDULER_STATE_VERSION + 1;
 
         let (mut after, _c2) = sched_at(c1.now());
-        after.add("a");
+        after.add(Provider::Anthropic, "a");
         let err = after.restore_state(&saved).unwrap_err();
         assert_eq!(err.found, SCHEDULER_STATE_VERSION + 1);
         assert_eq!(err.expected, SCHEDULER_STATE_VERSION);
         assert_eq!(
-            after.state("a"),
+            after.state(Provider::Anthropic, "a"),
             Some(AccountState::Loading),
             "nothing may have been applied"
         );
@@ -1504,10 +1588,10 @@ mod tests {
     fn the_exported_state_round_trips_through_json_in_a_stable_order() {
         let (mut s, _c) = sched();
         for uuid in ["c", "a", "b"] {
-            s.add(uuid);
+            s.add(Provider::Anthropic, uuid);
         }
-        s.record_throttle("b", 300);
-        s.record_failure("c", FailureKind::Network);
+        s.record_throttle(Provider::Anthropic, "b", 300);
+        s.record_failure(Provider::Anthropic, "c", FailureKind::Network);
 
         let exported = s.export_state();
         assert_eq!(
@@ -1525,32 +1609,32 @@ mod tests {
     #[test]
     fn one_account_failing_does_not_affect_another() {
         let (mut s, c) = sched();
-        s.add("a");
-        s.add("b");
-        s.record_failure("a", FailureKind::AuthDead);
+        s.add(Provider::Anthropic, "a");
+        s.add(Provider::Anthropic, "b");
+        s.record_failure(Provider::Anthropic, "a", FailureKind::AuthDead);
         c.advance_secs(1000);
-        assert_eq!(s.due(), vec!["b"]);
-        assert!(matches!(s.state("b"), Some(AccountState::Loading)));
+        assert_eq!(s.due(), vec![(Provider::Anthropic, "b".to_string())]);
+        assert!(matches!(s.state(Provider::Anthropic, "b"), Some(AccountState::Loading)));
     }
 
     /// Spec §7.3: twice the polling interval is the staleness boundary.
     #[test]
     fn value_goes_stale_after_twice_the_interval() {
         let (mut s, c) = sched();
-        s.add("a");
-        s.record_success("a", win(30.0), None);
+        s.add(Provider::Anthropic, "a");
+        s.record_success(Provider::Anthropic, "a", win(30.0), None);
         c.advance_secs(599);
-        assert!(matches!(s.state("a"), Some(AccountState::Ok { .. })));
+        assert!(matches!(s.state(Provider::Anthropic, "a"), Some(AccountState::Ok { .. })));
         c.advance_secs(2);
-        assert!(matches!(s.state("a"), Some(AccountState::Stale { .. })));
+        assert!(matches!(s.state(Provider::Anthropic, "a"), Some(AccountState::Stale { .. })));
     }
 
     #[test]
     fn removing_an_account_forgets_it_entirely() {
         let (mut s, _c) = sched();
-        s.add("a");
-        s.remove("a");
-        assert_eq!(s.state("a"), None);
+        s.add(Provider::Anthropic, "a");
+        s.remove(Provider::Anthropic, "a");
+        assert_eq!(s.state(Provider::Anthropic, "a"), None);
         assert!(s.due().is_empty());
     }
 
@@ -1560,12 +1644,12 @@ mod tests {
     #[test]
     fn a_second_poll_cannot_start_while_one_is_in_flight() {
         let (mut s, _c) = sched();
-        s.add("a");
-        assert!(s.begin_poll("a"), "the first request must succeed");
-        assert!(!s.begin_poll("a"), "the second request must be refused");
+        s.add(Provider::Anthropic, "a");
+        assert!(s.begin_poll(Provider::Anthropic, "a"), "the first request must succeed");
+        assert!(!s.begin_poll(Provider::Anthropic, "a"), "the second request must be refused");
         assert!(s.due().is_empty(), "an in-flight account must not show up in due");
-        s.end_poll("a");
-        assert!(s.begin_poll("a"), "after end_poll it must be claimable again");
+        s.end_poll(Provider::Anthropic, "a");
+        assert!(s.begin_poll(Provider::Anthropic, "a"), "after end_poll it must be claimable again");
     }
 
     /// If the driver panics or returns early, `end_poll` never runs. Without a
@@ -1573,12 +1657,12 @@ mod tests {
     #[test]
     fn an_in_flight_slot_is_reclaimed_after_the_timeout() {
         let (mut s, c) = sched();
-        s.add("a");
-        assert!(s.begin_poll("a"));
+        s.add(Provider::Anthropic, "a");
+        assert!(s.begin_poll(Provider::Anthropic, "a"));
         c.advance_secs(IN_FLIGHT_RECLAIM_SECS - 1);
-        assert!(!s.begin_poll("a"), "still claimed just before the deadline");
+        assert!(!s.begin_poll(Provider::Anthropic, "a"), "still claimed just before the deadline");
         c.advance_secs(2);
-        assert!(s.begin_poll("a"), "reclaimed once the deadline passes");
+        assert!(s.begin_poll(Provider::Anthropic, "a"), "reclaimed once the deadline passes");
     }
 
     /// The server-supplied `Retry-After` is external input with no upper
@@ -1589,11 +1673,11 @@ mod tests {
     #[test]
     fn an_absurd_retry_after_is_capped_and_never_lands_in_the_past() {
         let (mut s, c) = sched();
-        s.add("a");
+        s.add(Provider::Anthropic, "a");
         let now = c.now();
 
-        s.record_throttle("a", u64::MAX);
-        let until = s.next_wake("a").unwrap();
+        s.record_throttle(Provider::Anthropic, "a", u64::MAX);
+        let until = s.next_wake(Provider::Anthropic, "a").unwrap();
         assert!(until > now, "throttled_until landed in the past — the throttle is defeated");
         assert_eq!(
             until - now,
@@ -1611,11 +1695,11 @@ mod tests {
     #[test]
     fn a_seeded_snapshot_renders_stale_with_the_age_it_really_has() {
         let (mut s, c) = sched();
-        s.add("a");
+        s.add(Provider::Anthropic, "a");
         let cached_at = c.now() - TimeDelta::seconds(3600);
-        s.seed("a", win(63.0), cached_at);
+        s.seed(Provider::Anthropic, "a", win(63.0), cached_at);
 
-        match s.state("a").unwrap() {
+        match s.state(Provider::Anthropic, "a").unwrap() {
             AccountState::Stale { windows, fetched_at, .. } => {
                 assert_eq!(windows[0].percent, 63.0);
                 assert_eq!(fetched_at, cached_at, "the cached snapshot was stamped with the restart time");
@@ -1634,13 +1718,13 @@ mod tests {
     #[test]
     fn seeding_does_not_make_an_account_due_earlier_than_its_schedule() {
         let (mut s, c) = sched();
-        s.add("a");
-        s.record_success("a", win(10.0), None);
-        let scheduled = s.next_wake("a").unwrap();
+        s.add(Provider::Anthropic, "a");
+        s.record_success(Provider::Anthropic, "a", win(10.0), None);
+        let scheduled = s.next_wake(Provider::Anthropic, "a").unwrap();
 
-        s.seed("a", win(63.0), c.now() - TimeDelta::seconds(3600));
+        s.seed(Provider::Anthropic, "a", win(63.0), c.now() - TimeDelta::seconds(3600));
 
-        assert_eq!(s.next_wake("a").unwrap(), scheduled, "seed moved the schedule");
+        assert_eq!(s.next_wake(Provider::Anthropic, "a").unwrap(), scheduled, "seed moved the schedule");
         assert!(s.due().is_empty(), "seed made the account due");
     }
 
@@ -1652,15 +1736,15 @@ mod tests {
     #[test]
     fn a_poll_that_records_no_outcome_still_respects_the_floor() {
         let (mut s, c) = sched();
-        s.add("a");
-        assert!(s.begin_poll("a"));
-        s.end_poll("a");
+        s.add(Provider::Anthropic, "a");
+        assert!(s.begin_poll(Provider::Anthropic, "a"));
+        s.end_poll(Provider::Anthropic, "a");
 
         assert!(s.due().is_empty(), "immediately due again after a poll that recorded nothing");
         c.advance_secs(PollPolicy::MIN_INTERVAL_SECS - 1);
         assert!(s.due().is_empty(), "still inside the floor");
         c.advance_secs(2);
-        assert_eq!(s.due(), vec!["a"], "due again once the floor has passed");
+        assert_eq!(s.due(), vec![(Provider::Anthropic, "a".to_string())], "due again once the floor has passed");
     }
 
     /// §7.1's `SECRETS_LOCKED` carries an "unlock" affordance, and that is the
@@ -1671,22 +1755,22 @@ mod tests {
     #[test]
     fn a_locked_store_wins_over_stale_even_after_a_success() {
         let (mut s, c) = sched();
-        s.add("a");
-        s.record_success("a", win(42.0), None);
+        s.add(Provider::Anthropic, "a");
+        s.record_success(Provider::Anthropic, "a", win(42.0), None);
         c.advance_secs(10);
-        s.record_failure("a", FailureKind::SecretsLocked);
+        s.record_failure(Provider::Anthropic, "a", FailureKind::SecretsLocked);
         assert_eq!(
-            s.state("a"),
+            s.state(Provider::Anthropic, "a"),
             Some(AccountState::SecretsLocked),
             "a locked store must offer the unlock affordance, not a dimmed value"
         );
 
         // The shadowing §7.1 does ask for is unchanged: NETWORK is defined as
         // "treated the same as STALE".
-        s.record_success("a", win(42.0), None);
-        s.record_failure("a", FailureKind::Network);
+        s.record_success(Provider::Anthropic, "a", win(42.0), None);
+        s.record_failure(Provider::Anthropic, "a", FailureKind::Network);
         assert!(
-            matches!(s.state("a"), Some(AccountState::Stale { .. })),
+            matches!(s.state(Provider::Anthropic, "a"), Some(AccountState::Stale { .. })),
             "NETWORK must stay equivalent to STALE"
         );
     }
@@ -1697,10 +1781,10 @@ mod tests {
     #[test]
     fn becoming_visible_never_polls_inside_the_floor() {
         let (mut s, c) = sched();
-        s.add("a");
-        assert!(s.begin_poll("a"), "poll once");
-        s.end_poll("a");
-        s.record_success("a", win(10.0), None);
+        s.add(Provider::Anthropic, "a");
+        assert!(s.begin_poll(Provider::Anthropic, "a"), "poll once");
+        s.end_poll(Provider::Anthropic, "a");
+        s.record_success(Provider::Anthropic, "a", win(10.0), None);
 
         c.advance_secs(5);
         s.set_visible(false);
@@ -1710,7 +1794,7 @@ mod tests {
         c.advance_secs(PollPolicy::MIN_INTERVAL_SECS);
         s.set_visible(false);
         s.set_visible(true);
-        assert_eq!(s.due(), vec!["a"], "once the floor has passed, becoming visible must make it due");
+        assert_eq!(s.due(), vec![(Provider::Anthropic, "a".to_string())], "once the floor has passed, becoming visible must make it due");
     }
 
     /// A cached window built **from the injected clock**, never from
@@ -1753,10 +1837,10 @@ mod tests {
     #[test]
     fn a_cache_from_another_login_is_discarded() {
         let (mut s, c) = sched();
-        s.add("a");
-        s.seed_from_cache("a", cached(&c, 63.0, 3600, "fp-from-another-login"), "fp-current");
+        s.add(Provider::Anthropic, "a");
+        s.seed_from_cache(Provider::Anthropic, "a", cached(&c, 63.0, 3600, "fp-from-another-login"), "fp-current");
         assert_eq!(
-            s.state("a"),
+            s.state(Provider::Anthropic, "a"),
             Some(AccountState::Loading),
             "an unverifiable cache was shown anyway"
         );
@@ -1765,10 +1849,10 @@ mod tests {
     #[test]
     fn a_cache_with_a_matching_fingerprint_is_restored_as_stale() {
         let (mut s, c) = sched();
-        s.add("a");
+        s.add(Provider::Anthropic, "a");
         let at = c.now();
-        s.seed_from_cache("a", cached(&c, 63.0, 3600, "fp"), "fp");
-        match s.state("a").unwrap() {
+        s.seed_from_cache(Provider::Anthropic, "a", cached(&c, 63.0, 3600, "fp"), "fp");
+        match s.state(Provider::Anthropic, "a").unwrap() {
             AccountState::Stale { windows, fetched_at, .. } => {
                 assert_eq!(windows[0].percent, 63.0);
                 assert_eq!(fetched_at, at, "the cached age must be the real one");
@@ -1784,18 +1868,18 @@ mod tests {
     #[test]
     fn a_cache_seeded_seconds_ago_is_still_stale_not_ok() {
         let (mut s, c) = sched();
-        s.add("a");
+        s.add(Provider::Anthropic, "a");
         let mut snap = cached(&c, 63.0, 3600, "fp");
         snap.fetched_at = c.now() - TimeDelta::seconds(5);
         assert!(
             c.now() - snap.fetched_at < PollPolicy::default().interval() * 2,
             "a snapshot older than the staleness boundary would make this test vacuous"
         );
-        s.seed_from_cache("a", snap, "fp");
+        s.seed_from_cache(Provider::Anthropic, "a", snap, "fp");
         assert!(
-            matches!(s.state("a"), Some(AccountState::Stale { .. })),
+            matches!(s.state(Provider::Anthropic, "a"), Some(AccountState::Stale { .. })),
             "a five-second-old cache rendered as a confirmed live value, got {:?}",
-            s.state("a")
+            s.state(Provider::Anthropic, "a")
         );
     }
 
@@ -1805,7 +1889,7 @@ mod tests {
     #[test]
     fn a_window_that_has_already_reset_is_not_restored() {
         let (mut s, c) = sched();
-        s.add("a");
+        s.add(Provider::Anthropic, "a");
         let mut snap = cached(&c, 63.0, 3600, "fp");
         snap.windows.push(UsageWindow {
             window_id: "seven_day".into(),
@@ -1814,8 +1898,8 @@ mod tests {
             resets_at: c.now() - TimeDelta::seconds(1),
             scope: None,
         });
-        s.seed_from_cache("a", snap, "fp");
-        match s.state("a").unwrap() {
+        s.seed_from_cache(Provider::Anthropic, "a", snap, "fp");
+        match s.state(Provider::Anthropic, "a").unwrap() {
             AccountState::Stale { windows, .. } => {
                 assert_eq!(windows.len(), 1, "the rotated window survived: {windows:?}");
                 assert_eq!(windows[0].window_id, "five_hour", "the wrong window was dropped");
@@ -1827,10 +1911,10 @@ mod tests {
     #[test]
     fn an_account_whose_windows_have_all_reset_is_not_restored() {
         let (mut s, c) = sched();
-        s.add("a");
-        s.seed_from_cache("a", cached(&c, 63.0, -1, "fp"), "fp");
+        s.add(Provider::Anthropic, "a");
+        s.seed_from_cache(Provider::Anthropic, "a", cached(&c, 63.0, -1, "fp"), "fp");
         assert_eq!(
-            s.state("a"),
+            s.state(Provider::Anthropic, "a"),
             Some(AccountState::Loading),
             "an account with no live windows must stay Loading, not render an empty bar list"
         );
@@ -1843,18 +1927,18 @@ mod tests {
     fn restoring_a_cache_does_not_erase_the_startup_stagger() {
         let (mut s, c) = sched();
         for id in ["a", "b", "c"] {
-            s.add(id);
+            s.add(Provider::Anthropic, id);
         }
         let stagger = PollPolicy::default().stagger();
         assert!(stagger > TimeDelta::zero(), "a zero stagger would make this test catch nothing");
 
         for id in ["a", "b", "c"] {
-            s.seed_from_cache(id, cached(&c, 10.0, 3600, "fp"), "fp");
+            s.seed_from_cache(Provider::Anthropic, id, cached(&c, 10.0, 3600, "fp"), "fp");
         }
 
-        assert_eq!(s.next_wake("a").unwrap(), c.now());
-        assert_eq!(s.next_wake("b").unwrap(), c.now() + stagger);
-        assert_eq!(s.next_wake("c").unwrap(), c.now() + stagger * 2);
+        assert_eq!(s.next_wake(Provider::Anthropic, "a").unwrap(), c.now());
+        assert_eq!(s.next_wake(Provider::Anthropic, "b").unwrap(), c.now() + stagger);
+        assert_eq!(s.next_wake(Provider::Anthropic, "c").unwrap(), c.now() + stagger * 2);
     }
 
     /// §7.2/§10.5: "do not retry". Without restoring the flag, every launch
@@ -1865,11 +1949,11 @@ mod tests {
         let mut cache = HashMap::new();
         register_accounts(&mut s, &[account("a", true), account("b", false)], &mut cache, &|_, _| None);
 
-        assert_eq!(s.state("a"), Some(AccountState::AuthDead));
+        assert_eq!(s.state(Provider::Anthropic, "a"), Some(AccountState::AuthDead));
         c.advance_secs(100_000);
         assert_eq!(
             s.due(),
-            vec!["b"],
+            vec![(Provider::Anthropic, "b".to_string())],
             "the quarantined account was polled again after a restart"
         );
     }
@@ -1894,7 +1978,7 @@ mod tests {
         a.provider = Provider::Openai;
         register_accounts(&mut s, &[a], &mut cache, &|_, _| Some("fp".to_string()));
 
-        match s.state("same").unwrap() {
+        match s.state(Provider::Openai, "same").unwrap() {
             AccountState::Stale { windows, .. } => {
                 assert_eq!(
                     windows[0].percent, 77.0,
@@ -1917,9 +2001,9 @@ mod tests {
         let mut store = AccountStore::load(&path);
         store.upsert(account("a", false)).unwrap();
 
-        assert!(persist_quarantine(&mut store, "a").unwrap(), "the first call must record it");
-        assert!(!persist_quarantine(&mut store, "a").unwrap(), "the second call is a no-op");
-        assert!(!persist_quarantine(&mut store, "unknown").unwrap(), "an unknown uuid is a no-op");
+        assert!(persist_quarantine(&mut store, Provider::Anthropic, "a").unwrap(), "the first call must record it");
+        assert!(!persist_quarantine(&mut store, Provider::Anthropic, "a").unwrap(), "the second call is a no-op");
+        assert!(!persist_quarantine(&mut store, Provider::Anthropic, "unknown").unwrap(), "an unknown uuid is a no-op");
 
         let reloaded = AccountStore::load(&path);
         assert!(
@@ -1946,9 +2030,9 @@ mod tests {
         renamed.display_label = "work".into();
         store.upsert(renamed).unwrap();
 
-        assert!(persist_last_ok(&mut store, "a", at).unwrap(), "the account exists, so it writes");
+        assert!(persist_last_ok(&mut store, Provider::Anthropic, "a", at).unwrap(), "the account exists, so it writes");
         assert!(
-            !persist_last_ok(&mut store, "unknown", at).unwrap(),
+            !persist_last_ok(&mut store, Provider::Anthropic, "unknown", at).unwrap(),
             "an unknown uuid is a no-op"
         );
 
@@ -1981,10 +2065,10 @@ mod tests {
         let p = PollPolicy::with_interval_secs(i64::MAX);
         assert_eq!(p.interval().num_seconds(), PollPolicy::MAX_INTERVAL_SECS);
         let (mut s, _c) = sched();
-        s.add("a");
+        s.add(Provider::Anthropic, "a");
         s.set_policy(p);
-        assert!(s.begin_poll("a"));
-        s.record_success("a", win(10.0), None);
+        assert!(s.begin_poll(Provider::Anthropic, "a"));
+        s.record_success(Provider::Anthropic, "a", win(10.0), None);
         let p = PollPolicy::with_interval_secs(600);
         assert_eq!(p.interval().num_seconds(), 600, "a legitimate value must still pass through");
     }
@@ -1992,36 +2076,36 @@ mod tests {
     #[test]
     fn lowering_the_interval_pulls_a_pending_poll_forward() {
         let (mut s, c) = sched();
-        s.add("a");
-        assert!(s.begin_poll("a"));
-        s.end_poll("a");
-        s.record_success("a", win(10.0), None);
+        s.add(Provider::Anthropic, "a");
+        assert!(s.begin_poll(Provider::Anthropic, "a"));
+        s.end_poll(Provider::Anthropic, "a");
+        s.record_success(Provider::Anthropic, "a", win(10.0), None);
         let started = c.now();
-        assert_eq!(s.next_wake("a").unwrap(), started + PollPolicy::default().interval());
+        assert_eq!(s.next_wake(Provider::Anthropic, "a").unwrap(), started + PollPolicy::default().interval());
 
         s.set_policy(PollPolicy::with_interval_secs(PollPolicy::MIN_INTERVAL_SECS));
 
         assert_eq!(
-            s.next_wake("a").unwrap(),
+            s.next_wake(Provider::Anthropic, "a").unwrap(),
             started + TimeDelta::seconds(PollPolicy::MIN_INTERVAL_SECS),
             "the new interval never reached the schedule"
         );
         c.advance_secs(PollPolicy::MIN_INTERVAL_SECS - 1);
         assert!(s.due().is_empty(), "an interval change must not poll inside §6.1's floor");
         c.advance_secs(1);
-        assert_eq!(s.due(), vec!["a"], "due once the new interval has passed");
+        assert_eq!(s.due(), vec![(Provider::Anthropic, "a".to_string())], "due once the new interval has passed");
     }
 
     #[test]
     fn raising_the_interval_takes_effect_at_once() {
         let (mut s, c) = sched();
-        s.add("a");
-        assert!(s.begin_poll("a"));
-        s.end_poll("a");
-        s.record_success("a", win(10.0), None);
+        s.add(Provider::Anthropic, "a");
+        assert!(s.begin_poll(Provider::Anthropic, "a"));
+        s.end_poll(Provider::Anthropic, "a");
+        s.record_success(Provider::Anthropic, "a", win(10.0), None);
         let started = c.now();
         s.set_policy(PollPolicy::with_interval_secs(3600));
-        assert_eq!(s.next_wake("a").unwrap(), started + TimeDelta::seconds(3600));
+        assert_eq!(s.next_wake(Provider::Anthropic, "a").unwrap(), started + TimeDelta::seconds(3600));
     }
 
     /// A settings change must not reset an exponential backoff earned against
@@ -2030,17 +2114,17 @@ mod tests {
     #[test]
     fn changing_the_interval_does_not_reset_an_exponential_backoff() {
         let (mut s, c) = sched();
-        s.add("a");
+        s.add(Provider::Anthropic, "a");
         for _ in 0..8 {
-            assert!(s.begin_poll("a"));
-            s.end_poll("a");
-            s.record_failure("a", FailureKind::Network);
+            assert!(s.begin_poll(Provider::Anthropic, "a"));
+            s.end_poll(Provider::Anthropic, "a");
+            s.record_failure(Provider::Anthropic, "a", FailureKind::Network);
             c.advance_secs(200);
         }
         let attempted = c.now() - TimeDelta::seconds(200);
         s.set_policy(PollPolicy::with_interval_secs(PollPolicy::MIN_INTERVAL_SECS));
         assert_eq!(
-            s.next_wake("a").unwrap(),
+            s.next_wake(Provider::Anthropic, "a").unwrap(),
             attempted + TimeDelta::seconds(PollPolicy::MIN_INTERVAL_SECS * 64),
             "the backoff level was silently discarded by a settings change"
         );
@@ -2050,14 +2134,14 @@ mod tests {
     #[test]
     fn changing_the_interval_does_not_shorten_a_server_ordered_backoff() {
         let (mut s, c) = sched();
-        s.add("a");
-        assert!(s.begin_poll("a"));
-        s.end_poll("a");
+        s.add(Provider::Anthropic, "a");
+        assert!(s.begin_poll(Provider::Anthropic, "a"));
+        s.end_poll(Provider::Anthropic, "a");
         let started = c.now();
-        s.record_throttle("a", 300);
+        s.record_throttle(Provider::Anthropic, "a", 300);
         s.set_policy(PollPolicy::with_interval_secs(PollPolicy::MIN_INTERVAL_SECS));
         assert_eq!(
-            s.next_wake("a").unwrap(),
+            s.next_wake(Provider::Anthropic, "a").unwrap(),
             started + TimeDelta::seconds(300),
             "a settings change overrode the server's Retry-After"
         );
@@ -2070,27 +2154,27 @@ mod tests {
     fn changing_the_interval_does_not_erase_the_startup_stagger() {
         let (mut s, _c) = sched();
         for id in ["a", "b", "c"] {
-            s.add(id);
+            s.add(Provider::Anthropic, id);
         }
         let stagger = PollPolicy::default().stagger();
         assert!(stagger > TimeDelta::zero(), "a zero stagger would make this test catch nothing");
-        let a = s.next_wake("a").unwrap();
+        let a = s.next_wake(Provider::Anthropic, "a").unwrap();
         s.set_policy(PollPolicy::with_interval_secs(1800));
-        assert_eq!(s.next_wake("a").unwrap(), a);
-        assert_eq!(s.next_wake("b").unwrap() - a, stagger);
-        assert_eq!(s.next_wake("c").unwrap() - a, stagger * 2);
+        assert_eq!(s.next_wake(Provider::Anthropic, "a").unwrap(), a);
+        assert_eq!(s.next_wake(Provider::Anthropic, "b").unwrap() - a, stagger);
+        assert_eq!(s.next_wake(Provider::Anthropic, "c").unwrap() - a, stagger * 2);
     }
 
     #[test]
     fn set_policy_does_not_resurrect_a_quarantined_account() {
         let (mut s, c) = sched();
-        s.add("a");
-        assert!(s.begin_poll("a"));
-        s.end_poll("a");
-        s.record_failure("a", FailureKind::AuthDead);
-        let before = s.next_wake("a").unwrap();
+        s.add(Provider::Anthropic, "a");
+        assert!(s.begin_poll(Provider::Anthropic, "a"));
+        s.end_poll(Provider::Anthropic, "a");
+        s.record_failure(Provider::Anthropic, "a", FailureKind::AuthDead);
+        let before = s.next_wake(Provider::Anthropic, "a").unwrap();
         s.set_policy(PollPolicy::with_interval_secs(PollPolicy::MIN_INTERVAL_SECS));
-        assert_eq!(s.next_wake("a").unwrap(), before);
+        assert_eq!(s.next_wake(Provider::Anthropic, "a").unwrap(), before);
         c.advance_secs(100_000);
         assert!(s.due().is_empty(), "a quarantined account was made due again");
     }
@@ -2098,11 +2182,11 @@ mod tests {
     #[test]
     fn a_remedy_makes_a_backed_off_account_due_again_without_breaking_the_floor() {
         let (mut s, c) = sched();
-        s.add("a");
+        s.add(Provider::Anthropic, "a");
         for _ in 0..4 {
-            assert!(s.begin_poll("a"));
-            s.record_failure("a", FailureKind::SecretsLocked);
-            s.end_poll("a");
+            assert!(s.begin_poll(Provider::Anthropic, "a"));
+            s.record_failure(Provider::Anthropic, "a", FailureKind::SecretsLocked);
+            s.end_poll(Provider::Anthropic, "a");
             c.advance_secs(1);
         }
         assert!(s.due().is_empty(), "premise: the backoff has pushed the poll far out");
@@ -2116,14 +2200,14 @@ mod tests {
         // `becoming_visible_never_polls_inside_the_floor` also survives that
         // mutation.
         assert_eq!(
-            s.next_wake("a"),
+            s.next_wake(Provider::Anthropic, "a"),
             Some(last_attempt + TimeDelta::seconds(PollPolicy::MIN_INTERVAL_SECS)),
             "the remedy pulled the next poll inside §6.1's floor"
         );
         assert!(s.due().is_empty(), "and it is not due yet");
 
         c.advance_secs(PollPolicy::MIN_INTERVAL_SECS);
-        assert_eq!(s.due(), vec!["a"], "the account never became due again after the remedy");
+        assert_eq!(s.due(), vec![(Provider::Anthropic, "a".to_string())], "the account never became due again after the remedy");
     }
 
     /// §10.3. `add`'s stagger is right for startup and wrong for the one path
@@ -2134,32 +2218,32 @@ mod tests {
     fn a_newly_registered_account_is_due_immediately_even_behind_other_accounts() {
         let (mut s, c) = sched();
         for id in ["a", "b", "c"] {
-            s.add(id);
-            assert!(s.begin_poll(id));
-            s.end_poll(id);
-            s.record_success(id, win(10.0), None);
+            s.add(Provider::Anthropic, id);
+            assert!(s.begin_poll(Provider::Anthropic, id));
+            s.end_poll(Provider::Anthropic, id);
+            s.record_success(Provider::Anthropic, id, win(10.0), None);
         }
         assert!(s.due().is_empty(), "premise: no existing account is due, so due() below is about the new one");
 
-        s.add("d");
+        s.add(Provider::Anthropic, "d");
         assert_eq!(
-            s.next_wake("d").unwrap(),
+            s.next_wake(Provider::Anthropic, "d").unwrap(),
             c.now() + PollPolicy::default().stagger() * 3,
             "premise: add() puts the fourth account three staggers out"
         );
 
-        s.make_due_now("d");
-        assert_eq!(s.next_wake("d").unwrap(), c.now(), "the new account still waits out the stagger");
-        assert_eq!(s.due(), vec!["d"], "the account the user just added was not polled");
+        s.make_due_now(Provider::Anthropic, "d");
+        assert_eq!(s.next_wake(Provider::Anthropic, "d").unwrap(), c.now(), "the new account still waits out the stagger");
+        assert_eq!(s.due(), vec![(Provider::Anthropic, "d".to_string())], "the account the user just added was not polled");
 
         // A re-login is the same defect on a worse path:
         // `register_authenticated` does `remove` + `add`, so the rebuilt entry
         // goes to the end of `order` and inherits the largest offset there is.
-        s.remove("a");
-        s.add("a");
-        s.make_due_now("a");
+        s.remove(Provider::Anthropic, "a");
+        s.add(Provider::Anthropic, "a");
+        s.make_due_now(Provider::Anthropic, "a");
         assert_eq!(
-            s.next_wake("a").unwrap(),
+            s.next_wake(Provider::Anthropic, "a").unwrap(),
             c.now(),
             "a re-login — §7.2's remedy, with the user watching — inherited the largest stagger"
         );
@@ -2178,9 +2262,9 @@ mod tests {
 
         let stagger = PollPolicy::default().stagger();
         assert!(stagger > TimeDelta::zero(), "a zero stagger would make this test catch nothing");
-        assert_eq!(s.next_wake("a").unwrap(), c.now());
-        assert_eq!(s.next_wake("b").unwrap(), c.now() + stagger, "the startup burst is back");
-        assert_eq!(s.next_wake("c").unwrap(), c.now() + stagger * 2, "the startup burst is back");
+        assert_eq!(s.next_wake(Provider::Anthropic, "a").unwrap(), c.now());
+        assert_eq!(s.next_wake(Provider::Anthropic, "b").unwrap(), c.now() + stagger, "the startup burst is back");
+        assert_eq!(s.next_wake(Provider::Anthropic, "c").unwrap(), c.now() + stagger * 2, "the startup burst is back");
     }
 
     /// §7.2 is one strike, and a nudge is not a remedy. On the only shipped
@@ -2198,22 +2282,22 @@ mod tests {
     #[test]
     fn a_quarantined_account_is_not_made_due_by_the_registration_nudge() {
         let (mut s, c) = sched();
-        s.add("a");
+        s.add(Provider::Anthropic, "a");
         for _ in 0..4 {
-            assert!(s.begin_poll("a"));
-            s.record_failure("a", FailureKind::Network);
-            s.end_poll("a");
+            assert!(s.begin_poll(Provider::Anthropic, "a"));
+            s.record_failure(Provider::Anthropic, "a", FailureKind::Network);
+            s.end_poll(Provider::Anthropic, "a");
         }
-        s.record_failure("a", FailureKind::AuthDead);
-        let before = s.next_wake("a").unwrap();
+        s.record_failure(Provider::Anthropic, "a", FailureKind::AuthDead);
+        let before = s.next_wake(Provider::Anthropic, "a").unwrap();
         assert!(
             before > c.now() + TimeDelta::seconds(PollPolicy::MIN_INTERVAL_SECS),
             "premise: the backoff must sit beyond the floor, or the nudge could not move it"
         );
 
-        s.make_due_now("a");
+        s.make_due_now(Provider::Anthropic, "a");
 
-        assert_eq!(s.next_wake("a").unwrap(), before, "a quarantined account was rescheduled");
+        assert_eq!(s.next_wake(Provider::Anthropic, "a").unwrap(), before, "a quarantined account was rescheduled");
         c.advance_secs(100_000);
         assert!(s.due().is_empty(), "a quarantined account was polled again");
     }
@@ -2225,27 +2309,121 @@ mod tests {
     #[test]
     fn a_server_ordered_throttle_outlasts_the_registration_nudge() {
         let (mut s, c) = sched();
-        s.add("a");
-        assert!(s.begin_poll("a"));
-        s.end_poll("a");
+        s.add(Provider::Anthropic, "a");
+        assert!(s.begin_poll(Provider::Anthropic, "a"));
+        s.end_poll(Provider::Anthropic, "a");
         let started = c.now();
-        s.record_throttle("a", 300);
+        s.record_throttle(Provider::Anthropic, "a", 300);
 
-        s.make_due_now("a");
+        s.make_due_now(Provider::Anthropic, "a");
 
         // Again on `next_wake`: `due()` re-checks `throttled_until` on its own,
         // so it cannot see this schedule being dragged inside the server's wait.
         assert_eq!(
-            s.next_wake("a").unwrap(),
+            s.next_wake(Provider::Anthropic, "a").unwrap(),
             started + TimeDelta::seconds(300),
             "the nudge overrode the server's Retry-After"
         );
         assert_eq!(
-            s.state("a"),
+            s.state(Provider::Anthropic, "a"),
             Some(AccountState::Throttled { until: started + TimeDelta::seconds(300) }),
             "the throttle itself must survive too"
         );
         c.advance_secs(301);
-        assert_eq!(s.due(), vec!["a"], "and the account must come back once the wait expires");
+        assert_eq!(s.due(), vec![(Provider::Anthropic, "a".to_string())], "and the account must come back once the wait expires");
+    }
+
+    // ---- per-provider floor -------------------------------------------------
+
+    /// Two providers may issue the same account id. Keying the entry map on the
+    /// id alone makes the second `add` overwrite the first, and one of the
+    /// user's accounts disappears from the widget with no error anywhere.
+    ///
+    /// **Not asserted through `due().len()`.** `due()` caps at one account by
+    /// design — §6.1's global concurrency of 1, pinned by
+    /// `due_returns_at_most_one_account` — so two due accounts and one due
+    /// account are indistinguishable there regardless of whether the map was
+    /// fixed. Quarantining one and checking the other is unaffected is a
+    /// property that same cap cannot hide: if the second `add` had silently
+    /// been a no-op against an id the first already claimed, both lookups below
+    /// would resolve to the one surviving entry and Codex's account would read
+    /// `AuthDead` too.
+    #[test]
+    fn two_providers_sharing_an_id_are_two_entries() {
+        let (mut s, _c) = sched();
+        s.add(Provider::Anthropic, "same");
+        s.add(Provider::Openai, "same");
+
+        s.record_failure(Provider::Anthropic, "same", FailureKind::AuthDead);
+
+        assert_eq!(
+            s.state(Provider::Anthropic, "same"),
+            Some(AccountState::AuthDead),
+            "premise: the Anthropic account was quarantined"
+        );
+        assert_eq!(
+            s.state(Provider::Openai, "same"),
+            Some(AccountState::Loading),
+            "one account was overwritten by the other — quarantining the Anthropic \
+             account also quarantined the Codex one sharing its id"
+        );
+    }
+
+    /// An account is polled no faster than its own provider allows, whatever
+    /// the user set — the same property
+    /// `a_poll_that_records_no_outcome_still_respects_the_floor` pins for an
+    /// Anthropic account, exercised here for a Codex one instead. That matters
+    /// because the floor now comes from `e.provider.min_interval_secs()`, read
+    /// off the entry that was just polled, rather than from the single
+    /// Anthropic-shaped constant `due()` used before this task.
+    ///
+    /// This cannot be driven below 180s through `PollPolicy` itself —
+    /// `with_interval_secs` clamps there, and that floor happens to equal
+    /// Codex's own (Spike G, `Provider::min_interval_secs`) — so the boundary
+    /// this test can reach is "the floor holds at all for a non-Anthropic
+    /// account", not "two providers' floors differ". The next test reaches the
+    /// boundary this one cannot, by calling `effective_interval` directly with
+    /// an interval `PollPolicy` could never produce.
+    #[test]
+    fn an_account_is_never_polled_below_its_providers_floor() {
+        let (mut s, c) = sched();
+        s.add(Provider::Openai, "a");
+        assert!(s.begin_poll(Provider::Openai, "a"));
+        s.end_poll(Provider::Openai, "a");
+
+        assert!(s.due().is_empty(), "immediately due again after a poll that recorded nothing");
+        c.advance_secs(Provider::Openai.min_interval_secs() as i64 - 1);
+        assert!(s.due().is_empty(), "polled inside the provider floor");
+        c.advance_secs(2);
+        assert_eq!(
+            s.due(),
+            vec![(Provider::Openai, "a".to_string())],
+            "due again once the provider's floor has passed"
+        );
+    }
+
+    /// `effective_interval`'s raise-not-reject rule, pinned directly against
+    /// the private function rather than through the scheduler's public API.
+    ///
+    /// **This is the only place that can exercise it.** `PollPolicy` can never
+    /// hold an interval below `MIN_INTERVAL_SECS` (180s) — `with_interval_secs`
+    /// clamps there — and that happens to be exactly Codex's own floor too
+    /// (Spike G), so no `Scheduler`-level test can ever observe
+    /// `effective_interval` actually raising anything: every interval it is
+    /// ever called with in practice is already at or above every provider's
+    /// floor. Calling the function directly is what lets this test supply an
+    /// interval `PollPolicy` never could.
+    #[test]
+    fn effective_interval_raises_a_short_interval_to_the_providers_floor() {
+        assert_eq!(
+            effective_interval(TimeDelta::seconds(60), Provider::Openai),
+            TimeDelta::seconds(180),
+            "an interval shorter than the floor must be raised to it"
+        );
+        assert_eq!(
+            effective_interval(TimeDelta::seconds(300), Provider::Openai),
+            TimeDelta::seconds(300),
+            "an interval already above the floor must not be slowed down to match it"
+        );
     }
 }
