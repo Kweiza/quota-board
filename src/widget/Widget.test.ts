@@ -27,17 +27,29 @@ describe('Widget empty states', () => {
 })
 
 const two: AccountView[] = [
-  { uuid: 'uuid-work', label: 'work', email: 'work@example.com', state: { kind: 'loading' } },
-  { uuid: 'uuid-home', label: 'home', email: 'home@example.com', state: { kind: 'loading' } },
+  {
+    account_id: 'uuid-work',
+    provider: 'anthropic',
+    label: 'work',
+    email: 'work@example.com',
+    state: { kind: 'loading' },
+  },
+  {
+    account_id: 'uuid-home',
+    provider: 'anthropic',
+    label: 'home',
+    email: 'home@example.com',
+    state: { kind: 'loading' },
+  },
 ]
 
 describe('Widget refresh', () => {
   /**
-   * The uuid, never the index and never the label: CLAUDE.md makes
-   * `account.uuid` the primary key, and both other candidates are wrong here —
-   * labels are user-editable and may be duplicated, and `usage://updated`
-   * replaces the whole array so an index captured at render time goes stale.
-   * Asserting on the *second* row is what makes a hard-wired first uuid fail.
+   * The account_id, never the index and never the label: CLAUDE.md makes the
+   * pair the primary key, and both other candidates are wrong here — labels
+   * are user-editable and may be duplicated, and `usage://updated` replaces
+   * the whole array so an index captured at render time goes stale. Asserting
+   * on the *second* row is what makes a hard-wired first id fail.
    */
   it('asks to refresh the row that was clicked', () => {
     const refreshed: string[] = []

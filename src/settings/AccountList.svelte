@@ -28,10 +28,12 @@
 </script>
 
 <ul class="rows">
-  <!-- Keyed by uuid, never by index: `accounts://changed` replaces this array
-       wholesale, and an index key would move a half-typed label onto the wrong
-       account. CLAUDE.md: the primary key is `account.uuid`. -->
-  {#each accounts as a, i (a.uuid)}
+  <!-- Keyed by account_id, never by index: `accounts://changed` replaces this
+       array wholesale, and an index key would move a half-typed label onto the
+       wrong account. CLAUDE.md: the primary key is the (provider, account_id)
+       pair — `account_id` alone is what this list's own callbacks are keyed
+       by, since `Settings.svelte` resolves the provider itself. -->
+  {#each accounts as a, i (a.account_id)}
     <li class="row">
       <div class="ident">
         <!-- `value=` rather than `bind:value=`: binding would write through
@@ -42,7 +44,7 @@
           type="text"
           aria-label="Display name"
           value={a.label}
-          on:blur={(e) => onRename(a.uuid, e.currentTarget.value)}
+          on:blur={(e) => onRename(a.account_id, e.currentTarget.value)}
         />
         <!-- §9.3: the label is user-editable and may be duplicated, so this is
              the only thing left that tells two accounts apart. -->
@@ -57,22 +59,22 @@
              `role="status"` because this is the only answer a press gets: a
              refused button is otherwise inert until `Retry-After` runs out,
              which is the defect this note exists to fix. -->
-        {#if throttledUntil[a.uuid]}
+        {#if throttledUntil[a.account_id]}
           <span class="throttle" role="status">
-            throttled, available after {untilHhMm(throttledUntil[a.uuid])}
+            throttled, available after {untilHhMm(throttledUntil[a.account_id])}
           </span>
         {/if}
       </div>
       <div class="actions">
-        <button on:click={() => onRefresh(a.uuid)}>Refresh now</button>
-        <!-- A direction, not an index: the parent rebuilds the whole uuid array
-             for `reorder_accounts`, and an index captured at render time goes
-             stale as soon as the list is re-read. -->
-        <button disabled={i === 0} on:click={() => onMove(a.uuid, -1)}>Move up</button>
-        <button disabled={i === accounts.length - 1} on:click={() => onMove(a.uuid, 1)}>
+        <button on:click={() => onRefresh(a.account_id)}>Refresh now</button>
+        <!-- A direction, not an index: the parent rebuilds the whole (provider,
+             account_id) key array for `reorder_accounts`, and an index captured
+             at render time goes stale as soon as the list is re-read. -->
+        <button disabled={i === 0} on:click={() => onMove(a.account_id, -1)}>Move up</button>
+        <button disabled={i === accounts.length - 1} on:click={() => onMove(a.account_id, 1)}>
           Move down
         </button>
-        <button class="danger" on:click={() => onRemove(a.uuid)}>Remove</button>
+        <button class="danger" on:click={() => onRemove(a.account_id)}>Remove</button>
       </div>
     </li>
   {/each}

@@ -26,19 +26,45 @@ export interface CreditSpend {
   percent: number
 }
 
+/** Mirrors `ResetCredits` in `crates/core/src/model.rs`. Change both together. */
+export interface ResetCredits {
+  available: number
+  /**
+   * Measured 0 while `available` was 1, so the two are **not** interchangeable:
+   * an account can hold a credit that does nothing for the limit it is hitting.
+   */
+  applicable: number
+}
+
+/**
+ * Mirrors `ExtraLine` in `crates/core/src/model.rs`, serialized with
+ * `#[serde(tag = "kind", rename_all = "snake_case")]`.
+ *
+ * At most one line sits under a row's bars, and which kind it is follows from
+ * the provider — an enum rather than two nullable fields, so the exclusivity is
+ * not something a reader has to remember.
+ */
+export type ExtraLine =
+  | ({ kind: 'credit' } & CreditSpend)
+  | ({ kind: 'reset_credits' } & ResetCredits)
+
+export type Provider = 'anthropic' | 'openai'
+
 /**
  * Mirrors `AccountState` in `crates/core/src/model.rs`, which is serialized
  * with `#[serde(tag = "kind", rename_all = "snake_case")]`. That module carries
  * the reciprocal note; the two must be changed together.
  *
- * `credit` is `null` for an account with no monthly spending limit — the normal
- * case, and **not** a zero. It is also null for the whole first poll after a
- * restart, because the snapshot cache deliberately does not persist it.
+ * `extra` is `null` for an account with nothing to show under its bars — an
+ * Anthropic account with no spending limit, or a Codex account with no reset
+ * credits. Both are the normal case, and neither is a zero. It is also null
+ * for the whole first poll after a restart, because the snapshot cache
+ * deliberately does not persist it.
  */
 export type AccountState =
   | { kind: 'loading' }
-  | { kind: 'ok'; windows: UsageWindow[]; credit: CreditSpend | null; fetched_at: string }
-  | { kind: 'stale'; windows: UsageWindow[]; credit: CreditSpend | null; fetched_at: string }
+  | { kind: 'ok'; windows: UsageWindow[]; extra: ExtraLine | null; fetched_at: string }
+  | { kind: 'stale'; windows: UsageWindow[]; extra: ExtraLine | null; fetched_at: string }
   | { kind: 'throttled'; until: string }
   | { kind: 'auth_expired' }
   | { kind: 'auth_dead' }
@@ -59,9 +85,11 @@ export type AccountState =
   | { kind: 'network' }
 
 export interface AccountView {
-  uuid: string
+  /** Half of the primary key; `provider` is the other half. Not a UUID for every provider. */
+  account_id: string
+  provider: Provider
   label: string
-  /** Display only. **Never used as a key** (§9.3) — the key is `uuid`. */
+  /** Display only. **Never used as a key** (§9.3). */
   email: string
   state: AccountState
 }

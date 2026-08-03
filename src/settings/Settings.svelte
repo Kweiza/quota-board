@@ -166,14 +166,14 @@
   async function pullAccounts(): Promise<void> {
     try {
       accounts = await listAccounts()
-      // Retire notes for accounts that are gone. `account.uuid` is the stable
-      // primary key (§9.3), so removing an account and adding the same one back
-      // reuses its uuid — without this, a refusal from an earlier session
-      // reappears on a fresh row, quoting a wall clock the user never saw.
+      // Retire notes for accounts that are gone. `account_id` is stable across
+      // a rename (§9.3), so removing an account and adding the same one back
+      // reuses it — without this, a refusal from an earlier session reappears
+      // on a fresh row, quoting a wall clock the user never saw.
       // Only on a successful read: the `catch` below deliberately keeps the
       // last good list, and reconciling against a list we failed to fetch would
       // clear every note instead.
-      const live = new Set(accounts.map((a) => a.uuid))
+      const live = new Set(accounts.map((a) => a.account_id))
       Object.keys(throttledUntil)
         .filter((uuid) => !live.has(uuid))
         .forEach(forgetThrottle)
@@ -352,22 +352,25 @@
     }
   }
 
+  // `AccountList` reports a click by account_id alone (it never learns the
+  // provider), so every handler below resolves it here from `accounts` — the
+  // one place both halves of the key (§9.3) are already in hand.
   function rename(uuid: string, label: string): void {
-    const current = accounts.find((a) => a.uuid === uuid)
+    const current = accounts.find((a) => a.account_id === uuid)
     // Every blur fires this handler, including one that changed nothing.
     if (current === undefined || current.label === label) return
-    void guard(() => renameAccount(uuid, label))
+    void guard(() => renameAccount(uuid, current.provider, label))
   }
 
   function move(uuid: string, delta: number): void {
-    const from = accounts.findIndex((a) => a.uuid === uuid)
+    const from = accounts.findIndex((a) => a.account_id === uuid)
     const to = from + delta
     if (from < 0 || to < 0 || to >= accounts.length) return
     // The command takes the whole rearranged array, not a pair: `reorder`
     // rewrites `sort_order` from the order it is given.
-    const uuids = accounts.map((a) => a.uuid)
-    uuids.splice(to, 0, ...uuids.splice(from, 1))
-    void guard(() => reorderAccounts(uuids))
+    const keys = accounts.map((a) => ({ account_id: a.account_id, provider: a.provider }))
+    keys.splice(to, 0, ...keys.splice(from, 1))
+    void guard(() => reorderAccounts(keys))
   }
 
   function refresh(uuid: string): void {
@@ -457,7 +460,10 @@
   <section>
     <h2>Accounts</h2>
     <AccountList {accounts} {throttledUntil}
-                 onRemove={(uuid) => void guard(() => removeAccount(uuid))}
+                 onRemove={(uuid) => {
+                   const current = accounts.find((a) => a.account_id === uuid)
+                   if (current) void guard(() => removeAccount(uuid, current.provider))
+                 }}
                  onRename={rename} onMove={move} onRefresh={refresh} />
     {#if accounts.length === 0}
       <p class="hint">No accounts yet.</p>
@@ -625,8 +631,8 @@
     <label for="debug-account">Account</label>
     <select id="debug-account" bind:value={selected}>
       <option value="">—</option>
-      {#each accounts as a (a.uuid)}
-        <option value={a.uuid}>{a.label} ({a.email})</option>
+      {#each accounts as a (a.account_id)}
+        <option value={a.account_id}>{a.label} ({a.email})</option>
       {/each}
     </select>
     <button on:click={reloadRaw}>Reload</button>

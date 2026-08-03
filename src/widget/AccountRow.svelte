@@ -2,7 +2,17 @@
   import Bar from './Bar.svelte'
   import CreditLine from './CreditLine.svelte'
   import { relativeAge, untilHhMm } from '../lib/format'
-  import type { AccountView } from '../lib/types'
+  import type { AccountView, Provider } from '../lib/types'
+
+  /**
+   * Text, not a colour dot: §8.2 already spends colour on severity, and a
+   * second meaning on the same channel collides — besides failing anyone
+   * whose colour vision the severity ramp already taxes.
+   */
+  const BADGE: Record<Provider, { text: string; title: string }> = {
+    anthropic: { text: 'CL', title: 'Claude' },
+    openai: { text: 'CX', title: 'Codex' },
+  }
 
   export let account: AccountView
   export let now: Date = new Date()
@@ -42,27 +52,42 @@
     }
   }
 
+  $: badge = BADGE[account.provider]
+
   $: state = account.state
   // Spec §5.3: the weekly window count is 0, 1 or N — never assumed.
   $: windows = state.kind === 'ok' || state.kind === 'stale' ? state.windows : []
-  $: hasWeekly = windows.some(
-    (w) => w.window_id.startsWith('weekly') || w.window_id === 'seven_day',
-  )
+  // §5.3's read order is Anthropic's; Codex has no counterpart, so a plan
+  // simply has the windows it has. Ungated, this note appears on every Codex
+  // row forever.
+  $: hasWeekly =
+    account.provider !== 'anthropic' ||
+    windows.some((w) => w.window_id.startsWith('weekly') || w.window_id === 'seven_day')
   /**
-   * Absent for every account without a monthly spending limit, which is the
-   * common case — and there is deliberately no "credits off" placeholder for
-   * them. It is also absent for the first poll after a restart, because the
-   * snapshot cache does not persist a figure it cannot date (see
-   * `Entry::last_credit`). Both are silence, never a zero: the endpoint sends
-   * `used: $0.00` and `percent: 0` for an account that never had credits, and
-   * rendering that is exactly the demote-to-0% CLAUDE.md forbids.
+   * Absent whenever the account has nothing to put under its bars — an
+   * Anthropic account with no spending limit, or a Codex account with no reset
+   * credits. Both are the common case, and both are silence, **never a
+   * zero**: `usage::anthropic::parse_credit` and
+   * `usage::openai::parse_reset_credits` both answer `None` rather than a
+   * figure computed from a $0.00/zero-credit response, which is the
+   * demote-to-0% CLAUDE.md forbids. It is also absent for the first poll
+   * after a restart, because the snapshot cache does not persist a figure it
+   * cannot date (see `Entry::last_extra`).
    */
-  $: credit = state.kind === 'ok' || state.kind === 'stale' ? state.credit : null
+  $: extra = state.kind === 'ok' || state.kind === 'stale' ? state.extra : null
+  /**
+   * Filtered to the `credit` variant alone: `CreditLine` still expects
+   * `CreditSpend`'s shape, and dispatching the `reset_credits` variant onto
+   * its own line is a later task's job — this one only carries the `credit` →
+   * `extra` rename through without changing what a Claude row renders.
+   */
+  $: credit = extra !== null && extra.kind === 'credit' ? extra : null
   $: isStale = state.kind === 'stale'
 </script>
 
 <div class="account" class:stale={isStale}>
   <div class="head">
+    <span class="badge" title={badge.title}>{badge.text}</span>
     <span class="name" title={account.label}>{account.label}</span>
     {#if isStale && state.kind === 'stale'}
       <span class="age">{relativeAge(new Date(state.fetched_at), now)}</span>
@@ -148,7 +173,14 @@
      at .45 measures 3.42:1 (both above the 3:1 floor for the secondary text).
      Any darker backdrop only raises these. */
   .account.stale .name,
-  .account.stale .age { opacity: .58; }
+  .account.stale .age,
+  /* `.badge` joins this group for the same reason `.amounts` joins the group
+     below: it is another of `.head`'s children, and one left out of a stale
+     rule lights up at full strength inside an otherwise dimmed row — the
+     shipped bug this file's own history records. Joined here rather than
+     given a separate rule so the two cannot drift to different values, the
+     way `.name`'s and `.age`'s already do not. */
+  .account.stale .badge { opacity: .58; }
   .account.stale .note { opacity: .5; }
   .account.stale :global(.label),
   .account.stale :global(.pct),
@@ -168,6 +200,14 @@
           font-size: 11px; font-weight: 600; white-space: nowrap;
           overflow: hidden; text-overflow: ellipsis; }
   .age  { font-size: 10px; opacity: .8; white-space: nowrap; }
+  /* No opacity here on purpose: full strength is this badge's resting state,
+     the same as `.name`'s. Setting one here as well as in the stale group
+     above would make the two numbers fight over the same element, and
+     whichever should win would depend on which rule happens to be more
+     specific rather than on which state the row is actually in. */
+  .badge { flex-shrink: 0; font-size: 9px; font-weight: 700; letter-spacing: .04em;
+           border: 1px solid currentColor; border-radius: 3px;
+           padding: 0 .25em; line-height: 1.35; }
   /* Deliberately matched to `.gear` in Widget.svelte — same colour, same hover,
      same borderless glyph. They are the widget's only two chrome controls and
      must read as one family. `flex-shrink: 0` keeps it whole when a long

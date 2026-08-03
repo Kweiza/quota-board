@@ -19,12 +19,13 @@ import type { AccountView } from './types'
  * after the same assignment, while the proxy rendered the account.
  */
 const account = (label: string): AccountView => ({
-  uuid: 'u1',
+  account_id: 'u1',
+  provider: 'anthropic',
   label,
   email: label,
   state: {
     kind: 'ok',
-    credit: null,
+    extra: null,
     fetched_at: new Date().toISOString(),
     windows: [
       {

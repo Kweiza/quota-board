@@ -52,7 +52,8 @@ interface Backend {
 }
 
 const account = (uuid: string, label: string, email: string): AccountView => ({
-  uuid,
+  account_id: uuid,
+  provider: 'anthropic',
   label,
   email,
   state: { kind: 'loading' },
@@ -380,10 +381,10 @@ describe('Settings manual refresh', () => {
   }, 6000)
 
   it('does not resurrect a refusal on an account that was removed and added back', async () => {
-    // `account.uuid` is the stable primary key (§9.3), so removing an account
-    // and adding the same one back reuses its uuid. A note keyed by uuid and
-    // never reconciled would reappear on a fresh row, quoting a wall clock from
-    // a session the user does not remember.
+    // `account_id` is stable across a rename (§9.3), so removing an account
+    // and adding the same one back reuses it. A note keyed by uuid and never
+    // reconciled would reappear on a fresh row, quoting a wall clock from a
+    // session the user does not remember.
     const t = untilIn(30)
     const calls = mockBackend({
       accounts: two,
@@ -412,7 +413,7 @@ describe('Settings manual refresh', () => {
         .toHaveLength(2))
       expect(screen.queryByText(/throttled, available after/)).toBeNull()
     } finally {
-      if (!two.some((a) => a.uuid === removed.uuid)) two.unshift(removed)
+      if (!two.some((a) => a.account_id === removed.account_id)) two.unshift(removed)
     }
   })
 
@@ -426,7 +427,7 @@ describe('Settings manual refresh', () => {
       accounts: two,
       refreshStates: [
         { kind: 'throttled', until: first.iso },
-        { kind: 'ok', windows: [], credit: null, fetched_at: '2026-07-31T09:05:00Z' },
+        { kind: 'ok', windows: [], extra: null, fetched_at: '2026-07-31T09:05:00Z' },
       ],
     })
     render(Settings)
