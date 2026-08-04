@@ -1,6 +1,6 @@
-//! Account metadata store. Holds the labels, emails, and sort order needed to
-//! display several Claude accounts side by side. **Tokens never live here** —
-//! the `secrets` module owns those.
+//! Account metadata store. Holds the labels, emails, providers, and sort order
+//! needed to display several Claude and Codex accounts side by side.
+//! **Tokens never live here** — the `secrets` module owns those.
 
 use crate::provider::Provider;
 use chrono::{DateTime, Utc};

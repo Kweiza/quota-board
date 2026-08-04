@@ -68,9 +68,9 @@ pub fn load(path: &Path) -> HashMap<String, CachedSnapshot> {
 /// same map by key on startup (§7.4's restore) and must build the identical
 /// string, or a bare-id lookup would hit nothing — or worse, hit a stale
 /// pre-namespacing entry that this module's own `save`/`remove` can no longer
-/// reach and that therefore never gets updated or cleaned up again. Two
-/// hand-built copies of this format is exactly the mistake `token_key`'s own
-/// doc comment warns about.
+/// reach and that therefore never gets updated or cleaned up again. One shared
+/// function rather than a second hand-built `format!` at the call site: a key
+/// format stays a format only while exactly one piece of code writes it.
 pub(crate) fn cache_key(provider: Provider, account_id: &str) -> String {
     format!("{}:{}", provider.as_str(), account_id)
 }
