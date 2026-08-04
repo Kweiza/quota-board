@@ -450,13 +450,19 @@ describe('AccountRow credit line', () => {
 
 describe('AccountRow reset-credits line', () => {
   it('renders nothing when there are no reset credits', () => {
-    render(AccountRow, {
+    const { container } = render(AccountRow, {
       account: acct({
         provider: 'openai',
         state: { kind: 'ok', windows: [], extra: null, fetched_at: NOW.toISOString() },
       }),
     })
     expect(screen.queryByText(/reset credits/i)).toBeNull()
+    // Matches the parallel assertion in `AccountRow credit line`'s "draws no
+    // credit line at all" test: text absence alone would still pass if the
+    // component drew an empty `.credit-row` shell, which is exactly the kind
+    // of silent-but-not-actually-silent regression a zero-noise rule exists
+    // to prevent.
+    expect(container.querySelector('.credit-row')).toBeNull()
   })
 
   it('shows both counts when they differ', () => {
