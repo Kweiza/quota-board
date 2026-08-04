@@ -5,8 +5,8 @@
 
 ## 1. Scope
 
-quota-board is a desktop widget that shows the 5-hour and 7-day usage limits
-of several Claude accounts at once. This document records the architecture, the
+quota-board is a desktop widget that shows the usage limits of several Claude
+and Codex accounts at once. This document records the architecture, the
 constraints that shape it, and the terms-of-service position the project takes.
 
 Two observations determine almost everything else in the design; they are §2.
@@ -194,6 +194,11 @@ The following two paths are **explicitly out of scope**:
 
 **Losing this endpoint ends the product.** Not degraded performance —
 termination.
+
+> This claim, and its restatement at §12.6, predate Codex existing as an
+> independent second data source (§5.6). Whether losing this one endpoint still
+> ends *the product* — as opposed to ending its Claude side while Codex
+> accounts keep working — is unresolved and is not decided here.
 
 ### 5.2 User-Agent policy (a non-goal)
 
@@ -703,7 +708,7 @@ vanishes on reboot.
 - **The key format is deliberately asymmetric between providers**, not for lack
   of taste. Anthropic entries stay unprefixed (`<uuid>:tokens`) because changing
   that format orphans every existing keychain entry — the lookup falls to
-  `NOT_FOUND`, this section maps that to `AUTH_DEAD`, and the upgrade forces a
+  `NOT_FOUND`, §9.2 maps that to `AUTH_DEAD`, and the upgrade forces a
   re-login on every account already added. New providers are namespaced from
   the start (`openai:<id>:tokens`): the token store is the one place a bug
   means credential loss, so it carries no migration to get wrong. See
@@ -857,6 +862,15 @@ and the server issued it.
 
 We do not request `org:create_api_key`, `user:sessions:claude_code`,
 `user:mcp_servers`, or `user:file_upload` — they are not needed.
+
+**OpenAI's counterpart.** Discovery's advertised scope list for OpenAI
+(`openid`, `profile`, `email`, `offline_access` — §10.1) contains nothing
+resembling `user:inference`, so there is no inference scope to decline the way
+Anthropic's is declined above. **That is not evidence the resulting token
+cannot run inference** — access there is likely account-based rather than
+scope-gated. Establishing otherwise would mean sending an inference request,
+which this project forbids outright, so it stays unmeasured and is stated that
+way (docs/research/codex-usage-endpoint.md, "OAuth endpoints").
 
 ### 10.5 Expiry and refresh
 
