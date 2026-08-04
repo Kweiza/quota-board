@@ -17,24 +17,42 @@ stable.
 
 These are not style preferences. Violating any of them is a defect.
 
-- **Never impersonate `User-Agent: claude-code/<version>`.** Always send
-  `quota-board/<version>`. Misrepresenting identity to Anthropic's servers is
-  the one unambiguous prohibition in their terms, and the whole project is built
-  around not crossing it. This costs us the generous throttle bucket, and that
-  cost is accepted deliberately — see `docs/design.md` §5.2.
-- **Send only `anthropic-beta: oauth-2025-04-20`.** No other header that
-  identifies Claude Code.
-- **Never read or write `~/.claude/.credentials.json` from application code.**
-  The manual research scripts in `scripts/` are the sole exception, and only
-  when a human runs them.
+- **Never impersonate another client's `User-Agent`.** Not
+  `claude-code/<version>`, not Codex CLI's. Always send
+  `quota-board/<version>`, to every provider. Misrepresenting identity to
+  Anthropic's servers is the one unambiguous prohibition in their terms, and the
+  whole project is built around not crossing it. There it costs us the generous
+  throttle bucket, and that cost is accepted deliberately — see
+  `docs/design.md` §5.2. On the OpenAI side it was measured to cost nothing at
+  all: the honest request is served on the first attempt (Spike F). The rule is
+  not a price we pay only when it is cheap.
+- **Send only `anthropic-beta: oauth-2025-04-20`, and only to Anthropic.** No
+  other header that identifies Claude Code, and on the Codex side **no
+  `originator` header** — `originator: codex_cli_rs` is what identifies Codex
+  CLI, it was never sent, and Spike F measured that the endpoint answers 200
+  without it. `crates/core/src/usage/http.rs` asserts the absence of both
+  headers positively, because a mock that merely fails to match on a header
+  would pass whether or not it was sent.
+- **Never read or write another client's credential file from application
+  code** — `~/.claude/.credentials.json` for Claude Code, `~/.codex/auth.json`
+  for Codex CLI. This app does not depend on, interoperate with, or interfere
+  with another tool's credential storage. The manual research scripts in
+  `scripts/` are the sole exception, and only when a human runs them.
 - **Never call an inference endpoint for either provider** — `POST
   /v1/messages` for Anthropic, or any OpenAI completions/response endpoint for
   Codex. This app is not an inference client for either service. Either path
   would consume the very limits it reports.
 - **Never store tokens in plaintext.** Not in `tauri-plugin-store`, not in the
   account metadata file. Tokens live in `secrets` only.
-- **The account primary key is `account.uuid`.** Never key by email or by user
-  label — emails are display-only and user-editable.
+- **The account primary key is the pair `(provider, account_id)`.** Never the
+  bare id: two providers may issue the same one, and every store that keyed by
+  it alone collapsed the two accounts into one entry. The Rust field is
+  `Account::account_id` (serialized as `uuid`, which it is not — Codex issues
+  `user-…`). `provider::token_key`, `snapshots::cache_key`,
+  `scheduler::EntryKey`, `usage::raw`'s `RawKey` and `types.ts`'s `accountKey`
+  each build that pair, and finding the places that did not took five review
+  rounds. Never key by email or by user label either — those are display-only
+  and user-editable. See `docs/design.md` §9.3.
 - **No test may consume real account limits or throttle budget.** Every test
   reaches a local mock, never the network. Two different seams achieve that, and
   the difference is deliberate: `secrets`' store access and `auth`'s HTTP both
@@ -72,8 +90,11 @@ This repository is public.
 
 ```
 crates/core/          Headless library. Knows nothing about Tauri.
+  src/provider.rs     Provider, and every per-provider constant: URLs, scopes,
+                      polling floors, token-key format
   src/model.rs        UsageWindow, Severity — the normalized domain types
-  src/accounts.rs     Account metadata store (uuid-keyed, no tokens)
+  src/accounts.rs     Account metadata store ((provider, account_id)-keyed,
+                      no tokens)
   src/secrets/        Token store: keychain first, encrypted file fallback
   src/usage/          Anthropic and OpenAI usage response parsing
 docs/design.md        Architecture, constraints, terms-of-service position
