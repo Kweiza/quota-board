@@ -4,8 +4,8 @@ Guidance for Claude Code (and any other agent) working in this repository.
 
 ## What this is
 
-quota-board is a desktop widget that shows the 5-hour and 7-day Claude usage
-limits for several accounts at once. It is a single Tauri v2 application: a Rust
+quota-board is a desktop widget that shows the usage limits of several Claude
+and Codex accounts at once. It is a single Tauri v2 application: a Rust
 core owns accounts, tokens, polling, and networking, and a Svelte + TypeScript
 webview renders state.
 
@@ -27,8 +27,10 @@ These are not style preferences. Violating any of them is a defect.
 - **Never read or write `~/.claude/.credentials.json` from application code.**
   The manual research scripts in `scripts/` are the sole exception, and only
   when a human runs them.
-- **Never call `POST /v1/messages`.** This app is not an inference client. That
-  path would consume the very limits it reports.
+- **Never call an inference endpoint for either provider** — `POST
+  /v1/messages` for Anthropic, or any OpenAI completions/response endpoint for
+  Codex. This app is not an inference client for either service. Either path
+  would consume the very limits it reports.
 - **Never store tokens in plaintext.** Not in `tauri-plugin-store`, not in the
   account metadata file. Tokens live in `secrets` only.
 - **The account primary key is `account.uuid`.** Never key by email or by user

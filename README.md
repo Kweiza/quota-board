@@ -131,6 +131,16 @@ Approving each one restores every account. Dismissing instead is expected to
 leave that account reading as locked until the next launch you do approve; that
 branch has not been measured.
 
+**Codex (ChatGPT) accounts read a subscription usage endpoint too.**
+`GET https://chatgpt.com/backend-api/wham/usage` reports a Codex account's
+limits the same way `/api/oauth/usage` does for Claude, and it is held to the
+same rule: an honest `quota-board/<version>` User-Agent is sent, and nothing
+here impersonates the Codex CLI. Its 180-second polling floor is **borrowed**,
+not measured the way Claude's is — no run against this endpoint has ever
+produced a 429, so there is no boundary to derive a floor from, only a point
+(60-second polling for 89 minutes) known to be safe. See
+[`docs/research/codex-usage-endpoint.md`](docs/research/codex-usage-endpoint.md).
+
 ### Linux
 
 - **An X server is required — X11 or XWayland.** The app sets
