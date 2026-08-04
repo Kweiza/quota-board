@@ -456,20 +456,37 @@ fn identity_from(
     }
 }
 
-/// Sends the token request in whichever shape `cfg.body_style` calls for.
-/// This is the one place `exchange_code` and `refresh` differ across
-/// providers — PKCE, the loopback listener, and the manual paste fallback are
-/// unaffected and stay shared.
+/// Sends a body in whichever shape `style` calls for.
+///
+/// **Every POST this module makes goes through here**, token requests and
+/// revocation alike. `revoke` used to send JSON unconditionally, which was
+/// right for the one provider whose shape is measured and wrong for the other,
+/// and — because `revoke` discards its result — wrong invisibly. One dispatch
+/// means a provider added later cannot get one endpoint right and the other
+/// wrong.
+async fn post_in_body_style<H: TokenHttp, T: DeserializeOwned>(
+    http: &H,
+    style: BodyStyle,
+    url: &str,
+    json_body: &serde_json::Value,
+    form_body: &[(&str, &str)],
+) -> Result<(T, serde_json::Value), AuthError> {
+    match style {
+        BodyStyle::JsonWithState => http.post_json(url, json_body).await,
+        BodyStyle::Form => http.post_form(url, form_body).await,
+    }
+}
+
+/// The token endpoint's half of [`post_in_body_style`]. This is the one place
+/// `exchange_code` and `refresh` differ across providers — PKCE, the loopback
+/// listener, and the manual paste fallback are unaffected and stay shared.
 async fn post_token_request<H: TokenHttp>(
     http: &H,
     cfg: &ProviderSpec,
     json_body: &serde_json::Value,
     form_body: &[(&str, &str)],
 ) -> Result<(TokenFields, serde_json::Value), AuthError> {
-    match cfg.body_style {
-        BodyStyle::JsonWithState => http.post_json(&cfg.token_url, json_body).await,
-        BodyStyle::Form => http.post_form(&cfg.token_url, form_body).await,
-    }
+    post_in_body_style(http, cfg.body_style, &cfg.token_url, json_body, form_body).await
 }
 
 /// authorization_code → token exchange. docs/design.md §10.3.
@@ -605,17 +622,34 @@ pub async fn refresh<H: TokenHttp>(
 /// blocked by the revocation endpoint being unreachable or slow — the local
 /// deletion proceeds either way. docs/design.md §10.6.
 ///
-/// Not branched on `body_style`: design.md §10.6 records one JSON shape and
-/// nothing measured suggests OpenAI's revoke wants anything else, so it stays
-/// unconditional until a measurement says otherwise.
+/// **Branched on `body_style`, like every other POST here.** §10.6's JSON shape
+/// is Anthropic's and is measured; nothing at all has been measured for
+/// OpenAI, and RFC 7009 §2.1 requires `application/x-www-form-urlencoded` for a
+/// revocation request — which is the same reason `BodyStyle::Form` was chosen
+/// for that provider's token endpoint. Sending JSON regardless was a guess in
+/// the one place a wrong guess cannot be seen: this function swallows every
+/// outcome, so a refused revocation looks exactly like an accepted one and the
+/// user is left with a live refresh token on the server after the account is
+/// gone locally.
 pub async fn revoke<H: TokenHttp>(http: &H, cfg: &ProviderSpec, refresh_token: &str) {
-    let body = serde_json::json!({
+    let json_body = serde_json::json!({
         "token": refresh_token,
         "token_type_hint": "refresh_token",
         "client_id": cfg.client_id,
     });
-    let _ =
-        tokio::time::timeout(REVOKE_TIMEOUT, http.post_json::<serde_json::Value>(&cfg.revoke_url, &body)).await;
+    let form_body = [
+        ("token", refresh_token),
+        ("token_type_hint", "refresh_token"),
+        ("client_id", cfg.client_id.as_str()),
+    ];
+    let call = post_in_body_style::<H, serde_json::Value>(
+        http,
+        cfg.body_style,
+        &cfg.revoke_url,
+        &json_body,
+        &form_body,
+    );
+    let _ = tokio::time::timeout(REVOKE_TIMEOUT, call).await;
 }
 
 /// Fills in an identity's email from the usage response, when the token
@@ -696,7 +730,7 @@ mod tests {
     use crate::auth::pkce::PendingAuth;
     use crate::provider::Provider;
     use std::sync::{Arc, Mutex};
-    use wiremock::matchers::{body_json_string, header, method, path};
+    use wiremock::matchers::{body_json_string, body_string, header, method, path};
     use wiremock::{Mock, MockServer, Request, ResponseTemplate};
 
     fn pending() -> PendingAuth {
@@ -1236,6 +1270,41 @@ mod tests {
 
         let http = ReqwestHttp::new().unwrap();
         revoke(&http, &cfg_for(&server).await, "the-refresh-token").await;
+    }
+
+    /// docs/design.md §10.6: the revocation body goes out in the provider's
+    /// own `body_style`, not unconditionally as JSON.
+    ///
+    /// §10.6's JSON shape is Anthropic's and is measured; nothing has been
+    /// measured for OpenAI, and RFC 7009 §2.1 requires
+    /// `application/x-www-form-urlencoded` for a revocation request — the same
+    /// reason `BodyStyle::Form` was chosen for that provider's token endpoint.
+    /// **This is the outcome nothing else can observe**: `revoke` swallows
+    /// every result, so a server refusing the body would look exactly like a
+    /// success, and the user would be left with a live refresh token on
+    /// OpenAI's side after removing the account, with nothing saying so.
+    #[tokio::test]
+    async fn revoke_sends_the_body_style_the_provider_asked_for() {
+        let server = MockServer::start().await;
+        let cfg = ProviderSpec {
+            revoke_url: format!("{}/api/accounts/oauth/revoke", server.uri()),
+            ..Provider::Openai.spec()
+        };
+
+        Mock::given(method("POST"))
+            .and(path("/api/accounts/oauth/revoke"))
+            .and(header("content-type", "application/x-www-form-urlencoded"))
+            .and(body_string(format!(
+                "token=the-refresh-token&token_type_hint=refresh_token&client_id={}",
+                cfg.client_id
+            )))
+            .respond_with(ResponseTemplate::new(200))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let http = ReqwestHttp::new().unwrap();
+        revoke(&http, &cfg, "the-refresh-token").await;
     }
 
     /// docs/design.md §10.6: a failing revoke must not propagate or block
