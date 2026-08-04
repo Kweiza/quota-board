@@ -934,9 +934,28 @@ is rediscovered as a surprise.
 ### 10.6 Revocation
 
 On account deletion, POST
-`{ token, token_type_hint: "refresh_token", client_id }` to
-`<TOKEN_URL>/revoke`. Timeout 5 seconds, best-effort — swallow failures and
-proceed with local deletion.
+`{ token, token_type_hint: "refresh_token", client_id }` to the provider's own
+`revoke_url` (§10.1 — a field, not a suffix of the token URL, because OpenAI's
+is a sibling of its token endpoint). Timeout 5 seconds, best-effort — swallow
+failures and proceed with local deletion.
+
+**The body goes out in the provider's `body_style`**, through the same dispatch
+the token endpoint uses. The JSON shape above is Anthropic's and is measured
+(§10.3). For OpenAI nothing is measured, and RFC 7009 §2.1 requires
+`application/x-www-form-urlencoded` for a revocation request — the same reason
+`BodyStyle::Form` was chosen for that provider's token endpoint. Sending JSON
+regardless would be a guess in the one place a wrong guess cannot be seen:
+because the outcome is swallowed, a refused revocation looks exactly like an
+accepted one, and the user-visible result is a live refresh token left on the
+server after the account is gone locally.
+
+**Still unmeasured, and recorded as such.** No revocation request has ever been
+sent to OpenAI, so form encoding here is the standard's default rather than an
+observation. If a Codex account's tokens are found still valid after removal,
+check the body style first and the URL second — the CLI's request log uses a
+token endpoint that differs from the one discovery advertises, and its revoke
+sibling may differ the same way
+(`docs/research/codex-usage-endpoint.md`, "OAuth endpoints").
 
 ### 10.7 Refresh-chain isolation — the benefit and the measured risk
 
