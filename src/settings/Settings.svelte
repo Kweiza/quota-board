@@ -167,6 +167,22 @@
    */
   let loadedFor: string | null = null
   $: loaded = selected !== '' && loadedFor === selected
+
+  /**
+   * Returns the debug panel to "nothing selected".
+   *
+   * Called whenever the selected account is no longer in the list. The core
+   * calls `forget_raw` on removal precisely so a deleted account's body stops
+   * being readable; leaving `captured` here would undo that in the one window
+   * the body is displayed in. `selected` is reset too — a `<select>` whose
+   * chosen `<option>` has been removed keeps its old value, so `loaded` would
+   * stay true and the body would keep rendering with no user action.
+   */
+  function forgetSelection(): void {
+    selected = ''
+    loadedFor = null
+    captured = null
+  }
   $: dailyCalls = queriesPerDay(intervalSecs, accounts.length)
 
   let unlisteners: UnlistenFn[] = []
@@ -188,6 +204,13 @@
       Object.keys(throttledUntil)
         .filter((key) => !live.has(key))
         .forEach(forgetThrottle)
+      // The debug panel is reconciled against the same list, for a stronger
+      // reason than the notes above: a note is stale wall-clock text, while a
+      // retained body is the response `remove_account_for` called `forget_raw`
+      // to make unreadable. Without this the removed account's body stays
+      // rendered — the `<option>` is gone, but `selected` and `loadedFor` still
+      // agree, so `loaded` is true and no user action is needed to see it.
+      if (selected !== '' && !live.has(selected)) forgetSelection()
     } catch (e) {
       // A failed read is not a reason to blank the list; the widget branch of
       // src/main.ts set that rule and it holds here for the same reason.
@@ -449,7 +472,14 @@
     // actually needs from the same `accounts` list the `<select>` was built
     // from, rather than trying to parse the key back apart.
     const current = accounts.find((a) => accountKey(a.account_id, a.provider) === selected)
-    if (current === undefined) return
+    // The list changed under the selection — another window removed the
+    // account, or `pullAccounts` has not run yet. Returning silently would
+    // leave the previous body on screen and make the button look broken;
+    // clearing says what is actually true.
+    if (current === undefined) {
+      forgetSelection()
+      return
+    }
     try {
       captured = await lastResponse(current.account_id, current.provider)
       loadedFor = selected

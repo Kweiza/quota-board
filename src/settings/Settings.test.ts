@@ -551,6 +551,40 @@ describe('Settings debug panel', () => {
     expect(screen.getByText('Select an account and press Reload.')).toBeTruthy()
   })
 
+  /**
+   * `remove_account_for` calls `forget_raw` precisely so that a deleted
+   * account's body stops being readable. Nothing reconciled `selected` or
+   * `loadedFor` against the account list, so the webview undid that: the row
+   * vanished from the list while its captured body stayed on screen, with no
+   * user action in between.
+   */
+  it('drops a removed account\'s captured body instead of leaving it on screen', async () => {
+    const raw: RawResponse = {
+      captured_at: '2026-08-03T09:00:00Z',
+      status: 200,
+      truncated: false,
+      body: '{"marker":"THE-REMOVED-ACCOUNTS-BODY"}',
+    }
+    const backend: Backend = { accounts: [...two], raw }
+    const calls = mockBackend(backend)
+    render(Settings)
+    await selectAccount('uuid-home')
+    await fireEvent.click(screen.getByRole('button', { name: 'Reload' }))
+    expect(await screen.findByText(/THE-REMOVED-ACCOUNTS-BODY/)).toBeTruthy()
+
+    // The removal the widget really performs: the account leaves the list and
+    // the backend announces it.
+    backend.accounts = two.filter((a) => a.account_id !== 'uuid-home')
+    await whenSubscribed(calls)
+
+    await waitFor(() =>
+      expect(screen.queryByText(/THE-REMOVED-ACCOUNTS-BODY/)).toBeNull(),
+    )
+    // And the panel says what is true afterwards, rather than the "has not
+    // been polled" claim it has no basis for — nothing is selected any more.
+    expect(screen.getByText('Select an account and press Reload.')).toBeTruthy()
+  })
+
   it('marks a truncated body as truncated rather than showing it as whole', async () => {
     const raw: RawResponse = {
       captured_at: '2026-07-31T09:00:00Z',
