@@ -48,6 +48,18 @@ export type ExtraLine =
   | ({ kind: 'credit' } & CreditSpend)
   | ({ kind: 'reset_credits' } & ResetCredits)
 
+/**
+ * Mirrors `Provider` in `crates/core/src/provider.rs`, serialized with
+ * `#[serde(rename_all = "snake_case")]`. Change both together.
+ *
+ * These strings are **the wire form, not a display name** — the UI says
+ * "Claude" and "Codex", which are product names rather than vendor ones, and
+ * `AccountRow.svelte`'s `BADGE` maps one to the other. A rename on the Rust
+ * side that this file did not follow would leave `BADGE[account.provider]`
+ * `undefined` and throw while rendering, which is a blank widget rather than a
+ * type error. `provider_serializes_as_the_typescript_union_spells_it` pins the
+ * Rust half; nothing in either test suite catches the drift on its own.
+ */
 export type Provider = 'anthropic' | 'openai'
 
 /**

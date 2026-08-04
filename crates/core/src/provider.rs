@@ -167,6 +167,7 @@ pub fn token_key(provider: Provider, account_id: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::json;
 
     /// **The Anthropic form must not change.** Every existing keychain entry is
     /// stored under it; a new format orphans them all, lookups fall to
@@ -225,5 +226,47 @@ mod tests {
     #[test]
     fn the_anthropic_spec_still_requests_profile_alone() {
         assert_eq!(Provider::Anthropic.spec().scopes, vec!["user:profile"]);
+    }
+
+    /// The serialized form is a contract with `src/lib/types.ts:51`
+    /// (`export type Provider = 'anthropic' | 'openai'`), the same kind
+    /// `model.rs` pins for `ExtraLine`.
+    ///
+    /// **Nothing else notices if it breaks.** Drop the `rename_all` attribute
+    /// and every Rust test and every vitest test still passes, because both
+    /// suites work with values of their own side's spelling. At runtime
+    /// `list_accounts` starts answering `"Openai"`, `AccountRow.svelte`'s
+    /// `BADGE["Openai"]` is `undefined`, and `{badge.text}` throws while
+    /// rendering — a blank widget, which is the failure mode this whole
+    /// product is built to avoid.
+    ///
+    /// The deserialize half matters separately: `accounts.json` stores this
+    /// value, so a rename would also make every saved Codex account
+    /// unreadable.
+    #[test]
+    fn provider_serializes_as_the_typescript_union_spells_it() {
+        assert_eq!(serde_json::to_value(Provider::Anthropic).unwrap(), json!("anthropic"));
+        assert_eq!(serde_json::to_value(Provider::Openai).unwrap(), json!("openai"));
+        let back = |s: &str| serde_json::from_value::<Provider>(json!(s)).unwrap();
+        assert_eq!(back("anthropic"), Provider::Anthropic);
+        assert_eq!(back("openai"), Provider::Openai);
+    }
+
+    /// `as_str` and the serde name are **two independent spellings of the same
+    /// word**, and `src/lib/types.ts:98-109` says they mirror each other:
+    /// `snapshots::cache_key` builds `"<as_str>:<id>"` in Rust, while
+    /// `accountKey` builds `"<serialized>:<id>"` in the webview from the value
+    /// that arrived over IPC. Let the two drift and the webview's key stops
+    /// matching the core's for every keyed lookup — the `{#each}` block, the
+    /// throttle notes, and the debug panel's selection all key off it.
+    #[test]
+    fn the_storage_spelling_and_the_wire_spelling_are_the_same_word() {
+        for p in [Provider::Anthropic, Provider::Openai] {
+            assert_eq!(
+                serde_json::to_value(p).unwrap(),
+                json!(p.as_str()),
+                "{p:?} serializes as one word and stores itself as another"
+            );
+        }
     }
 }
