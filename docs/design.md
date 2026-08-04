@@ -170,7 +170,8 @@ budget (§14).
 
 ### 5.1 Data source
 
-**The following call is the only data source.**
+**The following call is the only data source for a Claude account.** §5.6 is
+Codex's counterpart.
 
 ```
 GET https://api.anthropic.com/api/oauth/usage
@@ -244,6 +245,7 @@ Three conventions coexist, so normalize once at the module boundary.
 | Source | Utilization | Reset time |
 |---|---|---|
 | `/api/oauth/usage` | `utilization`, 0–100 | `resets_at`, ISO-8601 string |
+| `wham/usage` (Codex) | `used_percent`, 0–100 | `reset_at`, **Unix epoch seconds** |
 | Response headers (unused) | `-utilization`, **0..1 fraction** | `-reset`, **Unix epoch seconds** |
 | statusline JSON (unused) | `used_percentage`, 0–100 | `resets_at`, epoch seconds |
 
@@ -273,6 +275,36 @@ fields observed: `seven_day_cowork`, `seven_day_omelette`, `spend{}`,
 - Treat unrecognizable shapes as an `UNKNOWN_SHAPE` state.
 - **Never demote a missing or unparseable window to 0%.** Displaying a
   confidently wrong number is the worst failure mode.
+
+### 5.6 The Codex data source
+
+```
+GET https://chatgpt.com/backend-api/wham/usage
+Authorization: Bearer <access_token for the account>
+User-Agent: quota-board/<version>
+Accept: application/json
+```
+
+**`/backend-api/codex/usage` is not this endpoint.** It answers a Cloudflare
+challenge — an HTML body, `server-timing: chlray`, no `x-oai-request-id` — while
+`wham/usage` answers 200 and agrees field for field with the account's own
+usage page. Both were measured; §5.2's problem does not arise here either: the
+honest `quota-board/<version>` User-Agent above is served on the first attempt,
+with no header that identifies Codex CLI. Full method and data:
+**docs/research/codex-usage-endpoint.md** (Spike F for the endpoint itself,
+Spike G for what was and was not found about its throttling —
+`Provider::min_interval_secs`'s doc comment carries the conclusion: a 180-second
+floor chosen as a margin, not derived from a measured boundary, because none was
+found).
+
+`rate_limit_reset_credits` arrives in the same response, so the widget's
+reset-credit line needs no second request to populate.
+
+**Every account measured read 0% throughout.** `secondary_window`,
+`additional_rate_limits`, and `code_review_rate_limit` were `null` in every
+capture, so the shape a populated window takes is not measured — §5.5's schema
+tolerance and the never-demote-to-0% rule carry the design across that gap, but
+the gap itself stays open until an account with usage in flight is observed.
 
 ## 6. Polling policy
 
@@ -462,6 +494,13 @@ rows that are decisions rather than mechanics:
   as `STALE`", and keeping the last value with its age is the right display for
   a fetch that failed without implicating the credential. The honest
   alternative is a ninth state whose display is identical to two existing ones.
+- An edge refusal of a Codex usage request — one that never reached the API at
+  all, distinguished from an API answer by the absence of `x-oai-request-id`
+  (§5.6) — → `NETWORK`. No new state was added for it: this table's states
+  exist to carry remedies, and an edge refusal has the same remedy as `NETWORK`
+  already does — none. Reading it as `AUTH_DEAD` would mark a healthy account
+  dead and send the user through a re-login that would be refused identically,
+  since the account was never what was asked about.
 - A 429 is **not** one of these at all. It carries a wait, so it drives §6.2's
   throttle path instead; folding it in here would discard the `Retry-After`.
 - A rotation that succeeded over HTTP but failed to persist changes **no**
@@ -661,6 +700,14 @@ vanishes on reboot.
 - Store entries are keyed **uniquely by `account.uuid` under our own service
   name**. Lookups must be exact-key lookups, never "the first entry whose
   service matches."
+- **The key format is deliberately asymmetric between providers**, not for lack
+  of taste. Anthropic entries stay unprefixed (`<uuid>:tokens`) because changing
+  that format orphans every existing keychain entry — the lookup falls to
+  `NOT_FOUND`, this section maps that to `AUTH_DEAD`, and the upgrade forces a
+  re-login on every account already added. New providers are namespaced from
+  the start (`openai:<id>:tokens`): the token store is the one place a bug
+  means credential loss, so it carries no migration to get wrong. See
+  `provider::token_key`.
 - Per-entry JSON blob:
   `{ access_token, refresh_token, expires_at, refresh_token_expires_at, scopes[], client_id }`
 
@@ -707,6 +754,27 @@ device-code alternative exists.
 Note that authorize is **not** `claude.ai/oauth/authorize`. Many older
 integration clients still use that address. `claude.ai` itself is not used for
 token or usage traffic at all.
+
+**OpenAI (Codex)**, from `auth.openai.com`'s discovery document
+(`/.well-known/openid-configuration`) and cross-checked against the codex
+binary's own request log — docs/research/codex-usage-endpoint.md, "OAuth
+endpoints":
+
+| Purpose | URL |
+|---|---|
+| authorize | `https://auth.openai.com/api/accounts/authorize` |
+| token (discovery-advertised) | `https://auth.openai.com/api/accounts/oauth/token` |
+| token (CLI-observed) | `https://auth.openai.com/oauth/token` |
+| revoke | `https://auth.openai.com/api/accounts/oauth/revoke` |
+
+**The CLI does not use the token endpoint its own issuer advertises** — its
+request log records the second URL above instead. `Provider::spec` uses the
+discovery-advertised one, because it is the documented contract; the
+CLI-observed one is recorded rather than adopted, so it is one grep away
+(`crates/core/src/provider.rs`) the day a refresh starts failing against it.
+**No OAuth flow has ever been run against either** — every row in this table
+comes from discovery or from reading the binary, not from a completed
+authorize/token exchange.
 
 ### 10.2 client_id
 
