@@ -148,10 +148,11 @@ impl RawLog {
 /// value *shapes*, so a future `"session_key": "9f3c…"` with no recognizable
 /// shape would pass it untouched.
 ///
-/// Checked against the measured key set (docs/research/usage-endpoint.md:25-43
-/// and :85-158): none of the real keys contains any of these needles, so this
-/// masks nothing diagnostic today. `credential` is spelled in full on purpose —
-/// `credit` would swallow the real `used_credits` and `credits_ever_enabled`.
+/// Checked against both measured key sets (docs/research/usage-endpoint.md:25-43
+/// and :85-158; docs/research/codex-usage-endpoint.md:93-99): apart from `_id`,
+/// none of the real keys contains any of these needles, so this masks nothing
+/// diagnostic today. `credential` is spelled in full on purpose — `credit` would
+/// swallow the real `used_credits` and `credits_ever_enabled`.
 const SENSITIVE_KEY_NEEDLES: &[&str] = &[
     "token",
     "secret",
@@ -164,6 +165,19 @@ const SENSITIVE_KEY_NEEDLES: &[&str] = &[
     "cookie",
     "session_key",
     "email",
+    // The Codex body carries `account_id` and `user_id` at the top level, and
+    // the research document says of that exact body: "This body carries
+    // identifiers, so raw captures belong in `.local/`, never in this
+    // repository" (codex-usage-endpoint.md:101-104). The debug panel exists to
+    // be pasted into a public issue, which is the same disclosure.
+    //
+    // **`_id`, not `id`.** A bare `id` would also catch
+    // `limits[].scope.model.id`, which the Anthropic body carries as a public
+    // model identifier beside the `display_name` the parser reads — diagnostic,
+    // not identifying. Every account-identifying key measured on either
+    // endpoint takes the `_id` shape, and so would an `org_id` or a
+    // `workspace_id` grown later, which is the whole reason this layer exists.
+    "_id",
 ];
 
 fn key_is_sensitive(key: &str) -> bool {
@@ -262,6 +276,25 @@ const MONEY_KEY_NEEDLES: &[&str] = &["dollars", "credits", "amount", "balance", 
 
 const MONEY_MASK: &str = "<redacted:amount>";
 
+/// Keys that contain a [`MONEY_KEY_NEEDLES`] needle but name no amount.
+/// Matched whole and case-insensitively, in the same style as
+/// [`MONEY_SHAPE_KEYS`] and for the same reason: a substring rule here would
+/// hand back the ground the needles are there to hold.
+///
+/// **This only stops a subtree from *becoming* money; it never leaves one.**
+/// `key_is_money` is consulted as `in_money || key_is_money(k)`, so a key on
+/// this list nested inside `spend{}` stays masked. Deny still wins from above.
+///
+/// - `rate_limit_reset_credits`: measured as `{ available_count: 1,
+///   applicable_available_count: 0 }` (docs/research/codex-usage-endpoint.md,
+///   "rate_limit_reset_credits") — a count of limit resets the account holds,
+///   not a sum of money. It matches on the `credits` needle, and the two counts
+///   under it are exactly what `usage::openai::parse_reset_credits` reads and
+///   what the Codex row draws under its bars. Masking them repeats the
+///   `decimal_places` incident recorded in [`MONEY_SHAPE_KEYS`]: the panel
+///   could not show the numbers the UI beside it was showing.
+const NOT_MONEY_KEYS: &[&str] = &["rate_limit_reset_credits"];
+
 /// The **only** numbers allowed to survive inside a money subtree. Deny stays
 /// the default: this is an exception list of keys that describe how to *read*
 /// an amount, not an allowlist of keys that carry one. Matched whole and
@@ -284,7 +317,24 @@ const MONEY_SHAPE_KEYS: &[&str] = &["exponent", "decimal_places"];
 
 fn key_is_money(key: &str) -> bool {
     let k = key.to_ascii_lowercase();
+    if NOT_MONEY_KEYS.contains(&k.as_str()) {
+        return false;
+    }
     MONEY_SUBTREES.contains(&k.as_str()) || MONEY_KEY_NEEDLES.iter().any(|n| k.contains(n))
+}
+
+/// A string that spells out a number, which is how the Codex body sends
+/// `credits.balance` — `"0"`, quoted (measured, Spike F;
+/// docs/research/codex-usage-endpoint.md, "`credits` and `spend_control`").
+///
+/// [`mask_money`] replaced numbers only, so an amount spelled as a string
+/// walked straight through the layer written to stop it. The digit check keeps
+/// this to values that are numeric in the ordinary sense: `f64` alone accepts
+/// `"NaN"` and `"inf"`, and `currency: "USD"` and `spend.disclaimer`'s prose —
+/// both of which §12.4's schema-drift question needs — must keep surviving.
+fn is_numeric_string(s: &str) -> bool {
+    let t = s.trim();
+    t.chars().any(|c| c.is_ascii_digit()) && t.parse::<f64>().is_ok()
 }
 
 /// A bare number under a shape-describing key inside a money subtree.
@@ -302,14 +352,16 @@ fn is_money_shape_metadata(key: &str, value: &Value) -> bool {
     MONEY_SHAPE_KEYS.contains(&k.as_str())
 }
 
-/// Layer 1b: inside a money subtree, replace **numbers only**.
+/// Layer 1b: inside a money subtree, replace **the magnitudes only** — every
+/// number, and a string that spells one out.
 ///
-/// Keys, `null`s, booleans and strings survive, so §12.4's schema-drift
-/// question — did a field appear, disappear, or change from `null` to an
-/// object? — is still answerable from the panel. What does not survive is the
-/// magnitude, which the app never reads (`usage::anthropic` touches none of these
-/// keys) and which is the one thing in this body that is nobody's business in a
-/// screenshot pasted into a public issue.
+/// Keys, `null`s, booleans and non-numeric strings survive, so §12.4's
+/// schema-drift question — did a field appear, disappear, or change from `null`
+/// to an object? — is still answerable from the panel. What does not survive is
+/// the magnitude, which the app never reads (neither `usage::anthropic` nor
+/// `usage::openai` touches any of these keys) and which is the one thing in
+/// this body that is nobody's business in a screenshot pasted into a public
+/// issue.
 ///
 /// [`MONEY_SHAPE_KEYS`] is the single, narrow exception: the scale that says
 /// how to read an amount is not itself an amount.
@@ -327,6 +379,9 @@ fn mask_money(v: &Value, in_money: bool) -> Value {
         ),
         Value::Array(a) => Value::Array(a.iter().map(|c| mask_money(c, in_money)).collect()),
         Value::Number(_) if in_money => Value::String(MONEY_MASK.to_string()),
+        Value::String(s) if in_money && is_numeric_string(s) => {
+            Value::String(MONEY_MASK.to_string())
+        }
         other => other.clone(),
     }
 }
@@ -765,6 +820,89 @@ mod tests {
                  the exception silently stops meaning anything. Rename it or drop the needle."
             );
         }
+    }
+
+    /// The second body shape, run through the real masker.
+    ///
+    /// Every other test in this module builds an Anthropic-shaped fixture, so
+    /// the whole Codex body went unchecked when the key changed. Both
+    /// directions matter and they pull opposite ways:
+    ///
+    /// - `account_id` and `user_id` are the identifiers
+    ///   docs/research/codex-usage-endpoint.md:101-104 says raw captures
+    ///   belong in `.local/` for carrying. This panel is meant to be pasted
+    ///   into a public issue.
+    /// - `available_count` and `applicable_available_count` are the two numbers
+    ///   the Codex row's own reset-credit line displays. Masking them is the
+    ///   `decimal_places` failure recorded above, one provider over: the panel
+    ///   could not answer a question about the line the widget draws.
+    #[test]
+    fn a_codex_body_masks_its_identifiers_and_keeps_the_counts_the_row_draws() {
+        let v: Value = serde_json::from_str(include_str!("fixtures/openai_plus_zero.json"))
+            .expect("the measured fixture parses");
+        let text = RawResponse::capture(200, &v).body().to_string();
+
+        for identifier in ["account_id", "user_id", "email"] {
+            assert!(
+                text.contains(&format!("\"{identifier}\": \"{KEY_MASK}\"")),
+                "{identifier} reached the panel unmasked: {text}"
+            );
+        }
+        // The fixture's ids are already placeholders, so the assertion above is
+        // the real one; this catches a mask applied to the key but not to a
+        // second occurrence of the value.
+        assert!(!text.contains("user-REDACTED"), "an identifier value survived: {text}");
+        assert!(!text.contains("redacted@example.com"), "the address survived: {text}");
+
+        assert!(
+            text.contains("\"available_count\": 1"),
+            "the reset-credit count the row displays was masked: {text}"
+        );
+        assert!(
+            text.contains("\"applicable_available_count\": 0"),
+            "the applicable count the row displays was masked: {text}"
+        );
+
+        // `credits.balance` is a **string** in this body (measured, Spike F),
+        // and it is a real balance on an account that has one. It is not read
+        // by any parser, so nothing but the panel ever sees it.
+        assert!(
+            text.contains(&format!("\"balance\": \"{MONEY_MASK}\"")),
+            "a monetary balance shipped because it was spelled as a string: {text}"
+        );
+
+        // §12.4's question must still be answerable: the shape survives.
+        for shape in [
+            "plan_type",
+            "plus",
+            "primary_window",
+            "\"used_percent\": 0",
+            "\"limit_window_seconds\": 604800",
+            "\"secondary_window\": null",
+            "rate_limit_reset_credits",
+            "spend_control",
+        ] {
+            assert!(text.contains(shape), "the shape marker {shape} was lost: {text}");
+        }
+    }
+
+    /// [`NOT_MONEY_KEYS`] stops a subtree from *becoming* money; it must never
+    /// leave one. `rate_limit_reset_credits` is measured at the top level, but
+    /// a body that later nested it under `spend{}` would carry amounts, and an
+    /// exception that unmasked on the way down would open an island in the
+    /// middle of the one subtree this module is most certain about.
+    #[test]
+    fn a_not_money_key_nested_inside_a_money_subtree_stays_masked() {
+        let v = serde_json::json!({
+            "five_hour": null,
+            "spend": { "rate_limit_reset_credits": { "available_count": 7 } }
+        });
+        let text = RawResponse::capture(200, &v).body().to_string();
+        assert!(!text.contains("7"), "the exception unmasked inside a money subtree: {text}");
+        assert!(
+            text.contains("available_count"),
+            "the surrounding shape must still be readable: {text}"
+        );
     }
 
     /// The exception is scoped to a bare number directly under the key. A
