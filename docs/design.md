@@ -112,10 +112,11 @@ webview pushes).
 
 | Module | Responsibility | Depends on |
 |---|---|---|
-| `accounts` | Account metadata CRUD. JSON file. **Contains no tokens** | filesystem |
+| `provider` | `Provider`, and every constant that differs between the two: endpoint URLs, scopes, token body style, polling floor, token-key format | — |
+| `accounts` | Account metadata CRUD. JSON file. **Contains no tokens** | `provider`, filesystem |
 | `secrets` | Token store abstraction. Keychain first, encrypted file as fallback | `keyring`, filesystem |
 | `auth` | PKCE OAuth flow, token refresh and revocation | `secrets`, HTTP |
-| `usage` | One valid token → a list of usage windows. **The only module that knows the Anthropic API** | `auth` (for its HTTP client), HTTP |
+| `usage` | One valid token → a list of usage windows. **The only module that knows either provider's usage API** | `auth` (for its HTTP client), HTTP |
 | `scheduler` | Polling, manual refresh, visibility gating, throttle management, snapshot retention, failure classification | the four above |
 | webview | Widget rendering, settings forms | Tauri IPC |
 
@@ -142,10 +143,10 @@ records why that edge exists in place of an HTTP trait.
 
 ### 4.3 Intent behind the module boundaries
 
-**`usage` is the only module that knows the Anthropic API.** The most unstable
-part of this design — the response schema of an undocumented endpoint — is
-confined to this one module. When the schema changes (and per §12.4 it already
-changed once), only this module is touched.
+**`usage` is the only module that knows either provider's usage API.** The most
+unstable part of this design — the response schemas of two undocumented
+endpoints — is confined to this one module. When a schema changes (and per
+§12.4 Anthropic's already changed once), only this module is touched.
 
 `secrets`' store access sits behind a trait, so tests substitute an in-memory
 implementation.
