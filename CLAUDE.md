@@ -75,9 +75,9 @@ crates/core/          Headless library. Knows nothing about Tauri.
   src/model.rs        UsageWindow, Severity — the normalized domain types
   src/accounts.rs     Account metadata store (uuid-keyed, no tokens)
   src/secrets/        Token store: keychain first, encrypted file fallback
-  src/usage/          Anthropic API response parsing
+  src/usage/          Anthropic and OpenAI usage response parsing
 docs/design.md        Architecture, constraints, terms-of-service position
-docs/research/        Measured behavior of the undocumented usage endpoint
+docs/research/        Measured behavior of the undocumented usage endpoints
 scripts/              Manual research scripts (run by a human, never by the app)
 ```
 
