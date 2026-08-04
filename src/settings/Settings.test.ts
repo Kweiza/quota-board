@@ -583,6 +583,25 @@ describe('Settings debug panel', () => {
     // And the panel says what is true afterwards, rather than the "has not
     // been polled" claim it has no basis for — nothing is selected any more.
     expect(screen.getByText('Select an account and press Reload.')).toBeTruthy()
+    // Removing the `<option>` resets the `<select>` on its own, so the
+    // component's own `selected` has to be reset too or the two disagree.
+    // Adding the same account back is where that shows: Svelte writes
+    // `selected` into the control on the next render, and a stale value
+    // re-selects a row the panel has nothing loaded for.
+    backend.accounts = [...two]
+    await whenSubscribed(calls)
+    expect((screen.getByLabelText('Account') as HTMLSelectElement).value).toBe('')
+
+    // `loadedFor` has to go with it. Left set, it would match the moment the
+    // same key is chosen again, so `loaded` turns true with `captured` still
+    // null and the panel claims the account has never polled — before the user
+    // has pressed anything, which is the confidently-wrong display CLAUDE.md
+    // calls this product's worst failure mode.
+    await selectAccount('uuid-home')
+    expect(screen.getByText('Select an account and press Reload.')).toBeTruthy()
+    expect(
+      screen.queryByText('This account has not been polled successfully since the app started.'),
+    ).toBeNull()
   })
 
   it('marks a truncated body as truncated rather than showing it as whole', async () => {
