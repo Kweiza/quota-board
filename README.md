@@ -8,6 +8,11 @@ Codex accounts at once.
 > signed by a trusted publisher; read [Installing](#installing) before running
 > one.
 >
+> **Codex sign-in is experimental in 0.3.0.** Its protocol is audited against
+> the official Codex 0.153.2 source and covered by local mock tests, but a full
+> quota-board login → usage → refresh → usage → revoke run was not completed
+> against a live account before this release.
+>
 > `crates/core` is deliberately Tauri-unaware, so the core builds and tests with
 > no GTK or WebKit present.
 
@@ -82,11 +87,14 @@ displays "Claude Code" rather than this application's name.** It is a single
 constant in one file, so if third-party registration ever becomes available,
 it can be replaced in one place.
 
-Codex sign-in follows OpenAI's public-client flow. The normal desktop path opens
-`auth.openai.com` and returns to a loopback callback on this machine. If neither
-registered callback port is available, quota-board offers OpenAI's device-code
-flow instead. Device-code sign-in is a beta OpenAI feature and may need to be
-enabled in ChatGPT security or workspace settings.
+Codex sign-in is experimental in 0.3.0 and follows OpenAI's public-client flow.
+The normal desktop path opens `auth.openai.com` and returns to a loopback
+callback on this machine. If neither registered callback port is available,
+quota-board offers OpenAI's device-code flow instead. Device-code sign-in is a
+beta OpenAI feature and may need to be enabled in ChatGPT security or workspace
+settings. The source-audited wire contract and local mock coverage are complete;
+the missing evidence is one full live quota-board lifecycle, not an inference
+request or imported CLI credential.
 
 ### One machine will hold all your tokens
 
