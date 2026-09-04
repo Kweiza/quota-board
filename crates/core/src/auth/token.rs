@@ -130,12 +130,6 @@ pub trait TokenHttp: Send + Sync {
         form: &[(&str, &str)],
     ) -> impl std::future::Future<Output = Result<(T, serde_json::Value), AuthError>> + Send;
 
-    fn get_json<T: DeserializeOwned>(
-        &self,
-        url: &str,
-        bearer: &str,
-    ) -> impl std::future::Future<Output = Result<T, AuthError>> + Send;
-
     fn user_agent(&self) -> &str;
 }
 
@@ -397,22 +391,6 @@ impl TokenHttp for ReqwestHttp {
         decode(resp, &form_request_secrets(form)).await
     }
 
-    async fn get_json<T: DeserializeOwned>(&self, url: &str, bearer: &str) -> Result<T, AuthError> {
-        let resp = self
-            .client
-            .get(url)
-            .bearer_auth(bearer)
-            .header("anthropic-beta", ANTHROPIC_BETA)
-            .header("Content-Type", "application/json")
-            .send()
-            .await
-            .map_err(|e| AuthError::Transport(e.to_string()))?;
-        // The raw body is discarded here: nothing that calls `get_json` today
-        // needs it. Kept as `Result<T, AuthError>` so this method's contract
-        // does not change for whatever future caller reaches for it.
-        decode(resp, &[bearer]).await.map(|(typed, _raw)| typed)
-    }
-
     fn user_agent(&self) -> &str {
         USER_AGENT
     }
@@ -609,9 +587,8 @@ mod tests {
     use super::*;
     use crate::auth::pkce::PendingAuth;
     use crate::provider::Provider;
-    use std::sync::{Arc, Mutex};
     use wiremock::matchers::{body_json_string, header, method, path};
-    use wiremock::{Mock, MockServer, Request, ResponseTemplate};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
 
     fn pending() -> PendingAuth {
         PendingAuth {
@@ -956,67 +933,12 @@ mod tests {
     /// cannot see what actually went out on the wire, and would stay green
     /// even if `ReqwestHttp::new` stopped applying `.user_agent(USER_AGENT)`
     /// to the client. Kept as a cheap sanity check on the constant's shape;
-    /// `exchange_sends_a_json_body_not_a_form` and
-    /// `get_json_sends_the_oauth_beta_header_and_no_claude_identifying_header`
-    /// are what actually pin the wire behavior.
+    /// the exchange and usage wire tests are what actually pin the behavior.
     #[tokio::test]
     async fn user_agent_is_ours_never_claude_code() {
         let http = ReqwestHttp::new().unwrap();
         assert!(http.user_agent().starts_with("quota-board/"));
         assert!(!http.user_agent().contains("claude"));
-    }
-
-    #[derive(serde::Deserialize)]
-    struct Ping {
-        ok: bool,
-    }
-
-    /// `get_json` had no coverage at all before this. Captures the actual
-    /// request `get_json` sends and inspects every header on it — not just
-    /// the one this test happens to name — so a header added anywhere later
-    /// that leaks "claude" (product name, package name, anything) would be
-    /// caught here, not only a change to `user-agent` specifically.
-    #[tokio::test]
-    async fn get_json_sends_the_oauth_beta_header_and_no_claude_identifying_header() {
-        let server = MockServer::start().await;
-        let captured: Arc<Mutex<Option<Request>>> = Arc::new(Mutex::new(None));
-        let captured_clone = captured.clone();
-
-        Mock::given(method("GET"))
-            .and(path("/v1/ping"))
-            .respond_with(move |req: &Request| {
-                *captured_clone.lock().unwrap() = Some(req.clone());
-                ResponseTemplate::new(200).set_body_json(serde_json::json!({"ok": true}))
-            })
-            .mount(&server)
-            .await;
-
-        let http = ReqwestHttp::new().unwrap();
-        let resp: Ping = http
-            .get_json(&format!("{}/v1/ping", server.uri()), "bearer-token")
-            .await
-            .unwrap();
-        assert!(resp.ok);
-
-        let req = captured
-            .lock()
-            .unwrap()
-            .take()
-            .expect("get_json never reached the mock");
-
-        let beta = req
-            .headers
-            .get("anthropic-beta")
-            .expect("anthropic-beta header missing");
-        assert_eq!(beta.to_str().unwrap(), ANTHROPIC_BETA);
-
-        for (name, value) in req.headers.iter() {
-            let v = value.to_str().unwrap_or_default().to_lowercase();
-            assert!(
-                !v.contains("claude"),
-                "header `{name}` leaked a Claude-identifying value: {v}"
-            );
-        }
     }
 
     fn tokens_with(scopes: &[&str]) -> TokenSet {
