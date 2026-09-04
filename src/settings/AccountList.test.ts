@@ -28,7 +28,7 @@ const two = [
 ]
 
 const labels = (): string[] =>
-  (screen.getAllByLabelText('Display name') as HTMLInputElement[]).map((i) => i.value)
+  (screen.getAllByLabelText(/^Display name for /) as HTMLInputElement[]).map((i) => i.value)
 
 describe('AccountList', () => {
   it('renders one row per account, in the order given', () => {
@@ -54,8 +54,23 @@ describe('AccountList', () => {
     expect(screen.getByText('home@example.com')).toBeTruthy()
   })
 
+  it('shows full provider names when the label and email cannot distinguish the rows', () => {
+    render(AccountList, {
+      accounts: [
+        account('claude-id', 'Work', 'same@example.com', 'anthropic'),
+        account('codex-id', 'Work', 'same@example.com', 'openai'),
+      ],
+    })
+
+    expect(screen.getByLabelText('Provider: Claude').textContent).toBe('Claude')
+    expect(screen.getByLabelText('Provider: Codex').textContent).toBe('Codex')
+    expect(
+      screen.getByRole('textbox', { name: 'Display name for Codex account same@example.com' }),
+    ).toBeTruthy()
+  })
+
   it('reports the id and provider, never the label, when a row is removed', () => {
-    // CLAUDE.md: the primary key is the (provider, account_id) pair.
+    // AGENTS.md: the primary key is the (provider, account_id) pair.
     // `rename_account` exists, so the label is neither stable nor unique, and
     // the id alone is not unique across providers.
     const removed: Array<[string, string]> = []
@@ -63,7 +78,7 @@ describe('AccountList', () => {
       accounts: two,
       onRemove: (accountId, provider) => removed.push([accountId, provider]),
     })
-    screen.getAllByRole('button', { name: 'Remove' })[1].click()
+    screen.getByRole('button', { name: 'Remove Codex account Personal' }).click()
     expect(removed).toEqual([['uuid-home', 'openai']])
   })
 
@@ -73,7 +88,7 @@ describe('AccountList', () => {
       accounts: two,
       onRefresh: (accountId, provider) => refreshed.push([accountId, provider]),
     })
-    screen.getAllByRole('button', { name: 'Refresh now' })[1].click()
+    screen.getByRole('button', { name: 'Refresh Codex account Personal' }).click()
     expect(refreshed).toEqual([['uuid-home', 'openai']])
   })
 
@@ -86,8 +101,8 @@ describe('AccountList', () => {
       accounts: two,
       onMove: (accountId, provider, delta) => moves.push([accountId, provider, delta]),
     })
-    screen.getAllByRole('button', { name: 'Move up' })[1].click()
-    screen.getAllByRole('button', { name: 'Move down' })[0].click()
+    screen.getByRole('button', { name: 'Move Codex account Personal up' }).click()
+    screen.getByRole('button', { name: 'Move Claude account Work down' }).click()
     expect(moves).toEqual([
       ['uuid-home', 'openai', -1],
       ['uuid-work', 'anthropic', 1],
@@ -111,7 +126,7 @@ describe('AccountList', () => {
     })
 
     expect(labels()).toEqual(['Claude one', 'Codex one'])
-    screen.getAllByRole('button', { name: 'Remove' })[1].click()
+    screen.getByRole('button', { name: 'Remove Codex account Codex one' }).click()
     expect(removed).toEqual([['same-id', 'openai']])
   })
 })

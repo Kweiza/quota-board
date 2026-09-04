@@ -6,6 +6,8 @@
   import type { AccountView, Provider } from '../lib/types'
 
   export let accounts: AccountView[] = []
+  /** False only until the first complete account-list read. */
+  export let accountsLoaded = false
   export let warning: string | null = null
   export let onOpenSettings: () => void = () => {}
   // §7.1 makes clicking these the only remedy AUTH_DEAD and SECRETS_LOCKED
@@ -39,7 +41,7 @@
      remedies clickable inside it. docs/design.md §8.3. -->
 <div class="widget" use:enableDrag>
   <div class="titlebar">
-    <button class="gear" title="Settings" on:click={onOpenSettings}>⚙</button>
+    <button class="gear" type="button" aria-label="Settings" title="Settings" on:click={onOpenSettings}>⚙</button>
   </div>
   {#each accounts as a (accountKey(a.account_id, a.provider))}
     <AccountRow
@@ -56,8 +58,10 @@
          account is the confidently-wrong display this project treats as its
          worst failure mode. -->
     <div class="empty warn">{warning}</div>
+  {:else if accounts.length === 0 && !accountsLoaded}
+    <div class="empty" role="status">Loading accounts…</div>
   {:else if accounts.length === 0}
-    <div class="empty">Add an account in Settings</div>
+    <div class="empty">Add a Claude or Codex account in Settings</div>
   {/if}
 </div>
 
@@ -79,6 +83,11 @@
   .gear { background: none; border: none; color: #9ca3af; cursor: pointer;
           font-size: 12px; padding: 0; line-height: 1; }
   .gear:hover { color: #e5e7eb; }
+  .widget :global(button:focus-visible) {
+    outline: 1px solid currentColor;
+    outline-offset: 2px;
+    border-radius: 2px;
+  }
   .empty { font-size: 11px; opacity: .6; padding: .5em 0; }
   .empty.warn { color: #fbbf24; opacity: .9; }
 </style>

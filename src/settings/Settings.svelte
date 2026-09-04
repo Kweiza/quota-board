@@ -4,6 +4,7 @@
   import { openUrl } from '@tauri-apps/plugin-opener'
   import AccountList from './AccountList.svelte'
   import { queriesPerDay } from '../lib/format'
+  import { providerName } from '../lib/provider'
   import { accountKey } from '../lib/types'
   import {
     accountsWarning,
@@ -48,6 +49,12 @@
    * same reason.
    */
   let accounts: AccountView[] = []
+  // Empty is a user-visible claim, so it needs both halves of the initial
+  // account read: the list and the standing file warning that explains why a
+  // list may be empty.
+  let accountsRead = false
+  let accountsProblemRead = false
+  $: accountsLoaded = accountsRead && accountsProblemRead
   let error: string | null = null
   /**
    * §6.4's refusal, per account: `accountKey(account_id, provider)` → the
@@ -76,7 +83,7 @@
    * Dropping an expired note is **not** the same as announcing availability.
    * The server can re-throttle on the very next request, and the polling loop
    * keeps making requests while the note is on screen, so a note that *claimed*
-   * budget at the old instant would be CLAUDE.md's confidently-wrong display.
+   * budget at the old instant would be AGENTS.md's confidently-wrong display.
    * Removing it claims nothing: the press stays the only moment the answer is
    * known, and silence is the honest state between presses.
    */
@@ -160,7 +167,7 @@
    * loaded. A single `captured === null` cannot tell "not loaded yet" from
    * "loaded, and the answer was null", and collapsing the two tells the user an
    * account has never polled before they have pressed anything — the
-   * confidently-wrong display CLAUDE.md calls this product's worst failure
+   * confidently-wrong display AGENTS.md calls this product's worst failure
    * mode. Keying it by the same `accountKey` as `selected`, rather than using
    * a bare boolean, also drops a body belonging to the previously selected
    * account.
@@ -191,6 +198,7 @@
   async function pullAccounts(): Promise<void> {
     try {
       accounts = await listAccounts()
+      accountsRead = true
       // Retire notes for accounts that are gone. `account_id` is stable across
       // a rename (§9.3), so removing an account and adding the same one back
       // reuses it — without this, a refusal from an earlier session reappears
@@ -228,6 +236,7 @@
   async function pullAccountsProblem(): Promise<void> {
     try {
       accountsProblem = await accountsWarning()
+      accountsProblemRead = true
     } catch (e) {
       error = String(e)
     }
@@ -291,10 +300,13 @@
           // The login is over, however it finished, so the paste form goes with
           // it — leaving it up would invite a code for a login that is done.
           fallback = null
+          pendingLoginProvider = null
           void pullAccounts()
         }),
         await onAuthFailed((message) => {
           error = message
+          fallback = null
+          pendingLoginProvider = null
         }),
         // The other two of §10.3's four loopback failures: both are seen only
         // by the background task, and neither ends the login.
@@ -322,7 +334,7 @@
     expiryTimers = {}
   })
 
-  async function addAccount(provider: 'anthropic' | 'openai'): Promise<void> {
+  async function addAccount(provider: Provider): Promise<void> {
     // No local "pending" flag. The Rust side is the single-flight
     // (`begin_login` answers `a login is already in progress`), and a second
     // disabled state here would be the two-sources-disagree hazard §7.1 exists
@@ -339,6 +351,9 @@
       error = String(e)
       return
     }
+    // Set only after `begin_login` accepts this attempt. A second button press
+    // rejected by the Rust single-flight must not relabel the first login.
+    pendingLoginProvider = provider
     error = null
 
     // Two of §10.3's four loopback failures are visible only here, and the Rust
@@ -365,6 +380,8 @@
    * are actually over.
    */
   let fallback: ManualFallback | null = null
+  let pendingLoginProvider: Provider | null = null
+  $: pendingLoginName = pendingLoginProvider === null ? 'account' : providerName(pendingLoginProvider)
   let pasted = ''
   let submitting = false
 
@@ -510,11 +527,36 @@
     <AccountList {accounts} {throttledUntil}
                  onRemove={(uuid, provider) => void guard(() => removeAccount(uuid, provider))}
                  onRename={rename} onMove={move} onRefresh={refresh} />
-    {#if accounts.length === 0}
+    {#if accountsProblem}
+      <!-- The alert above already explains this state. Showing loading or an
+           empty invitation beside it would contradict that explanation. -->
+    {:else if !accountsLoaded}
+      <p class="hint" role="status">Loading accounts…</p>
+    {:else if accounts.length === 0}
       <p class="hint">No accounts yet.</p>
     {/if}
-    <button type="button" on:click={() => addAccount('anthropic')}>Add Claude account</button>
-    <button type="button" on:click={() => addAccount('openai')}>Add Codex account</button>
+
+    <div class="provider-grid" role="group" aria-label="Add account">
+      <div class="provider-card" role="group" aria-labelledby="add-claude-title">
+        <h3 id="add-claude-title">Claude</h3>
+        <p>Connect a Claude account and monitor the limits it reports.</p>
+        <button type="button" on:click={() => addAccount('anthropic')}>Add Claude account</button>
+        <!-- Reworded from the note on `pkce::begin` in
+             `crates/core/src/auth/pkce.rs`. It lives inside the Claude choice
+             because none of it applies to Codex. -->
+        <p class="provider-note">
+          Claude sign-in: Anthropic runs no third-party OAuth client registration
+          program, so this reuses Claude Code's public client. The consent screen
+          will show “Claude Code”.
+        </p>
+      </div>
+      <div class="provider-card" role="group" aria-labelledby="add-codex-title">
+        <h3 id="add-codex-title">Codex</h3>
+        <p>Connect a Codex account and monitor the limits it reports.</p>
+        <button type="button" on:click={() => addAccount('openai')}>Add Codex account</button>
+        <p class="provider-note">OpenAI handles authorization for the Codex account you choose.</p>
+      </div>
+    </div>
 
     <!-- docs/design.md §10.3. Shown only after the automatic half has given up;
          until then this whole block is absent, which is the decision recorded
@@ -522,7 +564,8 @@
          would be clutter for everyone who never needs it). -->
     {#if fallback}
       {@const fb = fallback}
-      <div class="fallback">
+      <div class="fallback" aria-labelledby="fallback-title">
+        <h3 id="fallback-title">Finish adding {pendingLoginName}</h3>
         <p class="warn">{fb.reason}.</p>
         <p class="hint">
           Open the link below in any browser — it does not have to be this
@@ -535,7 +578,7 @@
              The button is for the narrower case where a browser exists but
              could not be launched automatically. -->
         <p class="url">{fb.url}</p>
-        <button on:click={() => void openUrl(fb.url)}>Open in browser</button>
+        <button type="button" on:click={() => void openUrl(fb.url)}>Open in browser</button>
         <label for="manual-code">Code from the page</label>
         <input
           id="manual-code"
@@ -543,19 +586,11 @@
           bind:value={pasted}
           disabled={submitting}
         />
-        <button on:click={submitCode} disabled={submitting || pasted.trim() === ''}>
+        <button type="button" on:click={submitCode} disabled={submitting || pasted.trim() === ''}>
           Submit
         </button>
       </div>
     {/if}
-    <!-- Reworded from the note on `pkce::begin` in
-         `crates/core/src/auth/pkce.rs`. The two must not drift: if that comment
-         changes, change this sentence. -->
-    <p class="hint">
-      Anthropic runs no third-party OAuth client registration program, so this
-      reuses Claude Code's own public client. The consent screen will therefore
-      show <strong>"Claude Code"</strong>.
-    </p>
   </section>
 
   <section>
@@ -653,7 +688,7 @@
       {:else}
         <!-- A `StoreKind` variant added on the Rust side must not render an
              empty section here: silence in this panel reads as "the token store
-             is fine", which is CLAUDE.md's never-degrade-silently rule applied
+             is fine", which is AGENTS.md's never-degrade-silently rule applied
              to UI state. It says what it does not know instead. -->
         <p class="warn">
           This build does not recognize the token store state the backend
@@ -677,14 +712,20 @@
     <select id="debug-account" bind:value={selected}>
       <option value="">—</option>
       {#each accounts as a (accountKey(a.account_id, a.provider))}
-        <option value={accountKey(a.account_id, a.provider)}>{a.label} ({a.email})</option>
+        <option value={accountKey(a.account_id, a.provider)}
+          >{providerName(a.provider)} — {a.label} ({a.email})</option>
       {/each}
     </select>
     <button on:click={reloadRaw}>Reload</button>
 
-    <!-- Four mutually exclusive branches. Merging any two of them would report
-         a fact that has not been established. -->
-    {#if accounts.length === 0}
+    <!-- Account availability precedes the four capture branches. The standing
+         warning already explains an unreadable list, so that branch says
+         nothing here; adding an empty claim would contradict it. -->
+    {#if accountsProblem}
+      <!-- Explained by the alert above. -->
+    {:else if !accountsLoaded}
+      <p class="hint">Loading accounts…</p>
+    {:else if accounts.length === 0}
       <p class="hint">No accounts yet, so there is nothing to inspect.</p>
     {:else if !loaded}
       <p class="hint">Select an account and press Reload.</p>
@@ -725,11 +766,31 @@
   .settings input[type='password'] { width: 16em; padding: .25em .35em; }
   .settings button { padding: .3em .7em; cursor: pointer; }
   .settings button:disabled { cursor: default; opacity: .5; }
+  .settings :global(button:focus-visible),
+  .settings :global(input:focus-visible),
+  .settings :global(select:focus-visible) {
+    outline: 2px solid currentColor;
+    outline-offset: 2px;
+  }
   .hint { font-size: 11px; opacity: .7; margin: .5em 0 0; }
   .note { font-size: 11px; opacity: .85; margin: .5em 0 0; }
   .warn { font-size: 11px; color: #fbbf24; margin: .5em 0 0; }
+  .provider-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr));
+                   gap: .75em; margin-top: .85em; }
+  .provider-card { display: flex; flex-direction: column; align-items: flex-start;
+                   min-width: 0; padding: .75em; border-radius: 6px;
+                   border: 1px solid rgba(229, 231, 235, .25);
+                   background: rgba(255, 255, 255, .035); }
+  /* Product identity is text and shape only. Colour remains reserved for the
+     quota severity ramp and actual warnings. */
+  .provider-card h3 { margin: 0; padding: .05em .4em; border: 1px solid currentColor;
+                      border-radius: 3px; font-size: 11px; letter-spacing: .03em; }
+  .provider-card > p { margin: .55em 0 0; font-size: 11px; }
+  .provider-card > button { margin-top: .65em; }
+  .provider-card .provider-note { margin-top: .75em; opacity: .7; }
   .fallback { margin-top: .75em; padding: .6em .7em; border-radius: 6px;
               background: rgba(255, 255, 255, .04); }
+  .fallback h3 { margin: 0 0 .4em; font-size: 12px; }
   /* `user-select: text` is load-bearing, not cosmetic — see the note above the
      element. `break-all` because an authorize URL is one long unbreakable run
      and would otherwise push this panel wider than the window. */

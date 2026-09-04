@@ -40,22 +40,17 @@ const ok = (windows: ReturnType<typeof win>[], fetchedAt = NOW.toISOString()) =>
   view({ kind: 'ok', windows, extra: null, fetched_at: fetchedAt })
 
 describe('AccountRow provider', () => {
-  it('marks a Codex row so it cannot be confused with a Claude one', () => {
-    render(AccountRow, { account: acct({ provider: 'openai', label: 'work' }) })
-    // `toHaveTextContent` needs `@testing-library/jest-dom`, which this project
-    // does not depend on — every other assertion in this file reads
-    // `.textContent` directly (see `AccountRow bars` above), so this matches
-    // rather than adding a new dependency for one assertion.
-    expect(screen.getByTitle('Codex').textContent).toBe('CX')
-  })
+  it('shows full product names when every other account field is identical', () => {
+    const same = { label: 'Work', email: 'same@example.com' }
+    const claude = render(AccountRow, {
+      account: acct({ ...same, provider: 'anthropic' }),
+    })
+    expect(screen.getByLabelText('Provider: Claude').textContent).toBe('Claude')
+    claude.unmount()
 
-  /// Without this, every test above would still pass if `BADGE.anthropic`
-  /// were `{ text: 'CX', title: 'Codex' }` — nothing in this file asserted
-  /// what a *Claude* row's badge says, only what a Codex row's does.
-  it('marks a Claude row with its own badge, not the Codex one', () => {
-    render(AccountRow, { account: acct({ provider: 'anthropic', label: 'work' }) })
-    expect(screen.getByTitle('Claude').textContent).toBe('CL')
-    expect(screen.queryByTitle('Codex')).toBeNull()
+    render(AccountRow, { account: acct({ ...same, provider: 'openai' }) })
+    expect(screen.getByLabelText('Provider: Codex').textContent).toBe('Codex')
+    expect(screen.queryByLabelText('Provider: Claude')).toBeNull()
   })
 
   /// The note serves design.md §5.3's read order, which has no Codex counterpart.
@@ -216,7 +211,7 @@ describe('AccountRow states', () => {
       onRelogin: () => calls.push('relogin'),
     })
     expect(screen.queryAllByRole('meter')).toHaveLength(0)
-    const button = screen.getByRole('button', { name: 're-login required' })
+    const button = screen.getByRole('button', { name: 'Re-login Claude account work@example.com' })
     button.click()
     expect(calls).toEqual(['relogin'])
   })
@@ -228,7 +223,7 @@ describe('AccountRow states', () => {
       now: NOW,
       onUnlock: () => calls.push('unlock'),
     })
-    const button = screen.getByRole('button', { name: 'unlock' })
+    const button = screen.getByRole('button', { name: 'Unlock Claude account work@example.com' })
     button.click()
     expect(calls).toEqual(['unlock'])
   })
@@ -296,7 +291,7 @@ describe('AccountRow refresh', () => {
       // matched by accessible name rather than by role alone. The name is the
       // settings window's wording verbatim: one control, one label.
       expect(
-        screen.getByRole('button', { name: 'Refresh now' }),
+        screen.getByRole('button', { name: 'Refresh Claude account work@example.com' }),
         `${state.kind} must offer a refresh`,
       ).toBeTruthy()
       unmount()
@@ -312,7 +307,7 @@ describe('AccountRow refresh', () => {
         calls += 1
       },
     })
-    screen.getByRole('button', { name: 'Refresh now' }).click()
+    screen.getByRole('button', { name: 'Refresh Claude account work@example.com' }).click()
     expect(calls).toBe(1)
   })
 
@@ -339,15 +334,23 @@ describe('AccountRow refresh', () => {
         return pending
       },
     })
-    const button = screen.getByRole('button', { name: 'Refresh now' }) as HTMLButtonElement
+    const button = screen.getByRole('button', {
+      name: 'Refresh Claude account work@example.com',
+    }) as HTMLButtonElement
 
     button.click()
     await waitFor(() => expect(button.disabled).toBe(true))
+    expect(button.getAttribute('aria-busy')).toBe('true')
+    expect(button.getAttribute('aria-label')).toBe('Refreshing Claude account work@example.com')
     button.click()
     expect(starts, 'a second press must not start a second refresh').toBe(1)
 
     release()
-    await waitFor(() => expect(button.disabled).toBe(false))
+    await waitFor(() => {
+      expect(button.disabled).toBe(false)
+      expect(button.getAttribute('aria-busy')).toBe('false')
+      expect(button.getAttribute('aria-label')).toBe('Refresh Claude account work@example.com')
+    })
   })
 
   /**
@@ -415,7 +418,7 @@ describe('AccountRow credit line', () => {
   })
 
   /**
-   * CLAUDE.md's never-demote-to-0% rule at the point the endpoint invites the
+   * AGENTS.md's never-demote-to-0% rule at the point the endpoint invites the
    * mistake: an account that never enabled credits still reports `used` $0.00
    * and `percent` 0, and `parse_credit` answers `null` for it. Nothing at all
    * must be drawn — not a zero, and not a "credits off" placeholder.

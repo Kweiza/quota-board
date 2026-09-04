@@ -3,17 +3,8 @@
   import CreditLine from './CreditLine.svelte'
   import ResetCreditsLine from './ResetCreditsLine.svelte'
   import { relativeAge, untilHhMm } from '../lib/format'
-  import type { AccountView, Provider } from '../lib/types'
-
-  /**
-   * Text, not a colour dot: §8.2 already spends colour on severity, and a
-   * second meaning on the same channel collides — besides failing anyone
-   * whose colour vision the severity ramp already taxes.
-   */
-  const BADGE: Record<Provider, { text: string; title: string }> = {
-    anthropic: { text: 'CL', title: 'Claude' },
-    openai: { text: 'CX', title: 'Codex' },
-  }
+  import { providerName } from '../lib/provider'
+  import type { AccountView } from '../lib/types'
 
   export let account: AccountView
   export let now: Date = new Date()
@@ -53,7 +44,8 @@
     }
   }
 
-  $: badge = BADGE[account.provider]
+  $: provider = providerName(account.provider)
+  $: refreshLabel = `${busy ? 'Refreshing' : 'Refresh'} ${provider} account ${account.label}`
 
   $: state = account.state
   // Spec §5.3: the weekly window count is 0, 1 or N — never assumed.
@@ -71,7 +63,7 @@
    * zero**: `usage::anthropic::parse_credit` and
    * `usage::openai::parse_reset_credits` both answer `None` rather than a
    * figure computed from a $0.00/zero-credit response, which is the
-   * demote-to-0% CLAUDE.md forbids. It is also absent for the first poll
+   * demote-to-0% AGENTS.md forbids. It is also absent for the first poll
    * after a restart, because the snapshot cache does not persist a figure it
    * cannot date (see `Entry::last_extra`).
    */
@@ -81,7 +73,10 @@
 
 <div class="account" class:stale={isStale}>
   <div class="head">
-    <span class="badge" title={badge.title}>{badge.text}</span>
+    <!-- Full product name rather than an abbreviation or a colour. §8.2
+         already gives colour one job (severity), and `title`-only expansion is
+         unavailable to keyboard, touch and many assistive-technology users. -->
+    <span class="badge" aria-label={`Provider: ${provider}`}>{provider}</span>
     <span class="name" title={account.label}>{account.label}</span>
     {#if isStale && state.kind === 'stale'}
       <span class="age">{relativeAge(new Date(state.fetched_at), now)}</span>
@@ -97,8 +92,9 @@
       class="refresh"
       class:busy
       type="button"
-      aria-label="Refresh now"
-      title="Refresh now"
+      aria-label={refreshLabel}
+      aria-busy={busy}
+      title={busy ? 'Refreshing…' : 'Refresh now'}
       disabled={busy}
       on:click={refresh}>↻</button>
   </div>
@@ -118,16 +114,20 @@
       <ResetCreditsLine credits={extra} />
     {/if}
   {:else if state.kind === 'loading'}
-    <div class="note">…</div>
+    <div class="note" role="status">loading…</div>
   {:else if state.kind === 'auth_expired'}
     <!-- §7.1 calls this "loading", but a permanent failure that renders
          byte-identical to the spinner is the confusion it warns about, so the
          three waiting-shaped states each say something different. -->
-    <div class="note">refreshing…</div>
+    <div class="note" role="status">refreshing…</div>
   {:else if state.kind === 'auth_dead'}
     <!-- §7.1: the click is this state's only remedy, so the parent must be
          able to hear it. -->
-    <button class="note action" on:click={onRelogin}>re-login required</button>
+    <button
+      class="note action"
+      type="button"
+      aria-label={`Re-login ${provider} account ${account.label}`}
+      on:click={onRelogin}>re-login required</button>
   {:else if state.kind === 'oauth_not_allowed'}
     <!-- No `action` button. §7.1 makes the click a state's remedy, and the two
          remedies this app could offer are both wrong here: re-login is refused
@@ -137,7 +137,11 @@
          was a lapsed subscription on an ordinary personal account. -->
     <div class="note">access not available</div>
   {:else if state.kind === 'secrets_locked'}
-    <button class="note action" on:click={onUnlock}>unlock</button>
+    <button
+      class="note action"
+      type="button"
+      aria-label={`Unlock ${provider} account ${account.label}`}
+      on:click={onUnlock}>unlock</button>
   {:else if state.kind === 'throttled'}
     <div class="note">throttled, after {untilHhMm(state.until)}</div>
   {:else if state.kind === 'network'}
@@ -211,6 +215,8 @@
   .refresh { flex-shrink: 0; background: none; border: none; color: #9ca3af;
              cursor: pointer; font-size: 11px; padding: 0; line-height: 1; }
   .refresh:hover:not(:disabled) { color: #e5e7eb; }
+  .refresh:focus-visible,
+  .action:focus-visible { outline: 1px solid currentColor; outline-offset: 2px; border-radius: 2px; }
   .refresh:disabled { cursor: default; }
   .refresh.busy { animation: spin 900ms linear infinite; }
   @keyframes spin { to { transform: rotate(360deg); } }

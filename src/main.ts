@@ -107,8 +107,10 @@ if (isSettingsWindow()) {
   followContentHeight(target)
 
   async function pull(): Promise<void> {
+    let accountsRead = false
     try {
       widgetProps.accounts = await listAccounts()
+      accountsRead = true
     } catch (e) {
       // A failed command is not a reason to blank the widget: the last list
       // stays on screen. Never demote to an empty or zero state.
@@ -119,6 +121,9 @@ if (isSettingsWindow()) {
       // once this says whether it is empty because there is nothing yet or
       // because the file could not be read.
       widgetProps.warning = await accountsWarning()
+      // Empty is a claim, so expose it only after both halves of the read have
+      // answered. A warning still wins in Widget when it is present.
+      if (accountsRead) widgetProps.accountsLoaded = true
     } catch (e) {
       console.error('quota-board: accounts_warning failed', e)
     }

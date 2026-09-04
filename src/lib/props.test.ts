@@ -15,7 +15,7 @@ import type { AccountView } from './types'
  * bundle gets a bare `$state(...)` call), replacing the proxy with a plain
  * object literal, or spreading it at the mount site (`{ ...widgetProps }`
  * copies the values out of the proxy). Measured with this repo's svelte
- * 5.56.8: a plain object left the DOM reading "Add an account in Settings"
+ * 5.56.8: a plain object left the DOM reading the initial loading state
  * after the same assignment, while the proxy rendered the account.
  */
 const account = (label: string): AccountView => ({
@@ -42,6 +42,7 @@ const account = (label: string): AccountView => ({
 afterEach(() => {
   // The proxy is a module singleton, so each test has to hand it back empty.
   widgetProps.accounts = []
+  widgetProps.accountsLoaded = false
   document.body.innerHTML = ''
 })
 
@@ -51,13 +52,14 @@ describe('widgetProps', () => {
     document.body.appendChild(target)
     const app = mount(Widget, { target, props: widgetProps })
 
-    expect(target.textContent).toContain('Add an account in Settings')
+    expect(target.textContent).toContain('Loading accounts…')
 
     widgetProps.accounts = [account('work@example.com')]
+    widgetProps.accountsLoaded = true
     flushSync()
 
     expect(target.textContent).toContain('work@example.com')
-    expect(target.textContent).not.toContain('Add an account in Settings')
+    expect(target.textContent).not.toContain('Loading accounts…')
     unmount(app)
   })
 
@@ -67,6 +69,7 @@ describe('widgetProps', () => {
     const app = mount(Widget, { target, props: widgetProps })
 
     widgetProps.accounts = [account('first@example.com')]
+    widgetProps.accountsLoaded = true
     flushSync()
     widgetProps.accounts = [account('second@example.com')]
     flushSync()
