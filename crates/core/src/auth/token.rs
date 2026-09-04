@@ -273,8 +273,44 @@ impl ReqwestHttp {
 /// both, and `TokenFields` deliberately carries no `account` field, so
 /// deriving `T` here can never fail because of an `account` shape it does not
 /// even declare (see `TokenFields`'s doc comment).
+const SENSITIVE_REQUEST_FIELDS: &[&str] = &[
+    "access_token",
+    "authorization_code",
+    "code",
+    "code_verifier",
+    "device_auth_id",
+    "id_token",
+    "refresh_token",
+    "requested_token",
+    "subject_token",
+    "token",
+    "user_code",
+];
+
+fn redact_remote_echo(mut value: String, request_secrets: &[&str]) -> String {
+    for secret in request_secrets.iter().filter(|value| !value.is_empty()) {
+        value = value.replace(secret, "<redacted>");
+    }
+    value
+}
+
+fn json_request_secrets(body: &serde_json::Value) -> Vec<&str> {
+    SENSITIVE_REQUEST_FIELDS
+        .iter()
+        .filter_map(|field| body.get(field).and_then(serde_json::Value::as_str))
+        .collect()
+}
+
+fn form_request_secrets<'a>(form: &'a [(&str, &str)]) -> Vec<&'a str> {
+    form.iter()
+        .filter(|(field, _)| SENSITIVE_REQUEST_FIELDS.contains(field))
+        .map(|(_, value)| *value)
+        .collect()
+}
+
 async fn decode<T: DeserializeOwned>(
     resp: reqwest::Response,
+    request_secrets: &[&str],
 ) -> Result<(T, serde_json::Value), AuthError> {
     let status = resp.status().as_u16();
     let text = resp
@@ -291,7 +327,8 @@ async fn decode<T: DeserializeOwned>(
                     .or_else(|| value.get("code").and_then(|v| v.as_str()))
             })
             .or_else(|| v.get("code").and_then(|value| value.as_str()))
-            .map(str::to_string);
+            .map(str::to_string)
+            .map(|value| redact_remote_echo(value, request_secrets));
         let description = v
             .get("error_description")
             .and_then(|value| value.as_str())
@@ -300,7 +337,8 @@ async fn decode<T: DeserializeOwned>(
                     .and_then(|value| value.get("message"))
                     .and_then(|value| value.as_str())
             })
-            .map(str::to_string);
+            .map(str::to_string)
+            .map(|value| redact_remote_echo(value, request_secrets));
         return Err(AuthError::OAuth {
             status,
             code,
@@ -334,7 +372,7 @@ impl TokenHttp for ReqwestHttp {
             .send()
             .await
             .map_err(|e| AuthError::Transport(e.to_string()))?;
-        decode(resp).await
+        decode(resp, &json_request_secrets(body)).await
     }
 
     async fn post_form<T: DeserializeOwned>(
@@ -349,7 +387,7 @@ impl TokenHttp for ReqwestHttp {
             .send()
             .await
             .map_err(|e| AuthError::Transport(e.to_string()))?;
-        decode(resp).await
+        decode(resp, &form_request_secrets(form)).await
     }
 
     async fn get_json<T: DeserializeOwned>(&self, url: &str, bearer: &str) -> Result<T, AuthError> {
@@ -365,7 +403,7 @@ impl TokenHttp for ReqwestHttp {
         // The raw body is discarded here: nothing that calls `get_json` today
         // needs it. Kept as `Result<T, AuthError>` so this method's contract
         // does not change for whatever future caller reaches for it.
-        decode(resp).await.map(|(typed, _raw)| typed)
+        decode(resp, &[bearer]).await.map(|(typed, _raw)| typed)
     }
 
     fn user_agent(&self) -> &str {
@@ -713,6 +751,38 @@ mod tests {
                 assert_eq!(status, 400);
             }
             other => panic!("expected an OAuth error, got {other:?}"),
+        }
+    }
+
+    /// OAuth servers are remote input and may echo a submitted credential in
+    /// either error field. Both `Display` and derived `Debug` for `AuthError`
+    /// are printable, so the transport must scrub request secrets before the
+    /// error leaves it.
+    #[tokio::test]
+    async fn a_remote_error_cannot_echo_the_submitted_refresh_token() {
+        const SECRET: &str = "refresh-SENTINEL-never-print";
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(500).set_body_json(serde_json::json!({
+                "error": {
+                    "code": format!("rejected-{SECRET}"),
+                    "message": format!("could not rotate {SECRET}")
+                }
+            })))
+            .mount(&server)
+            .await;
+
+        let http = ReqwestHttp::new().unwrap();
+        let err = http
+            .post_json::<serde_json::Value>(
+                &format!("{}/oauth/token", server.uri()),
+                &serde_json::json!({ "grant_type": "refresh_token", "refresh_token": SECRET }),
+            )
+            .await
+            .unwrap_err();
+        for printed in [err.to_string(), format!("{err:?}")] {
+            assert!(!printed.contains(SECRET), "remote echo leaked the token: {printed}");
+            assert!(printed.contains("<redacted>"), "the sanitized error lost all context: {printed}");
         }
     }
 
