@@ -54,8 +54,14 @@ fn window(root: &Value, slot: &str) -> Option<UsageWindow> {
     // Every field is required. A window missing any of them is dropped rather
     // than filled in: AGENTS.md forbids demoting a missing value, and a bar
     // drawn from a default is exactly that.
-    let percent = w.get("used_percent")?.as_f64()?;
-    let seconds = w.get("limit_window_seconds")?.as_i64()?;
+    let percent = w
+        .get("used_percent")?
+        .as_f64()
+        .filter(|percent| percent.is_finite() && *percent >= 0.0)?;
+    let seconds = w
+        .get("limit_window_seconds")?
+        .as_i64()
+        .filter(|seconds| *seconds > 0)?;
     let resets_at = parse_reset(w.get("reset_at")?)?;
     Some(UsageWindow {
         window_id: slot.trim_end_matches("_window").to_string(),
@@ -114,15 +120,6 @@ pub fn parse_reset_credits(raw: &Value) -> Option<ResetCredits> {
     }
     let applicable = u32::try_from(c.get("applicable_available_count")?.as_i64()?).ok()?;
     Some(ResetCredits { available, applicable })
-}
-
-/// The account's email, for display only (§9.3 — never a key).
-///
-/// Here rather than on `CapturedFetch` because only the add-account path wants
-/// it: putting it on the fetch result would add a field to the polling path
-/// that every poll carries and nothing reads.
-pub fn parse_email(raw: &Value) -> Option<String> {
-    raw.get("email")?.as_str().filter(|s| !s.is_empty()).map(str::to_string)
 }
 
 #[cfg(test)]
@@ -214,6 +211,40 @@ mod tests {
         }
     }
 
+    /// A negative percentage is malformed, not a reassuring empty limit. The
+    /// webview clamps bar width below zero and colors negative values green, so
+    /// accepting this would turn an upstream error into the healthiest-looking
+    /// state the product can display.
+    #[test]
+    fn a_negative_percentage_is_unreadable_not_zero() {
+        let body = v(r#"{"rate_limit":{"primary_window":
+            {"used_percent":-1,"limit_window_seconds":604800,
+             "reset_at":1786345526}}}"#);
+        assert!(matches!(parse_usage(&body), Err(ParseError::UnreadableSource)));
+    }
+
+    /// Zero and negative durations are not labels. Without validation they
+    /// become `0d` and a negative duration, both confident UI claims derived
+    /// from malformed input.
+    #[test]
+    fn a_nonpositive_window_duration_is_unreadable() {
+        for seconds in [0, -60] {
+            let body = serde_json::json!({
+                "rate_limit": {
+                    "primary_window": {
+                        "used_percent": 12,
+                        "limit_window_seconds": seconds,
+                        "reset_at": 1786345526
+                    }
+                }
+            });
+            assert!(
+                matches!(parse_usage(&body), Err(ParseError::UnreadableSource)),
+                "accepted {seconds}-second window"
+            );
+        }
+    }
+
     /// The companion to the test above: this is what proves the emptiness
     /// check runs on the *collected* list of windows, not on each window
     /// individually. A fix that errored whenever any single window failed to
@@ -256,25 +287,4 @@ mod tests {
         assert!(parse_usage(&anthropic).is_err());
     }
 
-    /// Measured, Spike F: the usage response carries `email` even when the
-    /// token response does not — this is what `auth::token::backfill_email`
-    /// relies on.
-    #[test]
-    fn reads_the_email_from_the_usage_response() {
-        assert_eq!(parse_email(&v(PLUS_ZERO)).as_deref(), Some("redacted@example.com"));
-    }
-
-    /// A present-but-empty email is not an email — the same reasoning
-    /// `auth::token::account_id_from` applies to a present-but-empty
-    /// identifier, and for the same reason: a blank string is not a value to
-    /// fill a label with.
-    #[test]
-    fn an_empty_email_is_absent_not_a_blank_string() {
-        assert_eq!(parse_email(&v(r#"{"email":""}"#)), None);
-    }
-
-    #[test]
-    fn a_body_with_no_email_key_is_absent() {
-        assert_eq!(parse_email(&v(r#"{"plan_type":"plus"}"#)), None);
-    }
 }
