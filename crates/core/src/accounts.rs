@@ -25,6 +25,17 @@ pub struct Account {
     /// field existed, which is exactly what `Provider`'s `Default` covers.
     #[serde(default)]
     pub provider: Provider,
+    /// OpenAI's `chatgpt_account_id`: the workspace whose quota this login
+    /// reads. It is request context, not the account key — two different users
+    /// can hold seats in the same workspace.
+    ///
+    /// Absent for Anthropic and from files written before Codex support.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workspace_id: Option<String>,
+    /// Whether OpenAI marked the selected workspace as FedRAMP. Only `true`
+    /// changes the usage request; an absent or false claim sends no header.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub is_fedramp: bool,
     /// User-editable display name.
     pub display_label: String,
     /// Display only. **Never used as a key.**
@@ -47,6 +58,10 @@ pub enum AccountError {
     /// list and **refuses to write**. Returned by every mutating call.
     #[error("the account file could not be read, so it is not being written: {0}")]
     Unreadable(String),
+    /// The primary key is `(provider, account_id)`, so it cannot represent two
+    /// workspace grants for one OpenAI user without silently replacing one.
+    #[error("this OpenAI user is already stored for a different workspace")]
+    WorkspaceConflict,
 }
 
 /// A single-owner handle to one account metadata file.
@@ -112,8 +127,34 @@ impl AccountStore {
         &self.accounts
     }
 
+    /// Check an upsert without changing memory or disk.
+    ///
+    /// Login can call this before storing a newly issued credential. Detecting
+    /// a workspace conflict after that write would already have replaced the
+    /// first workspace's only token; metadata-first has the inverse failure if
+    /// credential storage then fails. The same rule is enforced again inside
+    /// `upsert`, so callers cannot bypass it accidentally.
+    pub fn validate_upsert(&self, account: &Account) -> Result<(), AccountError> {
+        if let Some(existing) = self
+            .accounts
+            .iter()
+            .find(|a| a.provider == account.provider && a.account_id == account.account_id)
+        {
+            if account.provider == Provider::Openai
+                && matches!(
+                    (&existing.workspace_id, &account.workspace_id),
+                    (Some(existing), Some(incoming)) if existing != incoming
+                )
+            {
+                return Err(AccountError::WorkspaceConflict);
+            }
+        }
+        Ok(())
+    }
+
     /// Update by (provider, account_id), or append if it is new.
     pub fn upsert(&mut self, mut account: Account) -> Result<(), AccountError> {
+        self.validate_upsert(&account)?;
         // The pair, not the id alone: two providers may issue the same string,
         // and collapsing them would make adding the second account silently
         // replace the first.
@@ -250,6 +291,8 @@ mod tests {
         Account {
             account_id: account_id.into(),
             provider: Provider::Anthropic,
+            workspace_id: None,
+            is_fedramp: false,
             display_label: label.into(),
             email: format!("{label}@example.com"),
             created_at: Utc::now(),
@@ -429,6 +472,39 @@ mod tests {
         for forbidden in ["access_token", "refresh_token", "Bearer"] {
             assert!(!text.contains(forbidden), "metadata contains {forbidden}");
         }
+        assert!(
+            !text.contains("workspace_id") && !text.contains("is_fedramp"),
+            "absent OpenAI context should not change legacy metadata: {text}"
+        );
+        std::fs::remove_file(&path).ok();
+    }
+
+    /// Workspace routing data belongs in account metadata, but credentials do
+    /// not. The two are easy to conflate because both originate in OpenAI's
+    /// token claims; this pins the storage boundary while also exercising the
+    /// new fields through the real serializer.
+    #[test]
+    fn openai_context_round_trips_without_storing_tokens() {
+        let path = tmp();
+        let mut account = acc("user-one", "work");
+        account.provider = Provider::Openai;
+        account.workspace_id = Some("workspace-one".into());
+        account.is_fedramp = true;
+
+        let mut s = AccountStore::load(&path);
+        s.upsert(account).unwrap();
+        drop(s);
+
+        let s = AccountStore::load(&path);
+        assert_eq!(s.list().len(), 1);
+        assert_eq!(s.list()[0].account_id, "user-one");
+        assert_eq!(s.list()[0].workspace_id.as_deref(), Some("workspace-one"));
+        assert!(s.list()[0].is_fedramp);
+
+        let text = std::fs::read_to_string(&path).unwrap();
+        for forbidden in ["access_token", "refresh_token", "Bearer"] {
+            assert!(!text.contains(forbidden), "metadata contains {forbidden}");
+        }
         std::fs::remove_file(&path).ok();
     }
 
@@ -451,6 +527,8 @@ mod tests {
         assert_eq!(s.list().len(), 1, "a pre-provider file must still load");
         assert_eq!(s.list()[0].provider, Provider::Anthropic);
         assert_eq!(s.list()[0].account_id, "acc-1");
+        assert_eq!(s.list()[0].workspace_id, None);
+        assert!(!s.list()[0].is_fedramp);
         std::fs::remove_file(&path).ok();
     }
 
@@ -477,9 +555,115 @@ mod tests {
         let mut b = acc("same-id", "codex");
         a.provider = Provider::Anthropic;
         b.provider = Provider::Openai;
+        // Deliberately populate both with different sentinels. Anthropic never
+        // produces this field, but making both sides `Some` ensures omitting
+        // `provider` from the conflict lookup would fail this test.
+        a.workspace_id = Some("anthropic-sentinel".into());
+        b.workspace_id = Some("workspace-b".into());
         s.upsert(a).unwrap();
         s.upsert(b).unwrap();
         assert_eq!(s.list().len(), 2, "the provider is part of the key");
+        std::fs::remove_file(&path).ok();
+    }
+
+    /// One Codex user authenticated into two workspaces is not two users. The
+    /// primary key deliberately remains `(provider, account_id)`, so accepting
+    /// the second workspace would overwrite the first grant under that key.
+    #[test]
+    fn the_same_openai_user_in_a_different_workspace_is_refused() {
+        let path = tmp();
+        let mut first = acc("user-one", "one");
+        first.provider = Provider::Openai;
+        first.workspace_id = Some("workspace-one".into());
+        let mut second = acc("user-one", "two");
+        second.provider = Provider::Openai;
+        second.workspace_id = Some("workspace-two".into());
+
+        let mut s = AccountStore::load(&path);
+        s.upsert(first).unwrap();
+        let before = std::fs::read(&path).unwrap();
+        let err = s
+            .validate_upsert(&second)
+            .expect_err("the conflict preflight accepted the second workspace");
+        assert!(matches!(err, AccountError::WorkspaceConflict));
+        assert_eq!(
+            std::fs::read(&path).unwrap(),
+            before,
+            "validation changed the metadata file"
+        );
+        let err = s
+            .upsert(second)
+            .expect_err("the second workspace silently replaced the first");
+        assert!(matches!(err, AccountError::WorkspaceConflict));
+        assert_eq!(s.list().len(), 1);
+        assert_eq!(s.list()[0].workspace_id.as_deref(), Some("workspace-one"));
+        assert_eq!(
+            std::fs::read(&path).unwrap(),
+            before,
+            "a refused workspace changed the metadata file"
+        );
+        std::fs::remove_file(&path).ok();
+    }
+
+    /// Re-authenticating the same user into the same workspace is an update,
+    /// not a conflict. Refusing every repeated user id would make ordinary
+    /// re-login impossible.
+    #[test]
+    fn the_same_openai_user_in_the_same_workspace_is_updated() {
+        let path = tmp();
+        let mut first = acc("user-one", "one");
+        first.provider = Provider::Openai;
+        first.workspace_id = Some("workspace-one".into());
+        let mut updated = acc("user-one", "renamed");
+        updated.provider = Provider::Openai;
+        updated.workspace_id = Some("workspace-one".into());
+
+        let mut s = AccountStore::load(&path);
+        s.upsert(first).unwrap();
+        s.validate_upsert(&updated).unwrap();
+        s.upsert(updated).unwrap();
+        assert_eq!(s.list().len(), 1);
+        assert_eq!(s.list()[0].display_label, "renamed");
+        std::fs::remove_file(&path).ok();
+    }
+
+    /// Missing context is unknown, not a distinct workspace. This lets an
+    /// account written before the field existed acquire the measured claim on
+    /// its next login without being mistaken for a cross-workspace overwrite.
+    #[test]
+    fn a_legacy_openai_account_can_gain_workspace_context() {
+        let path = tmp();
+        let mut legacy = acc("user-one", "legacy");
+        legacy.provider = Provider::Openai;
+        let mut enriched = acc("user-one", "enriched");
+        enriched.provider = Provider::Openai;
+        enriched.workspace_id = Some("workspace-one".into());
+
+        let mut s = AccountStore::load(&path);
+        s.upsert(legacy).unwrap();
+        s.validate_upsert(&enriched).unwrap();
+        s.upsert(enriched).unwrap();
+        assert_eq!(s.list().len(), 1);
+        assert_eq!(s.list()[0].workspace_id.as_deref(), Some("workspace-one"));
+        std::fs::remove_file(&path).ok();
+    }
+
+    /// A workspace is request context, not a key. Two seats in one workspace
+    /// remain two rows because their OpenAI user ids differ.
+    #[test]
+    fn two_openai_users_in_one_workspace_remain_two_accounts() {
+        let path = tmp();
+        let mut first = acc("user-one", "one");
+        first.provider = Provider::Openai;
+        first.workspace_id = Some("workspace-shared".into());
+        let mut second = acc("user-two", "two");
+        second.provider = Provider::Openai;
+        second.workspace_id = Some("workspace-shared".into());
+
+        let mut s = AccountStore::load(&path);
+        s.upsert(first).unwrap();
+        s.upsert(second).unwrap();
+        assert_eq!(s.list().len(), 2, "the workspace was mistaken for the account key");
         std::fs::remove_file(&path).ok();
     }
 

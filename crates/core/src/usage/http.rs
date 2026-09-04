@@ -66,11 +66,34 @@ pub async fn fetch_usage(
     provider: Provider,
     access_token: &str,
 ) -> Result<Vec<UsageWindow>, UsageError> {
+    fetch_usage_for_account(http, provider, access_token, None, false).await
+}
+
+/// The production fetch with optional OpenAI workspace context.
+///
+/// `workspace_id` is OpenAI's quota-bearing `chatgpt_account_id`, not the user
+/// id used as this application's account key. Anthropic ignores both context
+/// values, and an absent workspace is never guessed from another identifier.
+pub async fn fetch_usage_for_account(
+    http: &ReqwestHttp,
+    provider: Provider,
+    access_token: &str,
+    workspace_id: Option<&str>,
+    is_fedramp: bool,
+) -> Result<Vec<UsageWindow>, UsageError> {
     let url = match provider {
         Provider::Anthropic => USAGE_URL,
         Provider::Openai => OPENAI_USAGE_URL,
     };
-    fetch_usage_at(http, provider, url, access_token).await
+    fetch_usage_for_account_at(
+        http,
+        provider,
+        url,
+        access_token,
+        workspace_id,
+        is_fedramp,
+    )
+    .await
 }
 
 /// The URL-taking form. Tests point this at a mock server.
@@ -84,7 +107,26 @@ pub async fn fetch_usage_at(
     url: &str,
     access_token: &str,
 ) -> Result<Vec<UsageWindow>, UsageError> {
-    fetch_usage_captured_at(http, provider, url, access_token)
+    fetch_usage_for_account_at(http, provider, url, access_token, None, false).await
+}
+
+/// The URL-taking form with optional OpenAI workspace context.
+pub async fn fetch_usage_for_account_at(
+    http: &ReqwestHttp,
+    provider: Provider,
+    url: &str,
+    access_token: &str,
+    workspace_id: Option<&str>,
+    is_fedramp: bool,
+) -> Result<Vec<UsageWindow>, UsageError> {
+    fetch_usage_captured_for_account_at(
+        http,
+        provider,
+        url,
+        access_token,
+        workspace_id,
+        is_fedramp,
+    )
         .await
         .outcome
 }
@@ -120,7 +162,32 @@ pub async fn fetch_usage_captured_at(
     url: &str,
     access_token: &str,
 ) -> CapturedFetch {
-    let (status, body) = match fetch_usage_body_at(http, provider, url, access_token).await {
+    fetch_usage_captured_for_account_at(http, provider, url, access_token, None, false).await
+}
+
+/// The capturing form with optional OpenAI workspace context.
+///
+/// A true `is_fedramp` claim sends the provider's routing header. False and an
+/// absent workspace preserve the bearer-only request measured to work, rather
+/// than fabricating context from the user id.
+pub async fn fetch_usage_captured_for_account_at(
+    http: &ReqwestHttp,
+    provider: Provider,
+    url: &str,
+    access_token: &str,
+    workspace_id: Option<&str>,
+    is_fedramp: bool,
+) -> CapturedFetch {
+    let (status, body) = match fetch_usage_body_for_account_at(
+        http,
+        provider,
+        url,
+        access_token,
+        workspace_id,
+        is_fedramp,
+    )
+    .await
+    {
         Ok(pair) => pair,
         Err(e) => {
             return CapturedFetch { raw: None, extra: None, outcome: Err(e) };
@@ -148,16 +215,13 @@ pub async fn fetch_usage_captured_at(
 /// actually arrived. A 2xx that is not 200 is precisely the drift §12.4 asks
 /// this window to make visible, and a hardcoded 200 would hide it.
 ///
-/// **`pub(crate)`, not private.** `auth::token`'s add-account path (Step 5 of
-/// the Codex login task) needs exactly this half — the raw body, before
-/// masking or parsing — to read an email out of a response it would otherwise
-/// throw away. Routing that through `fetch_usage_captured_at` instead would
-/// pay for masking and parsing that path never uses.
-pub(crate) async fn fetch_usage_body_at(
+async fn fetch_usage_body_for_account_at(
     http: &ReqwestHttp,
     provider: Provider,
     url: &str,
     access_token: &str,
+    workspace_id: Option<&str>,
+    is_fedramp: bool,
 ) -> Result<(u16, serde_json::Value), UsageError> {
     let mut req = http.raw_client().get(url).bearer_auth(access_token);
     req = match provider {
@@ -165,10 +229,19 @@ pub(crate) async fn fetch_usage_body_at(
         Provider::Anthropic => req
             .header("anthropic-beta", ANTHROPIC_BETA)
             .header("Content-Type", "application/json"),
-        // Measured: Bearer alone is enough. `ChatGPT-Account-Id` is not
-        // required, `client_version` changes nothing, and no header that
-        // identifies Codex CLI is sent — see docs/research/codex-usage-endpoint.md.
-        Provider::Openai => req.header("Accept", "application/json"),
+        // Bearer alone is measured to work. When the issuer supplied workspace
+        // context, preserve it without sending `originator` or any inference
+        // capability header that would identify another client.
+        Provider::Openai => {
+            let mut req = req.header("Accept", "application/json");
+            if let Some(id) = workspace_id.filter(|id| !id.is_empty()) {
+                req = req.header("ChatGPT-Account-ID", id);
+            }
+            if is_fedramp {
+                req = req.header("X-OpenAI-Fedramp", "true");
+            }
+            req
+        }
     };
     let resp = req
         .send()
@@ -177,18 +250,9 @@ pub(crate) async fn fetch_usage_body_at(
 
     let status = resp.status().as_u16();
 
-    // Before the status ladder, not inside it. Who answered decides whether the
-    // status means anything at all: a Cloudflare challenge and an API 403 share
-    // a status code but need opposite handling, and `x-oai-request-id` is the
-    // one signal measured to distinguish them (docs/research/codex-usage-endpoint.md,
-    // "Path selection, and what the 403s mean").
-    if provider == Provider::Openai
-        && !resp.status().is_success()
-        && resp.headers().get("x-oai-request-id").is_none()
-    {
-        return Err(UsageError::EdgeRefused { status });
-    }
-
+    // A rate-limit response carries its own remedy even when an OpenAI edge
+    // generated it before assigning `x-oai-request-id`. Classify it before the
+    // generic edge-refusal branch or that actionable wait is discarded.
     if status == 429 {
         // Absence of Retry-After is interpreted as 0 (budget exhausted) — the
         // more conservative reading. Parsed as `u64`, not `i64`: a malformed
@@ -206,6 +270,19 @@ pub(crate) async fn fetch_usage_body_at(
             .unwrap_or(0);
         return Err(UsageError::Throttled { retry_after_secs });
     }
+
+    // Before the status ladder, not inside it. Who answered decides whether the
+    // status means anything at all: a Cloudflare challenge and an API 403 share
+    // a status code but need opposite handling, and `x-oai-request-id` is the
+    // one signal measured to distinguish them (docs/research/codex-usage-endpoint.md,
+    // "Path selection, and what the 403s mean").
+    if provider == Provider::Openai
+        && !resp.status().is_success()
+        && resp.headers().get("x-oai-request-id").is_none()
+    {
+        return Err(UsageError::EdgeRefused { status });
+    }
+
     // A 403 is not always the same thing as a 401, and the difference is
     // permanent versus transient — so this one status needs its body read
     // before it is classified. Everything else keeps the old ladder.
@@ -687,11 +764,11 @@ mod tests {
         );
     }
 
-    /// AGENTS.md: `anthropic-beta` identifies our Anthropic integration and has
-    /// no meaning at OpenAI. Sending it there is at best noise and at worst a
-    /// fingerprint.
+    /// Provider context selects an OpenAI workspace without impersonating an
+    /// inference client. The positive absence checks matter: a mock that only
+    /// matches required headers still passes when forbidden headers tag along.
     #[tokio::test]
-    async fn the_openai_request_carries_no_anthropic_header_and_an_honest_ua() {
+    async fn the_openai_request_carries_context_and_only_read_only_headers() {
         let server = MockServer::start().await;
         Mock::given(method("GET"))
             .and(header("user-agent", USER_AGENT))
@@ -705,7 +782,15 @@ mod tests {
             .await;
 
         let http = ReqwestHttp::new().unwrap();
-        let got = fetch_usage_captured_at(&http, Provider::Openai, &server.uri(), "t").await;
+        let got = fetch_usage_captured_for_account_at(
+            &http,
+            Provider::Openai,
+            &server.uri(),
+            "t",
+            Some("workspace-one"),
+            true,
+        )
+        .await;
         let windows = got.outcome.expect("the mock only matches an honest UA");
         assert_eq!(windows.len(), 1);
 
@@ -720,6 +805,144 @@ mod tests {
             sent.headers.get("originator").is_none(),
             "an originator header claiming to be Codex CLI was sent"
         );
+        assert!(
+            sent.headers.get("x-openai-codex-luna-reserve").is_none(),
+            "a Luna-reserve capability header was sent by a read-only monitor"
+        );
+        assert_eq!(
+            sent.headers
+                .get("chatgpt-account-id")
+                .expect("the workspace context was omitted")
+                .to_str()
+                .unwrap(),
+            "workspace-one",
+            "the user id and workspace id answer different questions"
+        );
+        assert_eq!(
+            sent.headers
+                .get("x-openai-fedramp")
+                .expect("the true FedRAMP claim was omitted")
+                .to_str()
+                .unwrap(),
+            "true"
+        );
+    }
+
+    /// Existing bearer-only callers keep their old behavior. Absence is not
+    /// permission to guess a workspace from the user id or to invent a FedRAMP
+    /// claim.
+    #[tokio::test]
+    async fn the_legacy_openai_wrapper_fabricates_no_account_context() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_string(include_str!("fixtures/openai_plus_zero.json"))
+                    .insert_header("x-oai-request-id", "req-1"),
+            )
+            .mount(&server)
+            .await;
+
+        let got = fetch_usage_captured_at(
+            &ReqwestHttp::new().unwrap(),
+            Provider::Openai,
+            &server.uri(),
+            "t",
+        )
+        .await;
+        got.outcome.unwrap();
+
+        let sent = &server.received_requests().await.unwrap()[0];
+        assert!(sent.headers.get("chatgpt-account-id").is_none());
+        assert!(sent.headers.get("x-openai-fedramp").is_none());
+    }
+
+    /// False is a real negative claim, not a request to send `false`. OpenAI's
+    /// client only emits the routing header for true, and this monitor follows
+    /// that narrower disclosure.
+    #[tokio::test]
+    async fn a_false_fedramp_claim_sends_no_fedramp_header() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_string(include_str!("fixtures/openai_plus_zero.json"))
+                    .insert_header("x-oai-request-id", "req-1"),
+            )
+            .mount(&server)
+            .await;
+
+        let got = fetch_usage_captured_for_account_at(
+            &ReqwestHttp::new().unwrap(),
+            Provider::Openai,
+            &server.uri(),
+            "t",
+            Some("workspace-one"),
+            false,
+        )
+        .await;
+        got.outcome.unwrap();
+
+        let sent = &server.received_requests().await.unwrap()[0];
+        assert!(sent.headers.get("chatgpt-account-id").is_some());
+        assert!(sent.headers.get("x-openai-fedramp").is_none());
+    }
+
+    /// OpenAI context has no meaning on Anthropic's endpoint. Even a caller
+    /// passing it accidentally must still send only the one beta header.
+    #[tokio::test]
+    async fn openai_account_context_is_never_sent_to_anthropic() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "five_hour": { "utilization": 28, "resets_at": "2026-07-29T15:00:00Z" },
+                "seven_day": null, "limits": []
+            })))
+            .mount(&server)
+            .await;
+
+        let got = fetch_usage_captured_for_account_at(
+            &ReqwestHttp::new().unwrap(),
+            Provider::Anthropic,
+            &server.uri(),
+            "t",
+            Some("workspace-one"),
+            true,
+        )
+        .await;
+        got.outcome.unwrap();
+
+        let sent = &server.received_requests().await.unwrap()[0];
+        assert!(sent.headers.get("anthropic-beta").is_some());
+        assert!(sent.headers.get("chatgpt-account-id").is_none());
+        assert!(sent.headers.get("x-openai-fedramp").is_none());
+    }
+
+    /// An OpenAI 429 can be generated before the request reaches the backend,
+    /// so it need not carry `x-oai-request-id`. `Retry-After` still provides a
+    /// concrete remedy and must win over the generic edge-refusal classifier.
+    #[tokio::test]
+    async fn an_openai_edge_429_keeps_its_retry_after() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .respond_with(ResponseTemplate::new(429).insert_header("retry-after", "42"))
+            .mount(&server)
+            .await;
+
+        let err = fetch_usage_at(
+            &ReqwestHttp::new().unwrap(),
+            Provider::Openai,
+            &server.uri(),
+            "t",
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(
+            err,
+            UsageError::Throttled {
+                retry_after_secs: 42
+            }
+        ));
     }
 
     #[tokio::test]

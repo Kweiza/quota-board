@@ -33,10 +33,10 @@ fn parse_reset(v: &Value) -> Option<DateTime<Utc>> {
     DateTime::from_timestamp(v.as_i64()?, 0)
 }
 
-/// Derived from the window's own length rather than from its slot name,
-/// because the length is plan-dependent: 604800 on `plus` and 2592000 on
-/// `free` were both measured on `primary_window`. Naming the slot "weekly"
-/// would mislabel every free account.
+/// Derived from the window's own length rather than from its slot name. The
+/// slot is both plan- and state-dependent: `primary_window` was measured as 7d
+/// on an idle paid account, 30d on free, and 5h on an active paid account.
+/// Naming either slot for one capture would confidently mislabel the others.
 fn label_for(seconds: i64) -> String {
     match seconds {
         18_000 => "5h".to_string(),
@@ -139,12 +139,10 @@ mod tests {
     /// `false` here as a placeholder, not a measurement — this parser does not
     /// read any of the three, so the placeholder cannot affect a test result.
     const FREE_ZERO: &str = include_str!("fixtures/openai_free_zero.json");
-    /// **Synthetic. No measurement backs this shape.** No account with usage in
-    /// flight was ever observed (docs/research/codex-usage-endpoint.md, "Scope
-    /// limits"), so `secondary_window` being populated, and the values in it,
-    /// are this project's guess. A failure here means the guess was wrong, not
-    /// that the server changed.
-    const SYNTHETIC_POPULATED: &str = include_str!("fixtures/openai_synthetic_populated.json");
+    /// Sanitized from a live paid account capture on 2026-09-03. Unlike the
+    /// earlier synthetic body, this establishes which duration occupies each
+    /// slot while both are active.
+    const PAID_ACTIVE: &str = include_str!("fixtures/openai_paid_active.json");
 
     fn v(s: &str) -> serde_json::Value {
         serde_json::from_str(s).unwrap()
@@ -171,12 +169,19 @@ mod tests {
 
     #[test]
     fn reads_both_windows_when_both_are_present() {
-        let w = parse_usage(&v(SYNTHETIC_POPULATED)).unwrap();
+        let body = v(PAID_ACTIVE);
+        assert_ne!(
+            body["account_id"], body["user_id"],
+            "the quota-bearing workspace is not the user key"
+        );
+        let w = parse_usage(&body).unwrap();
         assert_eq!(w.len(), 2);
         assert_eq!(w[0].window_id, "primary");
         assert_eq!(w[1].window_id, "secondary");
-        assert_eq!(w[1].label, "5h");
-        assert_eq!(w[1].percent, 62.0);
+        assert_eq!(w[0].label, "5h", "the paid primary window is the short one");
+        assert_eq!(w[0].percent, 31.0);
+        assert_eq!(w[1].label, "7d", "the paid secondary window is the weekly one");
+        assert_eq!(w[1].percent, 6.0);
     }
 
     /// AGENTS.md: never demote a missing value to 0%. A body with no
