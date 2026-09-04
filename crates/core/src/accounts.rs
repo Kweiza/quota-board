@@ -141,10 +141,8 @@ impl AccountStore {
             .find(|a| a.provider == account.provider && a.account_id == account.account_id)
         {
             if account.provider == Provider::Openai
-                && matches!(
-                    (&existing.workspace_id, &account.workspace_id),
-                    (Some(existing), Some(incoming)) if existing != incoming
-                )
+                && existing.workspace_id.is_some()
+                && existing.workspace_id != account.workspace_id
             {
                 return Err(AccountError::WorkspaceConflict);
             }
@@ -645,6 +643,31 @@ mod tests {
         s.upsert(enriched).unwrap();
         assert_eq!(s.list().len(), 1);
         assert_eq!(s.list()[0].workspace_id.as_deref(), Some("workspace-one"));
+        std::fs::remove_file(&path).ok();
+    }
+
+    /// Once a workspace is known, `None` is not a harmless legacy value. It
+    /// would erase the context every later usage request needs and make the
+    /// same stored token query an unspecified workspace.
+    #[test]
+    fn a_known_openai_workspace_cannot_be_erased() {
+        let path = tmp();
+        let mut known = acc("user-one", "known");
+        known.provider = Provider::Openai;
+        known.workspace_id = Some("workspace-one".into());
+        let mut erased = known.clone();
+        erased.workspace_id = None;
+
+        let mut s = AccountStore::load(&path);
+        s.upsert(known).unwrap();
+        let before = std::fs::read(&path).unwrap();
+
+        let err = s
+            .upsert(erased)
+            .expect_err("a known workspace was erased by an unknown value");
+        assert!(matches!(err, AccountError::WorkspaceConflict));
+        assert_eq!(s.list()[0].workspace_id.as_deref(), Some("workspace-one"));
+        assert_eq!(std::fs::read(&path).unwrap(), before);
         std::fs::remove_file(&path).ok();
     }
 
