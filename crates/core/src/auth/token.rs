@@ -354,8 +354,13 @@ async fn decode<T: DeserializeOwned>(
     let value: serde_json::Value = serde_json::from_str(&text).map_err(|e| {
         AuthError::Decode(redact_remote_echo(e.to_string(), request_secrets))
     })?;
+    let mut decode_secrets = request_secrets.to_vec();
+    // A successful token response can carry credentials that did not exist in
+    // the request. Serde may quote one in a later wrong-typed field's error, so
+    // collect the reviewed top-level token fields before typed decoding.
+    decode_secrets.extend(json_request_secrets(&value));
     let typed: T = serde_json::from_value(value.clone()).map_err(|e| {
-        AuthError::Decode(redact_remote_echo(e.to_string(), request_secrets))
+        AuthError::Decode(redact_remote_echo(e.to_string(), &decode_secrets))
     })?;
     Ok((typed, value))
 }
@@ -812,6 +817,41 @@ mod tests {
         for printed in [err.to_string(), format!("{err:?}")] {
             assert!(!printed.contains(SECRET), "2xx decode error leaked the token: {printed}");
             assert!(printed.contains("<redacted>"), "the sanitized error lost all context: {printed}");
+        }
+    }
+
+    /// The response can contain a newly issued credential that was not in the
+    /// request. If another response field repeats it with the wrong type, serde
+    /// includes that value in its error and request-only redaction cannot help.
+    #[tokio::test]
+    async fn a_success_status_decode_error_cannot_echo_a_new_response_token() {
+        const NEW_SECRET: &str = "new-access-SENTINEL-from-2xx";
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "access_token": NEW_SECRET,
+                "refresh_token": "new-refresh",
+                "expires_in": NEW_SECRET
+            })))
+            .mount(&server)
+            .await;
+
+        let err = refresh(
+            &ReqwestHttp::new().unwrap(),
+            &cfg_for(&server).await,
+            &tokens_with(&["user:profile"]),
+        )
+        .await
+        .unwrap_err();
+        for printed in [err.to_string(), format!("{err:?}")] {
+            assert!(
+                !printed.contains(NEW_SECRET),
+                "2xx decode error leaked the newly issued token: {printed}"
+            );
+            assert!(
+                printed.contains("<redacted>"),
+                "the sanitized error lost all context: {printed}"
+            );
         }
     }
 
