@@ -304,13 +304,19 @@ floor chosen as a margin, not derived from a measured boundary, because none was
 found).
 
 `rate_limit_reset_credits` arrives in the same response, so the widget's
-reset-credit line needs no second request to populate.
+reset-credit line needs no second request to populate. Only `available_count`
+is guaranteed by the current official contract; the older
+`applicable_available_count` is optional and absence remains unknown, never 0.
 
-**Every account measured read 0% throughout.** `secondary_window`,
-`additional_rate_limits`, and `code_review_rate_limit` were `null` in every
-capture, so the shape a populated window takes is not measured — §5.5's schema
-tolerance and the never-demote-to-0% rule carry the design across that gap, but
-the gap itself stays open until an account with usage in flight is observed.
+The original 2026-08-03 captures were all 0%. A sanitized paid-account capture
+on 2026-09-03 closed the ordinary populated-window gap: `primary_window` was a
+5-hour window at 31% and `secondary_window` a 7-day window at 6%.
+`additional_rate_limits` is still not live-measured by this project, but its
+populated wire shape and multi-bucket semantics are EVIDENCED by the current
+[official app-server contract](https://learn.chatgpt.com/en/docs/app-server) and
+the open-source Codex client. The parser therefore normalizes every readable
+bucket dynamically rather than assuming exactly two windows. `code_review_rate_limit`
+remains unmeasured and unused.
 
 ## 6. Polling policy
 
@@ -700,12 +706,18 @@ vanishes on reboot.
 
 ### 9.3 Key structure and isolation
 
-- **The account primary key is `account.uuid` from the OAuth token response.**
-  Email is for display and is user-editable. Neither email nor a user label is
-  ever used as a key.
-- Store entries are keyed **uniquely by `account.uuid` under our own service
-  name**. Lookups must be exact-key lookups, never "the first entry whose
-  service matches."
+- **The account primary key is `(provider, account_id)`.** Anthropic's
+  `account_id` is the `account.uuid` from its token response; OpenAI's is the
+  person-level `auth.chatgpt_user_id` (falling back to namespaced
+  `auth.user_id`). The field remains serialized as `uuid` for downgrade
+  compatibility. Email is display-only and user-editable. Neither email nor a
+  user label is ever used as a key.
+- OpenAI's `chatgpt_account_id` is workspace request context, not the person
+  key. This v1 store cannot represent two workspaces for one OpenAI user, so a
+  second workspace is refused rather than silently replacing the first.
+- Store entries are keyed **uniquely by the provider/account pair under our own
+  service name**. Lookups must be exact-key lookups, never "the first entry
+  whose service matches."
 - **The key format is deliberately asymmetric between providers**, not for lack
   of taste. Anthropic entries stay unprefixed (`<uuid>:tokens`) because changing
   that format orphans every existing keychain entry — the lookup falls to
@@ -714,8 +726,15 @@ vanishes on reboot.
   the start (`openai:<id>:tokens`): the token store is the one place a bug
   means credential loss, so it carries no migration to get wrong. See
   `provider::token_key`.
-- Per-entry JSON blob:
-  `{ access_token, refresh_token, expires_at, refresh_token_expires_at, scopes[], client_id }`
+- Per-entry JSON blobs are provider-specific and untagged:
+  - Anthropic:
+    `{ access_token, refresh_token, expires_at, refresh_token_expires_at, scopes[], client_id }`
+  - OpenAI:
+    `{ access_token, refresh_token, client_id, user_id, workspace_id, is_fedramp }`
+
+  OpenAI's ID token is decoded once to establish identity and then discarded;
+  neither usage nor refresh needs it, and keeping it would add another
+  JWT-sized value to the bounded credential blob.
 
   > **Windows Credential Manager has a hard 2560-byte limit per credential
   > blob** (`CRED_MAX_CREDENTIAL_BLOB_SIZE`). Packing the access token and
@@ -725,8 +744,8 @@ vanishes on reboot.
   > before checking, giving an effective limit of about 1280 ASCII characters —
   > **use the byte API (`set_secret`).**
 - Metadata file:
-  `{ uuid, display_label, email, created_at, last_ok_at, quarantined }` —
-  **no tokens**
+  `{ uuid, provider, workspace_id, display_label, email, created_at, last_ok_at, quarantined }`
+  — **no tokens**
 - **Every cache is fingerprinted with a one-way hash of the current access
   token.** Re-logging in invalidates the cache immediately.
 
@@ -743,8 +762,11 @@ vanishes on reboot.
 
 ## 10. OAuth (the `auth` module)
 
-authorization_code + PKCE (S256), public client, no client_secret. No
-device-code alternative exists.
+Both providers use public clients with no client secret, but they do not share
+an authorization flow. Anthropic uses authorization-code + PKCE (S256), with a
+loopback callback and manual-paste fallback. OpenAI uses the documented Codex
+device-code flow; the app never asks for an API key and never imports another
+Codex client's credential.
 
 ### 10.1 Endpoints
 
@@ -761,28 +783,29 @@ Note that authorize is **not** `claude.ai/oauth/authorize`. Many older
 integration clients still use that address. `claude.ai` itself is not used for
 token or usage traffic at all.
 
-**OpenAI (Codex)**, from `auth.openai.com`'s discovery document
-(`/.well-known/openid-configuration`) and cross-checked against the codex
-binary's own request log — docs/research/codex-usage-endpoint.md, "OAuth
-endpoints":
+**OpenAI (Codex)**, cross-checked against the current open-source Codex login
+implementation and the [official device-code documentation](https://learn.chatgpt.com/en/docs/auth):
 
 | Purpose | URL |
 |---|---|
-| authorize | `https://auth.openai.com/api/accounts/authorize` |
-| token (discovery-advertised) | `https://auth.openai.com/api/accounts/oauth/token` |
-| token (CLI-observed) | `https://auth.openai.com/oauth/token` |
-| revoke | `https://auth.openai.com/api/accounts/oauth/revoke` |
+| start device code | `POST https://auth.openai.com/api/accounts/deviceauth/usercode` |
+| poll device code | `POST https://auth.openai.com/api/accounts/deviceauth/token` |
+| user verification | `https://auth.openai.com/codex/device` |
+| device redirect replayed at exchange | `https://auth.openai.com/deviceauth/callback` |
+| token / refresh | `POST https://auth.openai.com/oauth/token` |
+| revoke | `POST https://auth.openai.com/oauth/revoke` |
 
-**The CLI does not use the token endpoint its own issuer advertises** — its
-request log records the second URL above instead. `Provider::spec` uses the
-discovery-advertised one, because it is the documented contract; the
-CLI-observed one is recorded rather than adopted, so it is one grep away
-(`crates/core/src/provider.rs`) the day a refresh starts failing against it.
-**No OAuth flow has ever been run against either** — every row in this table
-comes from discovery or from reading the binary, not from a completed
-authorize/token exchange.
+Discovery advertises different `/api/accounts/oauth/*` token siblings, but the
+shipping Codex implementation uses the `/oauth/*` endpoints above. The app
+follows the implementation actually backing the documented device flow. **No
+live OpenAI authorization has yet been completed by this project**; endpoint,
+body, identity and error-shape confidence comes from official source plus local
+mock conformance, not from pretending that implementation evidence is a live
+measurement.
 
 ### 10.2 client_id
+
+Anthropic:
 
 ```
 9d1c250a-e61b-44d9-88ed-5944d1962f5e
@@ -797,7 +820,20 @@ than this application's name.** This is stated in the README.
 It is **overridable** via settings or an environment variable, so that if
 Anthropic ever issues third-party client_ids we can switch immediately.
 
+OpenAI:
+
+```
+app_EMoamEEZ73f0CkXaXp7hrann
+```
+
+This is the public client used by the documented Codex device flow. Device-code
+authentication may be disabled in a workspace or personal security settings;
+that refusal is a typed, localized prerequisite state, not a reason to ask for
+an API key or another client's token.
+
 ### 10.3 Flow
+
+#### Anthropic
 
 **PKCE**: verifier = base64url(32 random bytes), with `+`→`-`, `/`→`_`, and `=`
 stripped. challenge = base64url(sha256(verifier)). `state` is an independent
@@ -835,6 +871,29 @@ server expects. Timeout 30 seconds; 401 means "Invalid authorization code".
 **Token response**: `access_token`, `refresh_token`, `expires_in`,
 `refresh_token_expires_in` (non-standard), `scope` (space-separated string),
 and optionally `account:{uuid, email_address}` and `organization:{uuid}`.
+
+#### OpenAI
+
+1. POST JSON `{ "client_id": "…" }` to the device-code start endpoint.
+   Display the returned user code and the fixed verification URL. The user code
+   and device authorization id are credentials in progress: redact them from
+   debug output and discard them on cancellation.
+2. Poll with JSON `{ device_auth_id, user_code }` no faster than the returned
+   interval. The interval is untrusted input: require a positive integer,
+   default to 5 seconds, and cap it at the local 15-minute ceremony lifetime so
+   converting it to a signed duration cannot overflow.
+3. A 403/404 poll means pending. A completed poll returns an authorization code
+   and verifier; exchange them as form data at `/oauth/token`, replaying the
+   fixed device redirect exactly.
+4. Decode the returned ID token over the already-authenticated TLS response to
+   obtain the person id, optional workspace id, optional FedRAMP flag, profile
+   email and plan. Store only access + refresh and the identity context; discard
+   the ID token.
+
+The user-level id is the row key. `chatgpt_account_id`, when present, is sent as
+`ChatGPT-Account-Id` on usage reads; `chatgpt_account_is_fedramp: true` becomes
+`X-OpenAI-Fedramp: true`. Absence stays absent. A new login must pass the
+workspace-conflict preflight before its rotating token is stored.
 
 ### 10.4 Scopes
 
@@ -875,6 +934,8 @@ way (docs/research/codex-usage-endpoint.md, "OAuth endpoints").
 
 ### 10.5 Expiry and refresh
 
+**Anthropic.**
+
 Store `expires_at = now + expires_in * 1000` (absolute epoch ms). Treat as
 expired when `now + 300_000 >= expires_at` (a 5-minute skew).
 
@@ -897,10 +958,28 @@ an observable phenomenon, not a theoretical one.
 `code === "invalid_scope"`, retry **exactly once** using the stored scopes
 verbatim.
 
+**OpenAI.** Read access-token expiry from its JWT `exp` claim with the same
+five-minute skew. A missing or unreadable claim stays unknown rather than being
+fabricated as already expired. If the usage endpoint rejects that access token,
+force one JSON refresh at `/oauth/token` and retry the usage GET once. The
+refresh response fields are optional; retain the old access or refresh value
+when its replacement is absent. If an ID token is returned, use it only to
+verify that the person and known workspace did not change and then discard it.
+
+A bare refresh HTTP 401 is terminal for OpenAI. Anthropic is quarantined only
+for the explicit terminal codes (`invalid_grant`, `refresh_token_reused`,
+`refresh_token_expired`, `refresh_token_invalidated`); applying OpenAI's
+status-only rule globally would quarantine a Claude account without evidence
+that its chain is dead.
+
 **Concurrency**: serialize refreshes per account. Even in a single process, a
 scheduler poll and a user's manual refresh can overlap. Take a lock, and
 compare-and-swap against the stored refresh token before writing (if the value
 changed underneath us, adopt the new value rather than overwriting it).
+For a 401-triggered refresh, also carry the rejected access token as a witness:
+after waiting on the lock, a caller that sees a different stored access token
+adopts it without issuing a second refresh. This is what prevents two usage
+requests that rejected the same token from consuming one rotating chain twice.
 
 **`invalid_grant`**: means the refresh chain is permanently dead and cannot
 recover on its own. Only re-login helps. **Quarantine the account on one
@@ -940,23 +1019,14 @@ On account deletion, POST
 is a sibling of its token endpoint). Timeout 5 seconds, best-effort — swallow
 failures and proceed with local deletion.
 
-**The body goes out in the provider's `body_style`**, through the same dispatch
-the token endpoint uses. The JSON shape above is Anthropic's and is measured
-(§10.3). For OpenAI nothing is measured, and RFC 7009 §2.1 requires
-`application/x-www-form-urlencoded` for a revocation request — the same reason
-`BodyStyle::Form` was chosen for that provider's token endpoint. Sending JSON
-regardless would be a guess in the one place a wrong guess cannot be seen:
-because the outcome is swallowed, a refused revocation looks exactly like an
-accepted one, and the user-visible result is a live refresh token left on the
-server after the account is gone locally.
-
-**Still unmeasured, and recorded as such.** No revocation request has ever been
-sent to OpenAI, so form encoding here is the standard's default rather than an
-observation. If a Codex account's tokens are found still valid after removal,
-check the body style first and the URL second — the CLI's request log uses a
-token endpoint that differs from the one discovery advertises, and its revoke
-sibling may differ the same way
-(`docs/research/codex-usage-endpoint.md`, "OAuth endpoints").
+The JSON body shape above is used by both providers. Anthropic's request was
+live-measured; OpenAI's `/oauth/revoke` URL and JSON request are EVIDENCED by
+the current open-source Codex logout implementation and held by mock
+conformance tests. **OpenAI revocation is not live-measured by this project.**
+That distinction matters because the outcome is best-effort and swallowed: a
+refused revocation otherwise looks exactly like an accepted one. If a removed
+Codex grant is later found still valid, test body and endpoint against a live
+grant before changing either on inference from a generic OAuth default.
 
 ### 10.7 Refresh-chain isolation — the benefit and the measured risk
 

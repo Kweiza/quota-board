@@ -18,11 +18,17 @@ an honest `quota-board/<version>` User-Agent, with no header that identifies
 Codex CLI and no Cloudflare challenge. §2.2's premise — a free query endpoint
 exists — holds for Codex.
 
-The qualification is that **no window with usage in it was ever observed.** Both
-accounts read 0% throughout, so the shape a populated window takes, and what
-`reset_after_seconds` does once a window is in use, are not measured. §5.5's
-schema tolerance and the never-demote-to-0% rule carry the design across that
-gap, but the gap is real and is not closed by this run.
+The qualification for this 2026-08-03 run was that **no window with usage in it
+was observed.** Both accounts read 0% throughout, so this run did not measure a
+populated shape or what `reset_after_seconds` does while active.
+
+> **Follow-up, 2026-09-03.** A sanitized paid-account capture showed a populated
+> `primary_window` at 31% with `limit_window_seconds: 18000` (5 hours) and a
+> populated `secondary_window` at 6% with `limit_window_seconds: 604800` (7
+> days). That closes the ordinary populated-window gap without rewriting what
+> the original spike did and did not see. `additional_rate_limits` remains
+> unmeasured live; its populated shape is separately EVIDENCED by official
+> documentation and the open-source Codex client, not by this spike.
 
 ## The endpoint
 
@@ -126,6 +132,11 @@ it will always report movement.
 usage page shows no 5-hour window for this plan either, so the two-window
 5h + weekly shape assumed before this run may simply not exist here.
 
+The 2026-09-03 follow-up above later measured the ordinary primary/secondary
+pair on a paid account. It does not turn either original account into a
+populated one, and it does not live-measure `additional_rate_limits` or
+`code_review_rate_limit`.
+
 ### `rate_limit_reset_credits`
 
 ```json
@@ -136,6 +147,10 @@ usage page shows no 5-hour window for this plan either, so the two-window
 Present in the usage response itself, so the widget's reset-credit line needs
 **no second request**. The sibling path `…/rate-limit-reset-credits/consume`
 spends a credit and is never called by the script.
+
+The current official client also accepts the summary form
+`{ "available_count": N }` with no applicable count. The parser therefore
+keeps applicability optional: absence is unknown, not a fabricated zero.
 
 ### `credits` and `spend_control`
 
@@ -216,6 +231,17 @@ would be picking the one nothing has been observed to use.
 
 The codex binary carries the public client `app_EMoamEEZ73f0CkXaXp7hrann`.
 **Not verified**: no authorization flow was run against it in this spike.
+
+> **Implementation follow-up, 2026-09-04.** Current official documentation and
+> open-source Codex use a device-code ceremony, not the discovery-advertised
+> browser route: `/api/accounts/deviceauth/usercode`,
+> `/api/accounts/deviceauth/token`, the verification page `/codex/device`, and
+> a form exchange at `/oauth/token` with
+> `https://auth.openai.com/deviceauth/callback`. Logout posts JSON to
+> `/oauth/revoke`. quota-board implements those shapes behind local mocks. This
+> is EVIDENCED implementation behavior, not a live OAuth measurement; the final
+> sentence above remains true until this project completes the ceremony with
+> its own grant.
 
 Note for §10.4's counterpart: the advertised scope list contains nothing
 resembling `user:inference`, so there is no inference scope to decline. That is
@@ -313,11 +339,14 @@ free and with the instrument being too blunt at this scale.
 
 ## Scope limits
 
-- **Two accounts, one machine, one day, and neither had usage in flight.**
-  Every schema statement above describes a zero-usage account.
-- **`secondary_window`, `additional_rate_limits`, and `code_review_rate_limit`
-  are unmeasured.** They were `null` in every capture. A run in which a field
-  stays null measures nothing about that field.
+- **This spike covered two accounts, one machine, one day, and neither had
+  usage in flight.** Its schema statements describe zero-usage accounts. The
+  separate 2026-09-03 capture measures one paid active account; it does not
+  broaden this run's account, machine, duration or throttle sample.
+- **`additional_rate_limits` and `code_review_rate_limit` remain unmeasured
+  live.** They were `null` in every project capture. Official documentation and
+  source now establish the former's shape, which is implementation evidence;
+  no equivalent evidence is claimed for the latter.
 - **No throttle boundary was measured.** Spike B and D did that work for
   Anthropic; nothing equivalent exists here. The 429 behaviour of this endpoint,
   whether it sends `Retry-After`, and whether its budget is per account or per
