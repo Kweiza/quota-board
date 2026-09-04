@@ -351,10 +351,12 @@ async fn decode<T: DeserializeOwned>(
     // parse error that embedded the value it failed to read) — the serde
     // error alone is enough to debug a schema mismatch without repeating it
     // here.
-    let value: serde_json::Value =
-        serde_json::from_str(&text).map_err(|e| AuthError::Decode(e.to_string()))?;
-    let typed: T =
-        serde_json::from_value(value.clone()).map_err(|e| AuthError::Decode(e.to_string()))?;
+    let value: serde_json::Value = serde_json::from_str(&text).map_err(|e| {
+        AuthError::Decode(redact_remote_echo(e.to_string(), request_secrets))
+    })?;
+    let typed: T = serde_json::from_value(value.clone()).map_err(|e| {
+        AuthError::Decode(redact_remote_echo(e.to_string(), request_secrets))
+    })?;
     Ok((typed, value))
 }
 
@@ -782,6 +784,33 @@ mod tests {
             .unwrap_err();
         for printed in [err.to_string(), format!("{err:?}")] {
             assert!(!printed.contains(SECRET), "remote echo leaked the token: {printed}");
+            assert!(printed.contains("<redacted>"), "the sanitized error lost all context: {printed}");
+        }
+    }
+
+    /// A 2xx body is still remote input. Serde includes a wrong-typed string in
+    /// its error text, so an issuer that reflects the submitted token into such
+    /// a field must be scrubbed just like a non-2xx OAuth error.
+    #[tokio::test]
+    async fn a_success_status_decode_error_cannot_echo_the_submitted_refresh_token() {
+        const SECRET: &str = "refresh-SENTINEL-from-2xx";
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "access_token": "new-at",
+                "refresh_token": "new-rt",
+                "expires_in": SECRET
+            })))
+            .mount(&server)
+            .await;
+
+        let mut tokens = tokens_with(&["user:profile"]);
+        tokens.refresh_token = SECRET.into();
+        let err = refresh(&ReqwestHttp::new().unwrap(), &cfg_for(&server).await, &tokens)
+            .await
+            .unwrap_err();
+        for printed in [err.to_string(), format!("{err:?}")] {
+            assert!(!printed.contains(SECRET), "2xx decode error leaked the token: {printed}");
             assert!(printed.contains("<redacted>"), "the sanitized error lost all context: {printed}");
         }
     }
