@@ -72,7 +72,20 @@ impl RawResponse {
     /// rejects it and the local part ships. Masking first means truncation can
     /// only ever cut a placeholder.
     pub fn capture(status: u16, body: &Value) -> Self {
-        let (body, truncated) = truncate_on_char_boundary(masked_text(body), MAX_BODY_BYTES);
+        Self::capture_with_secrets(status, body, &[])
+    }
+
+    /// Captures a response while also masking exact request credentials the
+    /// remote endpoint could echo under an unrecognized key or inside prose.
+    /// The ordinary schema/lexical masking remains in force; these values are
+    /// an additional deny-list, not an alternative to it.
+    pub(crate) fn capture_with_secrets(
+        status: u16,
+        body: &Value,
+        request_secrets: &[&str],
+    ) -> Self {
+        let (body, truncated) =
+            truncate_on_char_boundary(masked_text(body, request_secrets), MAX_BODY_BYTES);
         Self { captured_at: Utc::now(), status, truncated, body }
     }
 
@@ -391,13 +404,30 @@ fn mask_money(v: &Value, in_money: bool) -> Value {
 /// The output is the body **as parsed and re-serialized**, not the bytes off
 /// the wire: key order is normalized and duplicate keys collapse. The debug
 /// window says so rather than claiming byte fidelity.
-fn masked_text(body: &Value) -> String {
+fn scrub_exact_secrets(mut text: String, request_secrets: &[&str]) -> String {
+    for secret in request_secrets.iter().filter(|secret| !secret.is_empty()) {
+        // The raw spelling covers base64url/JWT tokens. The JSON-escaped
+        // spelling closes the same hole for an opaque OAuth token containing a
+        // quote, backslash, or control character.
+        text = text.replace(secret, TOKEN_MASK);
+        if let Ok(encoded) = serde_json::to_string(secret) {
+            let escaped = encoded
+                .strip_prefix('"')
+                .and_then(|value| value.strip_suffix('"'))
+                .unwrap_or(&encoded);
+            text = text.replace(escaped, TOKEN_MASK);
+        }
+    }
+    text
+}
+
+fn masked_text(body: &Value, request_secrets: &[&str]) -> String {
     let by_key = mask_money(&mask_by_key(body), false);
     // Never `unwrap`: `poll_claimed`'s doc comment in `src-tauri/src/state.rs`
     // records that a panic on this path ends polling for the life of the process.
     let pretty = serde_json::to_string_pretty(&by_key)
         .unwrap_or_else(|_| "<the response could not be re-serialized>".to_string());
-    scrub_text(&pretty)
+    scrub_text(&scrub_exact_secrets(pretty, request_secrets))
 }
 
 fn truncate_on_char_boundary(mut s: String, max: usize) -> (String, bool) {
