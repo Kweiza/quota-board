@@ -195,7 +195,11 @@ pub async fn fetch_usage_captured_for_account_at(
     };
     // Captured before parsing, deliberately: the body the debug window most
     // needs is the one the parser below is about to reject.
-    let raw = Some(RawResponse::capture(status, &body));
+    let raw = Some(RawResponse::capture_with_secrets(
+        status,
+        &body,
+        &[access_token],
+    ));
     let (extra, outcome) = match provider {
         Provider::Anthropic => (
             anthropic::parse_credit(&body).map(ExtraLine::Credit),
@@ -522,6 +526,38 @@ mod tests {
             "the unparseable body was discarded: {}",
             raw.body()
         );
+    }
+
+    /// OpenAI access tokens are JWTs and do not match the Anthropic `sk-ant`
+    /// heuristic. A changed endpoint can echo the submitted bearer under an
+    /// otherwise innocent key, so exact request-secret masking must happen
+    /// before the body reaches any debug/serialization surface.
+    #[tokio::test]
+    async fn an_alien_success_body_cannot_echo_the_openai_bearer_into_the_raw_capture() {
+        const TOKEN: &str = "eyJhbGciOiJSUzI1NiJ9.eyJleHAiOjE3MDAwMDAwMDB9.JWT-SENTINEL";
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!({ "note": TOKEN }))
+                    .insert_header("x-oai-request-id", "req-echo"),
+            )
+            .mount(&server)
+            .await;
+
+        let got = fetch_usage_captured_at(
+            &ReqwestHttp::new().unwrap(),
+            Provider::Openai,
+            &server.uri(),
+            TOKEN,
+        )
+        .await;
+        assert!(matches!(got.outcome, Err(UsageError::UnknownShape)));
+        let raw = got.raw.expect("a 2xx body must still be captured");
+        for printed in [raw.body().to_string(), format!("{raw:?}"), serde_json::to_string(&raw).unwrap()] {
+            assert!(!printed.contains(TOKEN), "raw capture leaked the bearer: {printed}");
+        }
+        assert!(raw.body().contains("<redacted:token>"));
     }
 
     /// AGENTS.md: never demote a missing value to a fabricated one. A 429 is
