@@ -5,8 +5,10 @@ import { WebviewWindow } from '@tauri-apps/api/webviewWindow'
 import type {
   AccountState,
   AccountView,
+  AuthCompleted,
+  AuthFailed,
   AutostartView,
-  LoginUrls,
+  LoginStart,
   ManualFallback,
   Provider,
   RawResponse,
@@ -87,7 +89,7 @@ export const refreshAccount = (uuid: string, provider: Provider): Promise<Accoun
   invoke('refresh_account', { uuid, provider })
 
 /** §10.3's flow, for whichever provider the user pressed the button for. */
-export const beginLogin = (provider: Provider): Promise<LoginUrls> =>
+export const beginLogin = (provider: Provider): Promise<LoginStart> =>
   invoke('begin_login', { provider })
 
 /** §10.3's paste path. Rejects with a sentence meant for the user. */
@@ -154,9 +156,13 @@ export const lastResponse = (uuid: string, provider: Provider): Promise<RawRespo
 export const onAccountsChanged = (fn: () => void): Promise<UnlistenFn> =>
   listen('accounts://changed', fn)
 
+/** A login completed; unlike accounts://changed this is never rename/remove/reorder. */
+export const onAuthCompleted = (fn: (result: AuthCompleted) => void): Promise<UnlistenFn> =>
+  listen<AuthCompleted>('auth://completed', (e) => fn(e.payload))
+
 /** §10.3's flow completes in the background, so its failures arrive here. */
-export const onAuthFailed = (fn: (message: string) => void): Promise<UnlistenFn> =>
-  listen<string>('auth://failed', (e) => fn(e.payload))
+export const onAuthFailed = (fn: (failure: AuthFailed) => void): Promise<UnlistenFn> =>
+  listen<AuthFailed>('auth://failed', (e) => fn(e.payload))
 
 /**
  * The loopback half gave up but the login can still be finished by hand.

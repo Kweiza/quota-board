@@ -107,6 +107,25 @@ describe('AccountRow bars', () => {
     expect(screen.getByText('weekly (Opus)')).toBeTruthy()
   })
 
+  it('renders every Codex bucket with its duration first', () => {
+    const windows = [
+      win('primary', '5h', 11),
+      win('additional:codex_spark:primary', '1h · Codex Spark', 42),
+      win('additional:codex_spark:secondary', '1d · Codex Spark', 7),
+    ]
+    render(AccountRow, {
+      account: acct({
+        provider: 'openai',
+        state: { kind: 'ok', windows, extra: null, fetched_at: NOW.toISOString() },
+      }),
+      now: NOW,
+    })
+
+    expect(screen.getAllByRole('meter')).toHaveLength(3)
+    expect(screen.getByText('1h · Codex Spark')).toBeTruthy()
+    expect(screen.getByText('1d · Codex Spark')).toBeTruthy()
+  })
+
   it('renders the label the core actually sends, verbatim', () => {
     render(AccountRow, { account: ok([win('weekly:Fable', 'weekly (Fable)', 33)]), now: NOW })
     expect(screen.getByLabelText('weekly (Fable)')).toBeTruthy()
@@ -265,37 +284,46 @@ describe('AccountRow states', () => {
 
 describe('AccountRow refresh', () => {
   /**
-   * Every state carries the button, and the ones with no numbers to show carry
-   * it for the strongest reason: `network` and `throttled` are precisely the
-   * rows worth retrying. Hiding the control there would withhold it exactly
-   * when it is wanted, and the only other "Refresh now" in the app is two
-   * clicks and a second window away.
+   * Every recoverable state carries the button, and the ones with no numbers
+   * to show carry it for the strongest reason: `network` and `throttled` are
+   * precisely the rows worth retrying. `auth_dead` is covered separately: the
+   * backend cannot retry a dead grant and the row already exposes re-login.
    */
-  const EVERY_STATE: AccountView['state'][] = [
+  const RETRYABLE_STATES: AccountView['state'][] = [
     { kind: 'ok', windows: [win('five_hour', '5h', 20)], extra: null, fetched_at: NOW.toISOString() },
     { kind: 'stale', windows: [win('five_hour', '5h', 20)], extra: null, fetched_at: NOW.toISOString() },
     { kind: 'loading' },
     { kind: 'throttled', until: '2026-07-29T14:05:00Z' },
     { kind: 'auth_expired' },
-    { kind: 'auth_dead' },
     { kind: 'oauth_not_allowed' },
     { kind: 'secrets_locked' },
     { kind: 'unknown_shape' },
     { kind: 'network' },
   ]
 
-  it('offers a refresh button whatever the row is showing', () => {
-    for (const state of EVERY_STATE) {
+  it('offers a refresh button for every state that the backend can retry', () => {
+    for (const state of RETRYABLE_STATES) {
       const { unmount } = render(AccountRow, { account: view(state), now: NOW })
-      // `auth_dead` and `secrets_locked` draw their own buttons, so this is
-      // matched by accessible name rather than by role alone. The name is the
-      // settings window's wording verbatim: one control, one label.
+      // `secrets_locked` draws its own remedy button too, so this is matched by
+      // accessible name rather than by role alone. The name is the settings
+      // window's wording verbatim: one control, one label.
       expect(
         screen.getByRole('button', { name: 'Refresh Claude account work@example.com' }),
         `${state.kind} must offer a refresh`,
       ).toBeTruthy()
       unmount()
     }
+  })
+
+  it('offers re-login instead of a no-op refresh for auth_dead', () => {
+    render(AccountRow, { account: view({ kind: 'auth_dead' }), now: NOW })
+
+    expect(
+      screen.queryByRole('button', { name: 'Refresh Claude account work@example.com' }),
+    ).toBeNull()
+    expect(
+      screen.getByRole('button', { name: 'Re-login Claude account work@example.com' }),
+    ).toBeTruthy()
   })
 
   it('reports the click to the parent', () => {
@@ -492,6 +520,20 @@ describe('AccountRow reset-credits line', () => {
       }),
     })
     expect(screen.getByText('2')).toBeTruthy()
+    expect(screen.queryByText(/applicable/)).toBeNull()
+  })
+
+  it('shows only the available count when applicability was not reported', () => {
+    render(AccountRow, {
+      account: acct({
+        provider: 'openai',
+        state: {
+          kind: 'ok', windows: [], fetched_at: NOW.toISOString(),
+          extra: { kind: 'reset_credits', available: 3, applicable: null },
+        },
+      }),
+    })
+    expect(screen.getByText('3')).toBeTruthy()
     expect(screen.queryByText(/applicable/)).toBeNull()
   })
 

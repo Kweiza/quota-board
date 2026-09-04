@@ -127,23 +127,24 @@ impl FailureKind {
                     FailureKind::Network
                 }
             },
-            StoredTokenError::Auth(e) => match e {
-                // §10.5: one strike, then quarantine.
-                AuthError::OAuth { .. } if e.is_dead_grant() => FailureKind::AuthDead,
+            StoredTokenError::Auth { provider, source } => match source {
+                // §10.5: one strike, then quarantine. The provider carried by
+                // the stored-token wrapper is part of the predicate: neither a
+                // bare OpenAI 401 nor a typed OpenAI identity mismatch may
+                // quarantine an Anthropic row.
+                source if source.is_dead_grant_for(*provider) => FailureKind::AuthDead,
                 // A transport failure is not an auth failure. Classifying it as
                 // one would eventually quarantine an account over a flaky link.
                 AuthError::Transport(_) => FailureKind::Network,
-                // `NoAccountIdentifier` cannot actually reach here today: it is
-                // raised by `account_id_from`, which only the account-creation
-                // path calls, and `refresh` — the only caller that feeds this
-                // match — never calls it. The arm exists because `AuthError` is
-                // matched exhaustively, and it groups with the other
-                // response-shape problems below rather than with a dead grant,
-                // since nothing here says the refresh chain itself is broken.
+                // A state mismatch or response-shape error says nothing about
+                // the refresh grant itself, so neither may quarantine the
+                // account as a dead grant.
                 AuthError::OAuth { .. }
                 | AuthError::StateMismatch
                 | AuthError::Decode(_)
-                | AuthError::NoAccountIdentifier => FailureKind::AuthExpired,
+                | AuthError::IdentityMismatch { .. } => {
+                    FailureKind::AuthExpired
+                }
             },
         }
     }
@@ -1216,6 +1217,9 @@ mod tests {
         fn oauth(code: &str) -> AuthError {
             AuthError::OAuth { status: 400, code: Some(code.into()), description: None }
         }
+        fn auth(provider: Provider, source: AuthError) -> StoredTokenError {
+            StoredTokenError::Auth { provider, source }
+        }
         assert_eq!(kind(StoredTokenError::Missing), FailureKind::AuthDead);
         assert_eq!(kind(StoredTokenError::Corrupt), FailureKind::AuthDead);
 
@@ -1236,16 +1240,67 @@ mod tests {
             FailureKind::Network
         );
 
-        assert!(oauth("invalid_grant").is_dead_grant(), "the guard below would be vacuous");
-        assert_eq!(kind(StoredTokenError::Auth(oauth("invalid_grant"))), FailureKind::AuthDead);
+        assert!(
+            oauth("invalid_grant").is_dead_grant_for(Provider::Anthropic),
+            "the guard below would be vacuous"
+        );
         assert_eq!(
-            kind(StoredTokenError::Auth(AuthError::Transport("boom".into()))),
+            kind(auth(Provider::Anthropic, oauth("invalid_grant"))),
+            FailureKind::AuthDead
+        );
+        assert_eq!(
+            kind(auth(
+                Provider::Anthropic,
+                AuthError::Transport("boom".into())
+            )),
             FailureKind::Network
         );
-        assert_eq!(kind(StoredTokenError::Auth(oauth("invalid_scope"))), FailureKind::AuthExpired);
-        assert_eq!(kind(StoredTokenError::Auth(AuthError::StateMismatch)), FailureKind::AuthExpired);
         assert_eq!(
-            kind(StoredTokenError::Auth(AuthError::Decode("x".into()))),
+            kind(auth(Provider::Anthropic, oauth("invalid_scope"))),
+            FailureKind::AuthExpired
+        );
+        let openai_unauthorized = || AuthError::OAuth {
+            status: 401,
+            code: Some("unauthorized".into()),
+            description: None,
+        };
+        assert_eq!(
+            kind(auth(Provider::Openai, openai_unauthorized())),
+            FailureKind::AuthDead
+        );
+        assert_eq!(
+            kind(auth(Provider::Anthropic, openai_unauthorized())),
+            FailureKind::AuthExpired,
+            "OpenAI's status-only terminal rule escaped its provider context"
+        );
+        assert_eq!(
+            kind(auth(
+                Provider::Openai,
+                AuthError::IdentityMismatch {
+                    provider: Provider::Openai
+                }
+            )),
+            FailureKind::AuthDead
+        );
+        assert_eq!(
+            kind(auth(
+                Provider::Anthropic,
+                AuthError::IdentityMismatch {
+                    provider: Provider::Openai
+                }
+            )),
+            FailureKind::AuthExpired,
+            "typed OpenAI identity evidence quarantined an Anthropic row"
+        );
+        assert_eq!(
+            kind(auth(Provider::Anthropic, AuthError::StateMismatch)),
+            FailureKind::AuthExpired
+        );
+        assert_eq!(
+            kind(auth(
+                Provider::Anthropic,
+                AuthError::Decode("x".into())
+            )),
             FailureKind::AuthExpired
         );
     }
@@ -1881,6 +1936,8 @@ mod tests {
         Account {
             account_id: uuid.into(),
             provider: Provider::Anthropic,
+            workspace_id: None,
+            is_fedramp: false,
             display_label: uuid.into(),
             email: format!("{uuid}@example.com"),
             created_at: Utc::now(),

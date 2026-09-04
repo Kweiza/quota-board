@@ -10,7 +10,7 @@ mod tray;
 use quota_core::accounts::AccountStore;
 use quota_core::auth::openai::{OpenAiAuthConfig, OPENAI_ISSUER};
 use quota_core::auth::stored::{load_tokens, AuthConfigs, RefreshLocks};
-use quota_core::auth::token::ReqwestHttp;
+use quota_core::auth::token::{AnthropicAuthConfig, ReqwestHttp};
 use quota_core::provider::Provider;
 use quota_core::scheduler::{register_accounts, Scheduler, SystemClock};
 use quota_core::secrets::{keychain::KeychainStore, timeout::TimeoutStore, SecretStore, SERVICE};
@@ -28,6 +28,29 @@ use tauri_plugin_autostart::MacosLauncher;
 use tauri_plugin_global_shortcut::{Code, GlobalShortcutExt, Modifiers, Shortcut, ShortcutState};
 use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
+
+/// The locked state startup must install when an encrypted-file backend was
+/// selected on an earlier run.
+///
+/// Kept as a named seam so both the choice and the skipped probe can be
+/// regression-tested without opening either real backend.
+fn select_startup_store<T, E>(
+    path: &std::path::Path,
+    probe_keychain: impl FnOnce() -> Result<T, E>,
+) -> (Option<StoreKind>, Option<Result<T, E>>) {
+    let fallback = match std::fs::metadata(path) {
+        Ok(_) => Some(StoreKind::EncryptedFileLocked),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+        // Fail closed. An unreadable path may still contain every account's
+        // credential; probing and selecting an empty keychain would then turn a
+        // transient filesystem error into a persisted AUTH_DEAD quarantine.
+        Err(_) => Some(StoreKind::EncryptedFileLocked),
+    };
+    match fallback {
+        Some(kind) => (Some(kind), None),
+        None => (None, Some(probe_keychain())),
+    }
+}
 
 /// §3.3's global toggle. Built on demand rather than stored in a `static`:
 /// `Shortcut::new` is cheap, and the handler and the registration have to agree
@@ -116,11 +139,13 @@ fn main() {
                 eprintln!("accounts: {w}");
             }
 
-            // §9.2's canary self-check. **Must run exactly once per process**:
-            // keyring 4.1.5 flips an internal flag before registering the
-            // store, so the error carrying the real cause is produced only on
-            // the first call and every later one yields a context-free
-            // `NoDefaultStore` (secrets/keychain.rs:13-21).
+            // §9.2's keychain canary self-check. **When the keychain is the
+            // selected backend, it must run exactly once per process**: keyring
+            // 4.1.5 flips an internal flag before registering the store, so the
+            // error carrying the real cause is produced only on the first call
+            // and every later one yields a context-free `NoDefaultStore`
+            // (secrets/keychain.rs:13-21). An existing encrypted backend skips
+            // the keychain and therefore skips this probe entirely.
             //
             // **Wrapped in `TimeoutStore`, and the wrapper is what makes both
             // this line and the polling loop safe.** Every `SecretStore` method
@@ -131,10 +156,20 @@ fn main() {
             // never appears; the same call inside `ensure_fresh` hangs the task
             // that drives the polling loop, and nothing is left running to
             // reclaim it.
-            let opened = TimeoutStore::spawn(
-                std::time::Duration::from_secs(quota_core::secrets::timeout::DEFAULT_TIMEOUT_SECS),
-                || KeychainStore::probe(SERVICE).map(|s| Box::new(s) as Box<dyn SecretStore>),
-            );
+            // Once the encrypted fallback has been selected it remains the
+            // credential source on later launches. A Secret Service daemon can
+            // appear after those credentials were written; probing it first
+            // would select an empty keychain, classify every fallback token as
+            // missing and persist AUTH_DEAD for otherwise healthy accounts.
+            let fallback_path = quota_core::paths::secrets_file();
+            let (existing_fallback, opened) = select_startup_store(&fallback_path, || {
+                TimeoutStore::spawn(
+                    std::time::Duration::from_secs(
+                        quota_core::secrets::timeout::DEFAULT_TIMEOUT_SECS,
+                    ),
+                    || KeychainStore::probe(SERVICE).map(|s| Box::new(s) as Box<dyn SecretStore>),
+                )
+            });
             // docs/design.md §9.2's real trigger — a Linux box with no Secret
             // Service (design.md:580-586) — cannot be reproduced on a macOS
             // development machine, and "the fallback has never been exercised
@@ -143,20 +178,30 @@ fn main() {
             // for the URL overrides. It cannot redirect writes: the path comes
             // from `paths::secrets_file()`, never from the environment.
             #[cfg(debug_assertions)]
-            let opened = if std::env::var_os("QUOTA_FORCE_FALLBACK").is_some() {
-                Err(SecretError::NoBackend(
-                    "QUOTA_FORCE_FALLBACK is set: pretending this machine has no keychain".into(),
-                ))
-            } else {
-                opened
-            };
+            let opened = opened.map(|opened| {
+                if std::env::var_os("QUOTA_FORCE_FALLBACK").is_some() {
+                    Err(SecretError::NoBackend(
+                        "QUOTA_FORCE_FALLBACK is set: pretending this machine has no keychain"
+                            .into(),
+                    ))
+                } else {
+                    opened
+                }
+            });
 
             let (secrets, store_kind): (Arc<dyn SecretStore>, StoreKind) = match opened {
-                Ok(s) => {
+                None => {
+                    let kind = existing_fallback.unwrap_or(StoreKind::EncryptedFileLocked);
+                    eprintln!(
+                        "encrypted token store found — waiting for its passphrase before reading accounts"
+                    );
+                    (Arc::new(LockedStore) as Arc<dyn SecretStore>, kind)
+                }
+                Some(Ok(s)) => {
                     eprintln!("token store: {}", s.describe());
                     (Arc::new(s), StoreKind::Keychain)
                 }
-                Err(e) => {
+                Some(Err(e)) => {
                     // §9.2's encrypted-file fallback needs a passphrase, and a
                     // passphrase cannot be asked for from `setup()` — there is
                     // no window yet. Start locked, render every account
@@ -192,7 +237,7 @@ fn main() {
             };
             register_accounts(&mut scheduler, accounts.list(), &mut cache, &current_fp);
 
-            let mut anthropic = Provider::Anthropic.spec();
+            let mut anthropic = AnthropicAuthConfig::production();
             anthropic.token_url = token_url();
             let auth_configs = AuthConfigs {
                 anthropic,
@@ -302,7 +347,8 @@ fn main() {
 /// only.** In a release build the environment cannot point this binary at
 /// another host: the token endpoint receives a refresh token, so an
 /// env-settable URL in a shipped binary would be a credential exfiltration
-/// switch. Production values are §5.1's URL and `Provider::Anthropic.spec()`.
+/// switch. Production values are §5.1's URL and
+/// `AnthropicAuthConfig::production()`.
 #[cfg(debug_assertions)]
 fn usage_url() -> String {
     std::env::var("QUOTA_USAGE_URL")
@@ -329,11 +375,12 @@ fn openai_usage_url() -> String {
 
 #[cfg(debug_assertions)]
 fn token_url() -> String {
-    std::env::var("QUOTA_TOKEN_URL").unwrap_or_else(|_| Provider::Anthropic.spec().token_url)
+    std::env::var("QUOTA_TOKEN_URL")
+        .unwrap_or_else(|_| AnthropicAuthConfig::production().token_url)
 }
 #[cfg(not(debug_assertions))]
 fn token_url() -> String {
-    Provider::Anthropic.spec().token_url
+    AnthropicAuthConfig::production().token_url
 }
 
 /// Debug-only issuer override for a local OpenAI mock. Every OpenAI endpoint is
@@ -360,6 +407,52 @@ mod tests {
     use quota_core::snapshots::{self, CachedSnapshot};
 
     #[test]
+    fn an_existing_encrypted_store_is_selected_before_an_empty_keychain_can_be_probed() {
+        let mut path = std::env::temp_dir();
+        path.push(format!(
+            "quota-existing-fallback-{}-{}.json",
+            std::process::id(),
+            chrono::Utc::now().timestamp_nanos_opt().unwrap()
+        ));
+        std::fs::write(&path, b"encrypted store marker").unwrap();
+
+        let probed = std::sync::atomic::AtomicBool::new(false);
+        let (kind, opened) = select_startup_store(&path, || -> Result<(), ()> {
+            probed.store(true, std::sync::atomic::Ordering::SeqCst);
+            Ok(())
+        });
+
+        assert_eq!(kind, Some(StoreKind::EncryptedFileLocked));
+        assert!(opened.is_none());
+        assert!(
+            !probed.load(std::sync::atomic::Ordering::SeqCst),
+            "startup would select a newly available but empty keychain and quarantine every fallback account"
+        );
+
+        std::fs::remove_file(path).ok();
+    }
+
+    #[test]
+    fn a_fresh_install_still_probes_the_os_keychain() {
+        let mut path = std::env::temp_dir();
+        path.push(format!(
+            "quota-missing-fallback-{}-{}.json",
+            std::process::id(),
+            chrono::Utc::now().timestamp_nanos_opt().unwrap()
+        ));
+        std::fs::remove_file(&path).ok();
+
+        let probed = std::sync::atomic::AtomicBool::new(false);
+        let (kind, opened) = select_startup_store(&path, || -> Result<(), ()> {
+            probed.store(true, std::sync::atomic::Ordering::SeqCst);
+            Ok(())
+        });
+        assert_eq!(kind, None);
+        assert!(matches!(opened, Some(Ok(()))));
+        assert!(probed.load(std::sync::atomic::Ordering::SeqCst));
+    }
+
+    #[test]
     fn startup_restores_a_split_openai_credentials_snapshot() {
         let store = MemoryStore::default();
         let account_id = "startup-user";
@@ -370,8 +463,8 @@ mod tests {
             expires_at: chrono::Utc::now() + chrono::TimeDelta::hours(1),
             client_id: "test".into(),
             account_id: account_id.into(),
-            workspace_id: "startup-workspace".into(),
-            is_fedramp: false,
+            workspace_id: Some("startup-workspace".into()),
+            is_fedramp: Some(false),
         });
         save_tokens(&store, Provider::Openai, account_id, &tokens).unwrap();
 

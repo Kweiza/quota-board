@@ -9,7 +9,8 @@
 
 use crate::auth::callback::Callback;
 use crate::auth::pkce::{code_challenge_s256, random_urlsafe};
-use crate::auth::token::{AuthError, TokenHttp, EXPIRY_SKEW_SECS, OPENAI_DEAD_GRANT_CODE};
+use crate::auth::token::{AuthError, TokenHttp, EXPIRY_SKEW_SECS};
+use crate::provider::Provider;
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
 use chrono::{DateTime, TimeDelta, Utc};
 use serde::{Deserialize, Deserializer, Serialize};
@@ -20,7 +21,7 @@ pub const OPENAI_CLIENT_ID: &str = "app_EMoamEEZ73f0CkXaXp7hrann";
 pub const OPENAI_SCOPE: &str = "openid profile email offline_access";
 
 const DEVICE_AUTH_TIMEOUT: Duration = Duration::from_secs(15 * 60);
-const MIN_DEVICE_INTERVAL_SECS: u64 = 1;
+const DEFAULT_DEVICE_INTERVAL_SECS: u64 = 5;
 const MAX_DEVICE_INTERVAL_SECS: u64 = 15 * 60;
 
 fn protocol_error(message: &'static str) -> AuthError {
@@ -41,25 +42,12 @@ fn missing_claim(claim: &'static str) -> AuthError {
     ))
 }
 
-fn dead_refresh(status: u16, backend_code: Option<String>) -> AuthError {
-    AuthError::OAuth {
-        status,
-        code: Some(OPENAI_DEAD_GRANT_CODE.into()),
-        // The backend value is deliberately reduced to a known/non-known bit.
-        // A remote error field is not trusted to avoid echoing the submitted
-        // refresh token, and errors are printable by definition.
-        description: backend_code.map(|_| "OpenAI rejected the refresh grant permanently".into()),
-    }
-}
-
-fn changed_identity(field: &'static str) -> AuthError {
+fn changed_identity() -> AuthError {
     // A retry can never repair a token that rotated onto a different identity.
-    // Use the provider-only dead-chain marker so the scheduler quarantines it
-    // rather than attempting the same refresh forever.
-    AuthError::OAuth {
-        status: 409,
-        code: Some(OPENAI_DEAD_GRANT_CODE.into()),
-        description: Some(format!("the refreshed OpenAI identity changed its {field}")),
+    // A typed variant prevents an untrusted provider response from colliding
+    // with an internal string marker and quarantining the wrong provider.
+    AuthError::IdentityMismatch {
+        provider: Provider::Openai,
     }
 }
 
@@ -139,10 +127,15 @@ impl OpenAiPendingAuth {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct OpenAiIdentity {
     pub account_id: String,
-    pub workspace_id: String,
+    /// `chatgpt_account_id`, when the issuer selected a workspace. Bearer-only
+    /// usage requests are measured to work, so absence stays absent and is
+    /// never replaced with the user id.
+    pub workspace_id: Option<String>,
     pub email: String,
     pub plan_type: Option<String>,
-    pub is_fedramp: bool,
+    /// Present only when the claim was present. `Some(false)` and `None` are
+    /// distinct evidence even though both omit the request header.
+    pub is_fedramp: Option<bool>,
 }
 
 /// The persistable OpenAI token bundle.
@@ -156,9 +149,9 @@ pub struct OpenAiTokenSet {
     pub expires_at: DateTime<Utc>,
     pub client_id: String,
     pub account_id: String,
-    pub workspace_id: String,
+    pub workspace_id: Option<String>,
     #[serde(default)]
-    pub is_fedramp: bool,
+    pub is_fedramp: Option<bool>,
 }
 
 impl std::fmt::Debug for OpenAiTokenSet {
@@ -212,7 +205,11 @@ impl DeviceCode {
 }
 
 fn bounded_device_interval(seconds: u64) -> Duration {
-    Duration::from_secs(seconds.clamp(MIN_DEVICE_INTERVAL_SECS, MAX_DEVICE_INTERVAL_SECS))
+    Duration::from_secs(if seconds == 0 {
+        DEFAULT_DEVICE_INTERVAL_SECS
+    } else {
+        seconds.min(MAX_DEVICE_INTERVAL_SECS)
+    })
 }
 
 fn browser_authorize_url(
@@ -274,7 +271,7 @@ struct AuthClaims {
     #[serde(default)]
     chatgpt_plan_type: Option<String>,
     #[serde(default)]
-    chatgpt_account_is_fedramp: bool,
+    chatgpt_account_is_fedramp: Option<bool>,
 }
 
 #[derive(Deserialize)]
@@ -326,8 +323,7 @@ pub fn identity_from_id_token(id_token: &str) -> Result<OpenAiIdentity, AuthErro
     let account_id = nonempty(auth.chatgpt_user_id)
         .or_else(|| nonempty(auth.user_id))
         .ok_or_else(|| missing_claim("chatgpt_user_id"))?;
-    let workspace_id =
-        nonempty(auth.chatgpt_account_id).ok_or_else(|| missing_claim("chatgpt_account_id"))?;
+    let workspace_id = nonempty(auth.chatgpt_account_id);
     let email = nonempty(claims.email)
         .or_else(|| claims.profile.and_then(|profile| nonempty(profile.email)))
         .unwrap_or_default();
@@ -430,25 +426,26 @@ struct UserCodeResponse {
     device_auth_id: String,
     #[serde(alias = "usercode")]
     user_code: String,
-    #[serde(default, deserialize_with = "deserialize_interval")]
+    #[serde(default = "default_device_interval", deserialize_with = "deserialize_interval")]
     interval: u64,
+}
+
+fn default_device_interval() -> u64 {
+    DEFAULT_DEVICE_INTERVAL_SECS
 }
 
 fn deserialize_interval<'de, D>(deserializer: D) -> Result<u64, D::Error>
 where
     D: Deserializer<'de>,
 {
-    #[derive(Deserialize)]
-    #[serde(untagged)]
-    enum WireInterval {
-        Text(String),
-        Number(u64),
+    let value = serde_json::Value::deserialize(deserializer)?;
+    Ok(match value {
+        serde_json::Value::String(value) => value.trim().parse::<u64>().ok(),
+        serde_json::Value::Number(value) => value.as_u64(),
+        _ => None,
     }
-
-    match WireInterval::deserialize(deserializer)? {
-        WireInterval::Text(value) => value.trim().parse().map_err(serde::de::Error::custom),
-        WireInterval::Number(value) => Ok(value),
-    }
+    .filter(|seconds| *seconds > 0)
+    .unwrap_or(DEFAULT_DEVICE_INTERVAL_SECS))
 }
 
 /// Requests a device code from OpenAI's JSON device-auth endpoint.
@@ -569,39 +566,27 @@ struct RefreshResponse {
     refresh_token: Option<String>,
 }
 
-fn openai_refresh_error(error: AuthError) -> AuthError {
-    let AuthError::OAuth { status, code, .. } = &error else {
-        return error;
-    };
-    let normalized = code.as_deref().map(str::to_ascii_lowercase);
-    let terminal_code = matches!(
-        normalized.as_deref(),
-        Some(
-            "invalid_grant"
-                | "refresh_token_expired"
-                | "refresh_token_reused"
-                | "refresh_token_invalidated"
-        )
-    );
-    if *status == 401 || terminal_code {
-        dead_refresh(*status, normalized)
-    } else {
-        error
-    }
-}
-
-fn validate_unchanged_identity(
-    old: &OpenAiTokenSet,
-    new: &OpenAiIdentity,
+fn merge_refreshed_identity(
+    next: &mut OpenAiTokenSet,
+    new: OpenAiIdentity,
 ) -> Result<(), AuthError> {
-    if new.account_id != old.account_id {
-        return Err(changed_identity("account_id"));
+    if new.account_id != next.account_id {
+        return Err(changed_identity());
     }
-    if new.workspace_id != old.workspace_id {
-        return Err(changed_identity("workspace_id"));
+    if matches!(
+        (&next.workspace_id, &new.workspace_id),
+        (Some(old), Some(new)) if old != new
+    ) {
+        return Err(changed_identity());
     }
-    if new.is_fedramp != old.is_fedramp {
-        return Err(changed_identity("is_fedramp"));
+    // Login owns workspace discovery because it updates both credentials and
+    // Account metadata under one commit. Refresh can validate a known value,
+    // but must not enrich None -> Some in the token alone: a later login would
+    // still see legacy metadata and could replace that grant from a different
+    // workspace. Cloning `next` from the stored set also preserves a known
+    // workspace when the refreshed ID token omits the claim.
+    if new.is_fedramp.is_some() {
+        next.is_fedramp = new.is_fedramp;
     }
     Ok(())
 }
@@ -620,10 +605,7 @@ pub async fn refresh<H: TokenHttp>(
         refresh_token: &tokens.refresh_token,
     })
     .map_err(|_| protocol_error("the refresh request could not be encoded"))?;
-    let (response, _raw): (RefreshResponse, _) = http
-        .post_json(&endpoint, &body)
-        .await
-        .map_err(openai_refresh_error)?;
+    let (response, _raw): (RefreshResponse, _) = http.post_json(&endpoint, &body).await?;
 
     let access_token = response
         .access_token
@@ -631,29 +613,30 @@ pub async fn refresh<H: TokenHttp>(
     require_token(&access_token, "access_token")?;
     let expires_at = access_token_expiry(&access_token)?;
 
+    let mut next = OpenAiTokenSet {
+        access_token,
+        refresh_token: tokens.refresh_token.clone(),
+        expires_at,
+        client_id: tokens.client_id.clone(),
+        account_id: tokens.account_id.clone(),
+        workspace_id: tokens.workspace_id.clone(),
+        is_fedramp: tokens.is_fedramp,
+    };
+
     if let Some(id_token) = response.id_token.as_deref() {
         require_token(id_token, "id_token")?;
         let identity = identity_from_id_token(id_token)?;
-        validate_unchanged_identity(tokens, &identity)?;
+        merge_refreshed_identity(&mut next, identity)?;
     }
 
-    let refresh_token = match response.refresh_token {
+    next.refresh_token = match response.refresh_token {
         Some(value) => {
             require_token(&value, "refresh_token")?;
             value
         }
         None => tokens.refresh_token.clone(),
     };
-
-    Ok(OpenAiTokenSet {
-        access_token,
-        refresh_token,
-        expires_at,
-        client_id: tokens.client_id.clone(),
-        account_id: tokens.account_id.clone(),
-        workspace_id: tokens.workspace_id.clone(),
-        is_fedramp: tokens.is_fedramp,
-    })
+    Ok(next)
 }
 
 #[derive(Serialize)]
@@ -736,8 +719,8 @@ mod tests {
             expires_at: Utc::now() + TimeDelta::hours(1),
             client_id: OPENAI_CLIENT_ID.into(),
             account_id: "user-1".into(),
-            workspace_id: "workspace-1".into(),
-            is_fedramp: false,
+            workspace_id: Some("workspace-1".into()),
+            is_fedramp: Some(false),
         }
     }
 
@@ -806,17 +789,17 @@ mod tests {
     }
 
     #[test]
-    fn id_claims_follow_codex_precedence_and_require_both_identifiers() {
+    fn id_claims_follow_codex_precedence_and_require_the_user_identifier() {
         let identity =
             identity_from_id_token(&jwt(identity_payload("user-1", "ws-1", true))).unwrap();
         assert_eq!(
             identity,
             OpenAiIdentity {
                 account_id: "user-1".into(),
-                workspace_id: "ws-1".into(),
+                workspace_id: Some("ws-1".into()),
                 email: "top@example.invalid".into(),
                 plan_type: Some("plus".into()),
-                is_fedramp: true,
+                is_fedramp: Some(true),
             }
         );
 
@@ -832,15 +815,21 @@ mod tests {
         let identity = identity_from_id_token(&fallback).unwrap();
         assert_eq!(identity.account_id, "legacy-user");
         assert_eq!(identity.email, "profile@example.invalid");
+        assert_eq!(identity.workspace_id.as_deref(), Some("workspace"));
+        assert_eq!(identity.is_fedramp, None);
 
-        for payload in [
-            json!({ "https://api.openai.com/auth": { "chatgpt_account_id": "ws" } }),
-            json!({ "https://api.openai.com/auth": { "chatgpt_user_id": "user" } }),
-        ] {
-            let error = identity_from_id_token(&jwt(payload)).unwrap_err();
-            assert!(matches!(error, AuthError::Decode(_)));
-            assert!(error.to_string().contains("claim"));
-        }
+        let without_workspace = identity_from_id_token(&jwt(json!({
+            "https://api.openai.com/auth": { "chatgpt_user_id": "user" }
+        })))
+        .unwrap();
+        assert_eq!(without_workspace.workspace_id, None);
+
+        let error = identity_from_id_token(&jwt(json!({
+            "https://api.openai.com/auth": { "chatgpt_account_id": "ws" }
+        })))
+        .unwrap_err();
+        assert!(matches!(error, AuthError::Decode(_)));
+        assert!(error.to_string().contains("claim"));
     }
 
     #[tokio::test]
@@ -873,7 +862,7 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(identity.account_id, "user-1");
-        assert_eq!(tokens.workspace_id, "workspace-1");
+        assert_eq!(tokens.workspace_id.as_deref(), Some("workspace-1"));
 
         let request = captured.lock().unwrap().take().unwrap();
         assert_eq!(request.headers["user-agent"].to_str().unwrap(), USER_AGENT);
@@ -1021,30 +1010,128 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_refreshed_id_token_must_keep_account_workspace_and_fedramp_identity() {
-        for (account, workspace, fedramp, field) in [
-            ("other-user", "workspace-1", false, "account_id"),
-            ("user-1", "other-workspace", false, "workspace_id"),
-            ("user-1", "workspace-1", true, "is_fedramp"),
-        ] {
+    async fn a_refreshed_id_token_must_keep_account_identity() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "access_token": access_token(Utc::now().timestamp() + 3600),
+                "id_token": jwt(identity_payload("other-user", "workspace-1", false))
+            })))
+            .mount(&server)
+            .await;
+        let error = refresh(&ReqwestHttp::new().unwrap(), &cfg(&server), &token_set())
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            error,
+            AuthError::IdentityMismatch {
+                provider: Provider::Openai
+            }
+        ));
+    }
+
+    #[tokio::test]
+    async fn refresh_rejects_a_change_to_a_known_workspace() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "access_token": access_token(Utc::now().timestamp() + 3600),
+                "id_token": jwt(identity_payload("user-1", "other-workspace", false))
+            })))
+            .mount(&server)
+            .await;
+        let error = refresh(&ReqwestHttp::new().unwrap(), &cfg(&server), &token_set())
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            error,
+            AuthError::IdentityMismatch {
+                provider: Provider::Openai
+            }
+        ));
+    }
+
+    #[tokio::test]
+    async fn refresh_does_not_enrich_an_unknown_workspace() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "access_token": access_token(Utc::now().timestamp() + 3600),
+                "id_token": jwt(json!({
+                    "https://api.openai.com/auth": {
+                        "chatgpt_user_id": "user-1",
+                        "chatgpt_account_id": "workspace-1",
+                        "chatgpt_account_is_fedramp": true
+                    }
+                }))
+            })))
+            .mount(&server)
+            .await;
+
+        let mut old = token_set();
+        old.workspace_id = None;
+        old.is_fedramp = None;
+        let refreshed = refresh(&ReqwestHttp::new().unwrap(), &cfg(&server), &old)
+            .await
+            .unwrap();
+        assert_eq!(refreshed.workspace_id, None);
+        assert_eq!(refreshed.is_fedramp, Some(true));
+    }
+
+    #[tokio::test]
+    async fn refresh_preserves_a_known_workspace_when_the_new_claim_is_missing() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "access_token": access_token(Utc::now().timestamp() + 3600),
+                "id_token": jwt(json!({
+                    "https://api.openai.com/auth": {
+                        "chatgpt_user_id": "user-1"
+                    }
+                }))
+            })))
+            .mount(&server)
+            .await;
+
+        let old = token_set();
+        let refreshed = refresh(&ReqwestHttp::new().unwrap(), &cfg(&server), &old)
+            .await
+            .unwrap();
+        assert_eq!(refreshed.workspace_id, old.workspace_id);
+    }
+
+    #[tokio::test]
+    async fn refresh_preserves_missing_routing_claims_and_honors_explicit_false() {
+        for (fedramp_claim, expected_fedramp) in
+            [(None, Some(true)), (Some(false), Some(false))]
+        {
             let server = MockServer::start().await;
+            let mut auth = json!({ "chatgpt_user_id": "user-1" });
+            if let Some(value) = fedramp_claim {
+                auth.as_object_mut()
+                    .unwrap()
+                    .insert("chatgpt_account_is_fedramp".into(), json!(value));
+            }
             Mock::given(method("POST"))
                 .respond_with(ResponseTemplate::new(200).set_body_json(json!({
                     "access_token": access_token(Utc::now().timestamp() + 3600),
-                    "id_token": jwt(identity_payload(account, workspace, fedramp))
+                    "id_token": jwt(json!({ "https://api.openai.com/auth": auth }))
                 })))
                 .mount(&server)
                 .await;
-            let error = refresh(&ReqwestHttp::new().unwrap(), &cfg(&server), &token_set())
+
+            let mut old = token_set();
+            old.is_fedramp = Some(true);
+            let refreshed = refresh(&ReqwestHttp::new().unwrap(), &cfg(&server), &old)
                 .await
-                .unwrap_err();
-            assert!(
-                error.is_dead_grant(),
-                "identity change was treated as recoverable: {error}"
+                .unwrap();
+            assert_eq!(
+                refreshed.workspace_id, old.workspace_id,
+                "an omitted workspace erased known routing context"
             );
-            assert!(
-                error.to_string().contains(field),
-                "wrong mismatch was reported: {error}"
+            assert_eq!(
+                refreshed.is_fedramp, expected_fedramp,
+                "missing and explicit false FedRAMP claims were collapsed"
             );
         }
     }
@@ -1074,7 +1161,7 @@ mod tests {
                 .await
                 .unwrap_err();
             assert_eq!(
-                error.is_dead_grant(),
+                error.is_dead_grant_for(Provider::Openai),
                 dead,
                 "wrong classification for HTTP {status}: {error}"
             );
@@ -1141,7 +1228,7 @@ mod tests {
             format!("{}/codex/device", server.uri())
         );
         assert_eq!(device.user_code, "ABCD-EFGH");
-        assert_eq!(device.poll_interval(), Duration::from_secs(1));
+        assert_eq!(device.poll_interval(), Duration::from_secs(5));
         assert!(device.expires_at > Utc::now() + TimeDelta::minutes(14));
         let debug = format!("{device:?}");
         assert!(!debug.contains("ABCD-EFGH"));
@@ -1156,13 +1243,44 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn a_missing_device_poll_interval_uses_the_safe_default() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/api/accounts/deviceauth/usercode"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "device_auth_id": "device-secret",
+                "user_code": "ABCD-EFGH"
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let device = request_device_code(&ReqwestHttp::new().unwrap(), &cfg(&server))
+            .await
+            .unwrap();
+        assert_eq!(device.poll_interval(), Duration::from_secs(5));
+    }
+
     #[test]
     fn device_poll_interval_is_bounded_at_both_ends() {
-        assert_eq!(bounded_device_interval(0), Duration::from_secs(1));
+        assert_eq!(bounded_device_interval(0), Duration::from_secs(5));
         assert_eq!(
             bounded_device_interval(u64::MAX),
             Duration::from_secs(15 * 60)
         );
+    }
+
+    #[test]
+    fn missing_zero_and_malformed_device_intervals_use_the_default() {
+        for body in [
+            json!({ "device_auth_id": "id", "user_code": "code" }),
+            json!({ "device_auth_id": "id", "user_code": "code", "interval": 0 }),
+            json!({ "device_auth_id": "id", "user_code": "code", "interval": "nope" }),
+        ] {
+            let parsed: UserCodeResponse = serde_json::from_value(body).unwrap();
+            assert_eq!(parsed.interval, DEFAULT_DEVICE_INTERVAL_SECS);
+        }
     }
 
     #[tokio::test]

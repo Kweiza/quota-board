@@ -31,6 +31,8 @@
      "weekly (Opus)" is 75.31px, "weekly (Fable)" 75.81px and
      "weekly (Sonnet)" 84.69px, against 85.8px of track. A longer name still
      clips, and then the ellipsis plus title/aria-label carry the full text.
+     Codex additional-bucket labels put duration first, so right-side clipping
+     cannot erase the part that distinguishes the bucket's two windows.
      The reset column is 1fr and right-aligned rather than a fixed width: a
      too-narrow fixed column did not overflow, it *wrapped*, which doubled
      every bar row from 13px to 26px. */

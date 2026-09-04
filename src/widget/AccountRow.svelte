@@ -81,22 +81,25 @@
     {#if isStale && state.kind === 'stale'}
       <span class="age">{relativeAge(new Date(state.fetched_at), now)}</span>
     {/if}
-    <!-- Outside the state branches below, unlike the re-login and unlock
-         buttons: those are one state's remedy, this applies to every row.
+    <!-- Outside the display-state branches below because every *recoverable*
+         state can use it. AUTH_DEAD is the one exception: the core must not
+         retry a dead grant and the row already carries its re-login remedy.
          `aria-label` rather than visible text because the glyph is the whole
          control at this size; the name matches the settings window's button
          verbatim so the two cannot drift. `enableDrag` in Widget.svelte skips
          `closest('button')`, which is what keeps this clickable inside a card
          that is itself the drag handle. -->
-    <button
-      class="refresh"
-      class:busy
-      type="button"
-      aria-label={refreshLabel}
-      aria-busy={busy}
-      title={busy ? 'Refreshing…' : 'Refresh now'}
-      disabled={busy}
-      on:click={refresh}>↻</button>
+    {#if state.kind !== 'auth_dead'}
+      <button
+        class="refresh"
+        class:busy
+        type="button"
+        aria-label={refreshLabel}
+        aria-busy={busy}
+        title={busy ? 'Refreshing…' : 'Refresh now'}
+        disabled={busy}
+        on:click={refresh}>↻</button>
+    {/if}
   </div>
 
   <!-- The bar branch is explicit rather than the {:else} fallback: an

@@ -2,8 +2,8 @@ use chrono::Utc;
 use quota_core::accounts::{Account, AccountStore};
 use quota_core::auth::pkce::PendingAuth;
 use quota_core::auth::stored::{
-    delete_tokens, ensure_fresh, load_tokens, refresh_after_unauthorized, save_tokens, AuthConfigs,
-    RefreshLocks, StoredTokenError, StoredTokens,
+    delete_tokens, ensure_fresh, refresh_after_unauthorized, restore_tokens, save_tokens,
+    snapshot_tokens, AuthConfigs, CredentialSnapshot, RefreshLocks, StoredTokens,
 };
 use quota_core::auth::token::ReqwestHttp;
 use quota_core::provider::Provider;
@@ -116,7 +116,7 @@ pub struct AppState {
     pub(crate) login_commit: Mutex<()>,
     pub http: ReqwestHttp,
     /// Both protocols' refresh and revocation configuration. OpenAI is not a
-    /// `ProviderSpec`: its root-issuer endpoints and wire bodies differ from
+    /// `AnthropicAuthConfig`: its root-issuer endpoints and wire bodies differ from
     /// Anthropic's at every step.
     pub auth_configs: AuthConfigs,
     /// Per-account refresh locks (Task 10b). **Exactly one instance may exist
@@ -198,7 +198,9 @@ pub struct SecretsHandle {
 /// *more* load-bearing, not less: the two states carry different remedies and
 /// nothing else on the wire tells them apart, so a single "is it locked"
 /// boolean collapses the one distinction the design document forbids
-/// collapsing.
+/// collapsing. `EncryptedFileLocked` is the fourth operational discriminant:
+/// it is not a fourth store error, but the persisted backend choice awaiting
+/// its per-process passphrase.
 #[derive(Clone, Copy, PartialEq, Eq, Debug, serde::Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum StoreKind {
@@ -206,6 +208,9 @@ pub enum StoreKind {
     Keychain,
     /// §9.2's fallback: the encrypted file is open.
     EncryptedFile,
+    /// The encrypted fallback exists and is the selected credential backend,
+    /// but its passphrase has not been entered in this process yet.
+    EncryptedFileLocked,
     /// §9.2's `NO_BACKEND`. No credential store is registered on this machine
     /// at all — the passphrase fallback is the remedy.
     NoBackend,
@@ -230,15 +235,17 @@ impl StoreKind {
     }
 }
 
-/// Stands in for the token store when §9.2's keychain probe fails and no
-/// fallback has been opened yet. Every account then renders `SECRETS_LOCKED`,
+/// Stands in for the token store when §9.2's fallback needs a passphrase. That
+/// is either a first fallback after `NO_BACKEND`, or the encrypted backend
+/// deliberately selected on an earlier run. Every account then renders
+/// `SECRETS_LOCKED`,
 /// which is §7.1's state carrying the "unlock" affordance — and that click now
 /// leads somewhere: the settings window's passphrase form calls
 /// `unlock_secrets`, which opens §9.2's encrypted file and swaps it in through
-/// `AppState::install_store`. It is only offered when `StoreKind` says
-/// `NoBackend`: a keychain that merely did not answer arrives as
-/// `KeychainLocked`, and a passphrase there would open a different, empty
-/// store. The alternatives were a panic and a blank widget; both are worse.
+/// `AppState::install_fallback_store`. It is offered for `NoBackend` and
+/// `EncryptedFileLocked`; a keychain that merely did not answer arrives as
+/// `KeychainLocked`, and a passphrase there would open a different store. The
+/// alternatives were a panic and a blank widget; both are worse.
 pub struct LockedStore;
 
 impl SecretStore for LockedStore {
@@ -287,15 +294,27 @@ async fn rollback_tokens(
     store: Arc<dyn SecretStore>,
     provider: Provider,
     account_id: String,
-    previous: Option<StoredTokens>,
+    snapshot: CredentialSnapshot,
 ) -> Result<(), String> {
-    tauri::async_runtime::spawn_blocking(move || match previous {
-        Some(previous) => save_tokens(store.as_ref(), provider, &account_id, &previous),
-        None => delete_tokens(store.as_ref(), provider, &account_id).map(|_| ()),
+    tauri::async_runtime::spawn_blocking(move || {
+        if let Err(restore_error) = restore_tokens(store.as_ref(), &snapshot) {
+            // A failed restore may itself have left a split credential. Remove
+            // every provider-owned entry as the last safe state; retaining no
+            // credential is recoverable through login, while retaining an
+            // orphaned rotating subset is not.
+            return match delete_tokens(store.as_ref(), provider, &account_id) {
+                Ok(_) => Err(format!(
+                    "token rollback failed ({restore_error}); partial credentials were deleted"
+                )),
+                Err(cleanup_error) => Err(format!(
+                    "token rollback failed ({restore_error}); partial credential cleanup also failed ({cleanup_error})"
+                )),
+            };
+        }
+        Ok(())
     })
     .await
     .map_err(|e| format!("token rollback task failed: {e}"))?
-    .map_err(|e| format!("token rollback failed: {e}"))
 }
 
 impl AppState {
@@ -314,15 +333,19 @@ impl AppState {
         self.secrets.read().unwrap_or_else(|e| e.into_inner()).kind
     }
 
-    /// Installs the fallback only while no backend is open. The check and swap
-    /// share one write guard so two concurrent passphrase commands cannot leave
-    /// the process with two independently cached encrypted-file stores.
+    /// Installs the fallback only while it is the selected unopened backend.
+    /// The check and swap share one write guard so two concurrent passphrase
+    /// commands cannot leave the process with two independently cached
+    /// encrypted-file stores.
     pub fn install_fallback_store(
         &self,
         store: Arc<dyn SecretStore>,
     ) -> Result<Arc<dyn SecretStore>, Arc<dyn SecretStore>> {
         let mut current = self.secrets.write().unwrap_or_else(|e| e.into_inner());
-        if current.kind != StoreKind::NoBackend {
+        if !matches!(
+            current.kind,
+            StoreKind::NoBackend | StoreKind::EncryptedFileLocked
+        ) {
             return Err(store);
         }
         current.kind = StoreKind::EncryptedFile;
@@ -408,7 +431,9 @@ impl AppState {
     ) -> Result<(), String> {
         let provider = tokens.provider();
         let workspace_id = tokens.workspace_id().map(str::to_string);
-        let is_fedramp = tokens.is_fedramp();
+        // Metadata keeps the historical boolean representation; the token
+        // store retains `None` separately and is the authority for routing.
+        let is_fedramp = tokens.is_fedramp().unwrap_or(false);
 
         // Login and refresh share this lock. Without it, a refresh can finish
         // between the new credential write and the metadata write and replace
@@ -441,20 +466,12 @@ impl AppState {
         let previous = {
             let store = Arc::clone(&store);
             let id = account_id.to_string();
-            match tauri::async_runtime::spawn_blocking(move || {
-                load_tokens(store.as_ref(), provider, &id)
+            tauri::async_runtime::spawn_blocking(move || {
+                snapshot_tokens(store.as_ref(), provider, &id)
             })
             .await
             .map_err(|e| format!("the token store task failed: {e}"))?
-            {
-                Ok(tokens) => Some(tokens),
-                // Re-login is the remedy for both an absent credential and a
-                // corrupt/partial one. Neither has a trustworthy value that
-                // can be restored, so a later rollback removes the attempted
-                // set completely.
-                Err(StoredTokenError::Missing | StoredTokenError::Corrupt) => None,
-                Err(e) => return Err(format!("the existing token could not be read: {e}")),
-            }
+            .map_err(|e| format!("the existing token could not be snapshotted: {e}"))?
         };
 
         let save_result = {
@@ -472,7 +489,7 @@ impl AppState {
                 Arc::clone(&store),
                 provider,
                 account_id.to_string(),
-                previous.clone(),
+                previous,
             )
             .await;
             return match rollback {
@@ -513,20 +530,10 @@ impl AppState {
                         sched.make_due_now(provider, account_id);
                         None
                     }
-                    Err(e) => {
-                        // `AccountStore::upsert` mutates memory before flushing.
-                        // Restore the in-memory view too; the second flush may
-                        // fail for the same reason and is deliberately ignored.
-                        match existing {
-                            Some(previous) => {
-                                let _ = accounts.upsert(previous);
-                            }
-                            None => {
-                                let _ = accounts.remove(provider, account_id);
-                            }
-                        }
-                        Some(e)
-                    }
+                    // `AccountStore::upsert` restores its complete in-memory
+                    // before-image when flushing fails, so the metadata and
+                    // scheduler both remain untouched on this arm.
+                    Err(e) => Some(e),
                 },
             }
         };
@@ -554,6 +561,36 @@ impl AppState {
     pub async fn poll_one(&self, provider: Provider, uuid: &str) {
         let _permit = self.poll_permit.lock().await;
         self.poll_guarded(provider, uuid).await;
+    }
+
+    /// The manual-refresh entry point. The optimistic checks in the command
+    /// keep an already-refused press responsive; these checks under the global
+    /// permit are authoritative.
+    ///
+    /// A queued press can otherwise pass its first check, wait behind another
+    /// request that establishes `Retry-After`, and then immediately violate the
+    /// new wait. `AUTH_DEAD` is refused for the same reason §7.2 quarantines it:
+    /// only re-login can repair that grant, and another refresh burns a request
+    /// that is already known to fail.
+    pub async fn poll_one_manual(
+        &self,
+        provider: Provider,
+        uuid: &str,
+    ) -> (Option<quota_core::model::AccountState>, bool) {
+        let _permit = self.poll_permit.lock().await;
+        {
+            let sched = self.scheduler.lock().await;
+            match sched.state(provider, uuid) {
+                Some(state @ quota_core::model::AccountState::Throttled { .. })
+                | Some(state @ quota_core::model::AccountState::AuthDead) => {
+                    return (Some(state), false)
+                }
+                _ => {}
+            }
+        }
+
+        self.poll_guarded(provider, uuid).await;
+        (self.scheduler.lock().await.state(provider, uuid), true)
     }
 
     async fn poll_guarded(&self, provider: Provider, uuid: &str) {
@@ -626,6 +663,7 @@ impl AppState {
             &self.http,
             provider,
             usage_url,
+            uuid,
             &fetched_access,
             fetched_workspace.as_deref(),
             fetched_is_fedramp,
@@ -659,6 +697,7 @@ impl AppState {
                         &self.http,
                         provider,
                         usage_url,
+                        uuid,
                         &fetched_access,
                         fetched_workspace.as_deref(),
                         fetched_is_fedramp,
@@ -799,11 +838,11 @@ pub(crate) mod tests {
     use super::*;
     use quota_core::accounts::Account;
     use quota_core::auth::openai::{OpenAiAuthConfig, OpenAiTokenSet};
-    use quota_core::auth::token::TokenSet;
+    use quota_core::auth::stored::{load_tokens, StoredTokenError};
+    use quota_core::auth::token::{AnthropicAuthConfig, TokenSet};
     use quota_core::model::AccountState;
     use quota_core::provider::{
         openai_access_token_key, openai_refresh_token_key, openai_token_meta_key, token_key,
-        ProviderSpec,
     };
     use quota_core::scheduler::PollPolicy;
     use quota_core::secrets::timeout::TimeoutStore;
@@ -917,8 +956,8 @@ pub(crate) mod tests {
             expires_at: Utc::now() + chrono::TimeDelta::hours(1),
             client_id: "test".into(),
             account_id: account_id.into(),
-            workspace_id: workspace_id.into(),
-            is_fedramp: false,
+            workspace_id: Some(workspace_id.into()),
+            is_fedramp: Some(false),
         })
     }
 
@@ -958,9 +997,9 @@ pub(crate) mod tests {
             login_commit: Mutex::new(()),
             http: quota_core::auth::token::ReqwestHttp::new().unwrap(),
             auth_configs: AuthConfigs {
-                anthropic: ProviderSpec {
+                anthropic: AnthropicAuthConfig {
                     token_url: "http://127.0.0.1:1/never".into(),
-                    ..Provider::Anthropic.spec()
+                    ..AnthropicAuthConfig::production()
                 },
                 openai: OpenAiAuthConfig {
                     issuer: "http://127.0.0.1:1/never".into(),
@@ -1753,7 +1792,8 @@ pub(crate) mod tests {
             .and(header("chatgpt-account-id", "workspace-a"))
             .and(header("x-openai-fedramp", "true"))
             .respond_with(ResponseTemplate::new(200).set_body_string(
-                r#"{"rate_limit":{"primary_window":{"used_percent":10,
+                r#"{"user_id":"codex-a","account_id":"workspace-a",
+                    "rate_limit":{"primary_window":{"used_percent":10,
                     "limit_window_seconds":604800,"reset_after_seconds":604800,
                     "reset_at":9999999999},"secondary_window":null}}"#,
             ))
@@ -1774,8 +1814,8 @@ pub(crate) mod tests {
             expires_at: Utc::now() + chrono::TimeDelta::hours(1),
             client_id: "test".into(),
             account_id: "codex-a".into(),
-            workspace_id: "workspace-a".into(),
-            is_fedramp: true,
+            workspace_id: Some("workspace-a".into()),
+            is_fedramp: Some(true),
         });
         save_tokens(state.secrets().as_ref(), Provider::Openai, "codex-a", &tokens).unwrap();
         state.scheduler.lock().await.add(Provider::Openai, "codex-a");
@@ -1841,8 +1881,8 @@ pub(crate) mod tests {
             expires_at: Utc::now() - chrono::TimeDelta::seconds(1),
             client_id: "test".into(),
             account_id: "codex-a".into(),
-            workspace_id: "workspace-a".into(),
-            is_fedramp: false,
+            workspace_id: Some("workspace-a".into()),
+            is_fedramp: Some(false),
         });
         save_tokens(state.secrets().as_ref(), Provider::Openai, "codex-a", &tokens).unwrap();
         state.scheduler.lock().await.add(Provider::Openai, "codex-a");

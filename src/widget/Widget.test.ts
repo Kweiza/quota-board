@@ -86,7 +86,7 @@ describe('Widget refresh', () => {
     expect(refreshed).toEqual([['uuid-home', 'openai']])
   })
 
-  it('gives every row its own button', () => {
+  it('gives every retryable row its own button', () => {
     render(Widget, { accounts: two, warning: null })
     expect(screen.getAllByRole('button', { name: /^Refresh (Claude|Codex) account/ })).toHaveLength(2)
   })

@@ -153,6 +153,11 @@ impl AccountStore {
     /// Update by (provider, account_id), or append if it is new.
     pub fn upsert(&mut self, mut account: Account) -> Result<(), AccountError> {
         self.validate_upsert(&account)?;
+        // Match `remove`'s transactional in-memory contract: callers that get an
+        // error must keep seeing the last metadata state that actually reached
+        // disk. Login rollback in particular cannot safely infer whether this
+        // was an insert or replacement after a failed flush.
+        let previous = self.accounts.clone();
         // The pair, not the id alone: two providers may issue the same string,
         // and collapsing them would make adding the second account silently
         // replace the first.
@@ -170,10 +175,20 @@ impl AccountStore {
                 self.accounts.push(account);
             }
         }
-        self.flush()
+        if let Err(error) = self.flush() {
+            self.accounts = previous;
+            return Err(error);
+        }
+        Ok(())
     }
 
     pub fn remove(&mut self, provider: Provider, account_id: &str) -> Result<bool, AccountError> {
+        // `flush` can fail after the in-memory mutation (full disk, permissions,
+        // a transient rename refusal). Keep a complete before-image so a caller
+        // receiving `Err` can truthfully retry the same removal in this process.
+        // Restoring only the removed row would not restore the sort orders this
+        // method rewrites for every row after it.
+        let previous = self.accounts.clone();
         let before = self.accounts.len();
         self.accounts
             .retain(|a| !(a.account_id == account_id && a.provider == provider));
@@ -182,7 +197,10 @@ impl AccountStore {
             for (i, a) in self.accounts.iter_mut().enumerate() {
                 a.sort_order = i as u32;
             }
-            self.flush()?;
+            if let Err(error) = self.flush() {
+                self.accounts = previous;
+                return Err(error);
+            }
         }
         Ok(removed)
     }
@@ -191,6 +209,11 @@ impl AccountStore {
     /// are ignored, and accounts missing from the argument are appended
     /// afterwards in their original order.
     pub fn reorder(&mut self, keys: &[(Provider, String)]) -> Result<(), AccountError> {
+        // The UI applies the proposed order optimistically and reloads this
+        // same store when persistence fails. Keep its before-image just like
+        // `upsert` and `remove`, or that reload repeats an order that never
+        // reached disk and presents the failed write as successful.
+        let previous = self.accounts.clone();
         let mut ordered: Vec<Account> = Vec::with_capacity(self.accounts.len());
         for (provider, id) in keys {
             if let Some(i) = self
@@ -206,7 +229,11 @@ impl AccountStore {
             a.sort_order = i as u32;
         }
         self.accounts = ordered;
-        self.flush()
+        if let Err(error) = self.flush() {
+            self.accounts = previous;
+            return Err(error);
+        }
+        Ok(())
     }
 
     /// Build a fresh random temp path on every write. Sharing one fixed name
@@ -451,6 +478,87 @@ mod tests {
         assert!(s.remove(Provider::Anthropic, "uuid-a").unwrap());
         assert!(!s.remove(Provider::Anthropic, "uuid-a").unwrap());
         std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn a_failed_upsert_restores_the_last_in_memory_state_that_reached_disk() {
+        let root = tmp();
+        let moved = root.with_extension("moved");
+        std::fs::create_dir_all(&root).unwrap();
+        let path = root.join("accounts.json");
+        let mut s = AccountStore::load(&path);
+        s.upsert(acc("uuid-a", "original")).unwrap();
+
+        std::fs::rename(&root, &moved).unwrap();
+        std::fs::write(&root, b"blocks the account directory").unwrap();
+        assert!(s.upsert(acc("uuid-a", "changed")).is_err());
+        assert_eq!(s.list().len(), 1);
+        assert_eq!(s.list()[0].display_label, "original");
+
+        std::fs::remove_file(&root).ok();
+        std::fs::rename(&moved, &root).ok();
+        std::fs::remove_file(path).ok();
+        std::fs::remove_dir(root).ok();
+    }
+
+    #[test]
+    fn a_failed_remove_restores_the_row_and_every_sort_order_for_retry() {
+        let root = tmp();
+        let moved = root.with_extension("moved");
+        std::fs::create_dir_all(&root).unwrap();
+        let path = root.join("accounts.json");
+        let mut s = AccountStore::load(&path);
+        for (id, label) in [("uuid-a", "a"), ("uuid-b", "b"), ("uuid-c", "c")] {
+            s.upsert(acc(id, label)).unwrap();
+        }
+
+        std::fs::rename(&root, &moved).unwrap();
+        std::fs::write(&root, b"blocks the account directory").unwrap();
+        assert!(s.remove(Provider::Anthropic, "uuid-b").is_err());
+        let state: Vec<_> = s
+            .list()
+            .iter()
+            .map(|account| (account.account_id.as_str(), account.sort_order))
+            .collect();
+        assert_eq!(state, vec![("uuid-a", 0), ("uuid-b", 1), ("uuid-c", 2)]);
+
+        std::fs::remove_file(&root).ok();
+        std::fs::rename(&moved, &root).ok();
+        std::fs::remove_file(path).ok();
+        std::fs::remove_dir(root).ok();
+    }
+
+    #[test]
+    fn a_failed_reorder_restores_the_visible_order_and_sort_values() {
+        let root = tmp();
+        let moved = root.with_extension("moved");
+        std::fs::create_dir_all(&root).unwrap();
+        let path = root.join("accounts.json");
+        let mut s = AccountStore::load(&path);
+        for (id, label) in [("uuid-a", "a"), ("uuid-b", "b"), ("uuid-c", "c")] {
+            s.upsert(acc(id, label)).unwrap();
+        }
+
+        std::fs::rename(&root, &moved).unwrap();
+        std::fs::write(&root, b"blocks the account directory").unwrap();
+        assert!(s
+            .reorder(&[
+                (Provider::Anthropic, "uuid-c".into()),
+                (Provider::Anthropic, "uuid-a".into()),
+                (Provider::Anthropic, "uuid-b".into()),
+            ])
+            .is_err());
+        let state: Vec<_> = s
+            .list()
+            .iter()
+            .map(|account| (account.account_id.as_str(), account.sort_order))
+            .collect();
+        assert_eq!(state, vec![("uuid-a", 0), ("uuid-b", 1), ("uuid-c", 2)]);
+
+        std::fs::remove_file(&root).ok();
+        std::fs::rename(&moved, &root).ok();
+        std::fs::remove_file(path).ok();
+        std::fs::remove_dir(root).ok();
     }
 
     #[test]

@@ -14,6 +14,12 @@ pub enum ParseError {
     /// silently blank when the endpoint changes shape, with nobody noticing.
     #[error("usage fields were present but could not be parsed")]
     UnreadableSource,
+    /// A provider returned readable usage for an identity other than the one
+    /// requested, or omitted the identity needed to prove that it belongs to
+    /// this row. Values from that body must never be displayed under a guessed
+    /// account.
+    #[error("usage response identity could not be verified")]
+    UnverifiedIdentity,
 }
 
 /// One ISO-8601 string to UTC. None on failure — the caller drops that window.

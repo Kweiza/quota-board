@@ -1,6 +1,7 @@
-import { render, screen } from '@testing-library/svelte'
+import { render, screen, waitFor } from '@testing-library/svelte'
 import { describe, expect, it } from 'vitest'
 import AccountList from './AccountList.svelte'
+import { accountKey } from '../lib/types'
 import type { AccountView } from '../lib/types'
 
 /**
@@ -86,10 +87,69 @@ describe('AccountList', () => {
     const refreshed: Array<[string, string]> = []
     render(AccountList, {
       accounts: two,
-      onRefresh: (accountId, provider) => refreshed.push([accountId, provider]),
+      onRefresh: (accountId, provider) => {
+        refreshed.push([accountId, provider])
+      },
     })
     screen.getByRole('button', { name: 'Refresh Codex account Personal' }).click()
     expect(refreshed).toEqual([['uuid-home', 'openai']])
+  })
+
+  it('allows only one in-flight refresh per provider and account', async () => {
+    let release = (): void => {}
+    const pending = new Promise<void>((resolve) => {
+      release = resolve
+    })
+    let starts = 0
+    render(AccountList, {
+      accounts: two,
+      onRefresh: () => {
+        starts += 1
+        return pending
+      },
+    })
+    const button = screen.getByRole('button', {
+      name: 'Refresh Codex account Personal',
+    }) as HTMLButtonElement
+
+    button.click()
+    await waitFor(() => {
+      expect(button.disabled).toBe(true)
+      expect(button.getAttribute('aria-busy')).toBe('true')
+      expect(button.getAttribute('aria-label')).toBe('Refreshing Codex account Personal')
+    })
+    button.click()
+    expect(starts).toBe(1)
+
+    release()
+    await waitFor(() => {
+      expect(button.disabled).toBe(false)
+      expect(button.getAttribute('aria-busy')).toBe('false')
+    })
+  })
+
+  it('disables refresh for auth_dead and names the provider-specific re-login remedy', () => {
+    const dead = account('dead-user', 'Work', 'same@example.com', 'openai')
+    dead.state = { kind: 'auth_dead' }
+    let refreshes = 0
+    render(AccountList, {
+      accounts: [dead],
+      throttledUntil: {
+        [accountKey(dead.account_id, dead.provider)]: '2099-01-01T00:00:00Z',
+      },
+      onRefresh: () => {
+        refreshes += 1
+      },
+    })
+
+    const button = screen.getByRole('button', {
+      name: 'Refresh Codex account Work',
+    }) as HTMLButtonElement
+    expect(button.disabled).toBe(true)
+    expect(screen.getByText('Re-login with Add Codex account below.')).toBeTruthy()
+    expect(screen.queryByText(/throttled, available after/)).toBeNull()
+    button.click()
+    expect(refreshes).toBe(0)
   })
 
   it('reports a move as an id and provider, plus a direction, not as an index', () => {

@@ -12,7 +12,9 @@ import {
   isSettingsWindow,
   lastResponse,
   onAccountsChanged,
+  onAuthCompleted,
   onAuthFailed,
+  onManualFallback,
   openSettings,
   refreshAccount,
   renameAccount,
@@ -222,11 +224,15 @@ describe('openSettings', () => {
  * rejects at runtime with nothing on the JS side to catch it.
  */
 describe('command wrappers', () => {
-  it('beginLogin invokes the begin_login command with the requested provider and returns the URL', async () => {
-    const url = 'https://claude.ai/oauth/authorize?code_challenge=abc'
-    const calls = recordArgs((cmd) => (cmd === 'begin_login' ? url : null))
+  it('beginLogin invokes the begin_login command and preserves its tagged provider flow', async () => {
+    const start = {
+      attempt_id: 7,
+      kind: 'codex_browser',
+      authorize_url: 'https://auth.openai.com/oauth/authorize?code_challenge=abc',
+    }
+    const calls = recordArgs((cmd) => (cmd === 'begin_login' ? start : null))
 
-    await expect(beginLogin('openai')).resolves.toBe(url)
+    await expect(beginLogin('openai')).resolves.toBe(start)
 
     expect(calls).toEqual([{ cmd: 'begin_login', args: { provider: 'openai' } }])
   })
@@ -348,13 +354,47 @@ describe('event subscriptions', () => {
     expect(fn).toHaveBeenCalledOnce()
   })
 
-  it('onAuthFailed hands the callback the message, not the event envelope', async () => {
+  it('onAuthFailed hands the callback the correlated failure, not the event envelope', async () => {
     withEvents()
     const fn = vi.fn()
     await onAuthFailed(fn)
 
-    await emit('auth://failed', 'the login timed out')
+    const failure = {
+      attempt_id: 7,
+      provider: 'openai',
+      message: 'the login timed out',
+    }
 
-    expect(fn).toHaveBeenCalledExactlyOnceWith('the login timed out')
+    await emit('auth://failed', failure)
+
+    expect(fn).toHaveBeenCalledExactlyOnceWith(failure)
+  })
+
+  it('onAuthCompleted hands the callback the correlated result, not the event envelope', async () => {
+    withEvents()
+    const fn = vi.fn()
+    await onAuthCompleted(fn)
+
+    const completed = { attempt_id: 7, provider: 'openai' }
+
+    await emit('auth://completed', completed)
+
+    expect(fn).toHaveBeenCalledExactlyOnceWith(completed)
+  })
+
+  it('onManualFallback preserves the attempt and provider correlation fields', async () => {
+    withEvents()
+    const fn = vi.fn()
+    await onManualFallback(fn)
+
+    const fallback = {
+      attempt_id: 8,
+      provider: 'anthropic',
+      url: 'https://claude.example/manual',
+      reason: 'the callback timed out',
+    } as const
+    await emit('auth://manual-fallback', fallback)
+
+    expect(fn).toHaveBeenCalledExactlyOnceWith(fallback)
   })
 })
