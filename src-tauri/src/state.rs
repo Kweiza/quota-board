@@ -1,25 +1,34 @@
 use chrono::Utc;
 use quota_core::accounts::{Account, AccountStore};
 use quota_core::auth::pkce::PendingAuth;
-use quota_core::auth::stored::{ensure_fresh, RefreshLocks};
+use quota_core::auth::stored::{
+    delete_tokens, ensure_fresh, load_tokens, refresh_after_unauthorized, save_tokens, AuthConfigs,
+    RefreshLocks, StoredTokenError, StoredTokens,
+};
 use quota_core::auth::token::ReqwestHttp;
-use quota_core::provider::{Provider, ProviderSpec};
+use quota_core::provider::Provider;
 use quota_core::scheduler::{
     persist_last_ok, persist_quarantine, FailureKind, Scheduler, SystemClock,
 };
 use quota_core::secrets::{SecretError, SecretStore};
 use quota_core::settings::SettingsStore;
 use quota_core::snapshots::{fingerprint, save as save_snapshot};
-use quota_core::usage::http::{fetch_usage_captured_at, UsageError};
+use quota_core::usage::http::{fetch_usage_captured_for_account_at, UsageError};
 use quota_core::usage::raw::{RawLog, RawResponse};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, RwLock};
 use tauri::{Emitter, Manager};
-use tokio::sync::Mutex;
+use tokio::sync::{oneshot, Mutex};
+
+pub(crate) struct PendingManual {
+    pub generation: u64,
+    pub pending: PendingAuth,
+    pub cancel: Option<oneshot::Sender<()>>,
+}
 
 /// **Lock order: `scheduler` before `accounts`, never the reverse, and never
-/// hold either across `ensure_fresh` or `fetch_usage_captured_at`.** Both are `tokio`
+/// hold either across `ensure_fresh` or the usage fetch.** Both are `tokio`
 /// mutexes and neither is reentrant. Task 18 adds commands that touch the same
 /// two stores; a command taking them in the other order deadlocks against the
 /// polling loop. `crates/core/src/accounts.rs:36-47` carries the matching
@@ -40,7 +49,7 @@ pub struct AppState {
     /// §9.2's token store, swappable at runtime.
     ///
     /// **`pub(crate)` and never locked directly — use `secrets()`,
-    /// `install_store()`, `secrets_status()` and `store_kind()`.** The same
+    /// `install_fallback_store()`, `secrets_status()` and `store_kind()`.** The same
     /// convention as `poll_permit` below, and for a sharper reason: a read
     /// guard held across `ensure_fresh`'s awaits would make `unlock_secrets`
     /// block behind a poll that can legitimately run 150 seconds
@@ -78,53 +87,38 @@ pub struct AppState {
     /// Same `std::sync` rule as `secrets`: taken and released inside one
     /// statement, never across an `await`.
     pub(crate) last_raw: std::sync::Mutex<RawLog>,
-    /// §10.3's manual-paste login, waiting for the user to bring a code back.
+    /// §10.3's Claude manual-paste login, waiting for the user to bring a code
+    /// back. Codex has no `code#state` route and never writes this field.
     ///
-    /// Its `redirect_uri` is always the manual one, so `complete_login` needs no
-    /// branch: `exchange_code` replays whatever is in here.
+    /// Its `redirect_uri` is always the manual one, so the Anthropic exchange
+    /// replays exactly the URI stored here.
     ///
-    /// **Carries the `Provider` alongside the `PendingAuth`.** A login started
-    /// for Codex must be finished against Codex's token endpoint, not
-    /// Anthropic's — `finish_manual_login` has no other way to know which
-    /// provider a pasted code belongs to, since the paste itself is just a
-    /// `code#state` line.
-    ///
-    /// **Written on every `begin_login`, not only when the loopback fails.**
+    /// **Written on every Claude `begin_login`, not only when loopback fails.**
     /// Two of the four ways the loopback can fail are detected in the webview —
     /// a `Callback::bind` that never happened and an `openUrl` that threw — and
     /// the webview cannot reach this field. Storing it up front is what lets
     /// all four failures share one paste path.
     ///
-    /// Holding a login here does **not** hold `LOGIN_IN_FLIGHT`. Nothing is
-    /// waiting once the loopback is abandoned, and a flag with no task behind it
-    /// is the state `LoginGuard`'s comment exists to prevent. A second
-    /// `begin_login` therefore replaces this value, and a code pasted from the
-    /// replaced login is refused on its `state` — which is the correct answer,
-    /// not a bug.
+    /// A manual-only attempt does not hold `LOGIN_IN_FLIGHT`; a loopback attempt
+    /// does until its listener is cancelled or completes. The generation beside
+    /// this value prevents a replaced or late callback from committing.
     ///
     /// Same `std::sync` rule as `secrets`: taken and released inside one
     /// statement, never across an `await`.
-    pub(crate) pending_manual: std::sync::Mutex<Option<(Provider, PendingAuth)>>,
+    pub(crate) pending_manual: std::sync::Mutex<Option<PendingManual>>,
+    /// The generation allowed to commit a login result. A late callback from a
+    /// replaced Claude attempt observes a different value and exits without a
+    /// token request or event.
+    pub(crate) active_login: std::sync::Mutex<Option<u64>>,
+    /// Serializes the generation check with token/account persistence. It is
+    /// separate from `LOGIN_IN_FLIGHT`: Claude's manual fallback can complete
+    /// while its loopback task still owns that process-wide flag.
+    pub(crate) login_commit: Mutex<()>,
     pub http: ReqwestHttp,
-    /// Anthropic's login endpoints, with `main.rs`'s `token_url()` override
-    /// baked in (debug-only, Step 11's local-mock verification).
-    pub cfg: ProviderSpec,
-    /// Codex's half of the same pair. Kept as its own field rather than a map,
-    /// for the same reason `usage_url`/`openai_usage_url` below are: `Provider`
-    /// is a closed set of two, and a `HashMap` would buy nothing over one field
-    /// per variant while making a typo'd key a runtime `None` instead of a
-    /// compile error.
-    ///
-    /// **Without this, nothing could exercise a Codex login against a mock.**
-    /// `login_cfg` in `commands.rs` used to resolve every OpenAI login straight
-    /// to `Provider::Openai.spec()` — the real `auth.openai.com` — because no
-    /// override existed for it, unlike the identical seam
-    /// `QUOTA_OPENAI_USAGE_URL` already gave the usage endpoint. That left the
-    /// whole login path — `begin_login` → `complete_login` →
-    /// `register_authenticated` — for Codex with no test able to reach it
-    /// without touching the real network, which AGENTS.md forbids. `main.rs`'s
-    /// `openai_token_url()` is the same override, one endpoint over.
-    pub openai_cfg: ProviderSpec,
+    /// Both protocols' refresh and revocation configuration. OpenAI is not a
+    /// `ProviderSpec`: its root-issuer endpoints and wire bodies differ from
+    /// Anthropic's at every step.
+    pub auth_configs: AuthConfigs,
     /// Per-account refresh locks (Task 10b). **Exactly one instance may exist
     /// in the whole application** — two copies serialize nothing, because each
     /// hands out its own mutex (auth/stored.rs:76-84).
@@ -262,6 +256,48 @@ impl SecretStore for LockedStore {
     }
 }
 
+fn authenticated_account(
+    existing: Option<&Account>,
+    provider: Provider,
+    account_id: &str,
+    email: &str,
+    workspace_id: Option<&str>,
+    is_fedramp: bool,
+) -> Account {
+    Account {
+        account_id: account_id.to_string(),
+        provider,
+        workspace_id: workspace_id.map(str::to_string),
+        is_fedramp,
+        display_label: existing
+            .map(|account| account.display_label.clone())
+            .unwrap_or_else(|| email.to_string()),
+        email: email.to_string(),
+        created_at: existing.map(|account| account.created_at).unwrap_or_else(Utc::now),
+        last_ok_at: existing.and_then(|account| account.last_ok_at),
+        // Clearing this is the point of a successful re-login (§7.2).
+        quarantined: false,
+        // `AccountStore::upsert` preserves the existing value or assigns the
+        // next slot for a new row.
+        sort_order: 0,
+    }
+}
+
+async fn rollback_tokens(
+    store: Arc<dyn SecretStore>,
+    provider: Provider,
+    account_id: String,
+    previous: Option<StoredTokens>,
+) -> Result<(), String> {
+    tauri::async_runtime::spawn_blocking(move || match previous {
+        Some(previous) => save_tokens(store.as_ref(), provider, &account_id, &previous),
+        None => delete_tokens(store.as_ref(), provider, &account_id).map(|_| ()),
+    })
+    .await
+    .map_err(|e| format!("token rollback task failed: {e}"))?
+    .map_err(|e| format!("token rollback failed: {e}"))
+}
+
 impl AppState {
     /// The token store in effect right now.
     ///
@@ -278,30 +314,19 @@ impl AppState {
         self.secrets.read().unwrap_or_else(|e| e.into_inner()).kind
     }
 
-    /// Installs a store opened by `unlock_secrets` (§9.2) and returns the one
-    /// it replaced, so the caller drops it after the write guard is released.
-    ///
-    /// Dropping the **last** handle to a replaced `TimeoutStore` closes its job
-    /// channel, which is the only thing that lets a worker stranded inside a
-    /// wedged keychain call retire (secrets/timeout.rs:97-98). A poll already in
-    /// flight holds a clone until it finishes (`poll_claimed`'s `ensure_fresh`
-    /// call in this file), so the thread retires then, not at the moment of the
-    /// swap.
-    ///
-    /// The old store's `stuck` latch is never cleared in place and there is no
-    /// API to do so. It is cleared only by that store's own worker completing a
-    /// job (timeout.rs:100-102), which by definition cannot happen while the
-    /// worker is stranded — the next job would queue behind the wedged one and
-    /// time out again. Replacing the whole store is what recovers, and the new
-    /// `TimeoutStore` starts with its own `stuck: false` (timeout.rs:76).
-    pub fn install_store(
+    /// Installs the fallback only while no backend is open. The check and swap
+    /// share one write guard so two concurrent passphrase commands cannot leave
+    /// the process with two independently cached encrypted-file stores.
+    pub fn install_fallback_store(
         &self,
         store: Arc<dyn SecretStore>,
-        kind: StoreKind,
-    ) -> Arc<dyn SecretStore> {
-        let mut w = self.secrets.write().unwrap_or_else(|e| e.into_inner());
-        w.kind = kind;
-        std::mem::replace(&mut w.store, store)
+    ) -> Result<Arc<dyn SecretStore>, Arc<dyn SecretStore>> {
+        let mut current = self.secrets.write().unwrap_or_else(|e| e.into_inner());
+        if current.kind != StoreKind::NoBackend {
+            return Err(store);
+        }
+        current.kind = StoreKind::EncryptedFile;
+        Ok(std::mem::replace(&mut current.store, store))
     }
 
     /// `(description, kind)` for the settings window. `describe()` is the one
@@ -359,7 +384,7 @@ impl AppState {
         Ok(effective)
     }
 
-    /// Registers a freshly authenticated account (§10.3's flow, completed).
+    /// Stores and registers a freshly authenticated account (§10.3).
     ///
     /// **This and `list_accounts` in `commands.rs` are the only two places
     /// in the application that hold both stores at once**, so the lock order
@@ -377,55 +402,151 @@ impl AppState {
     /// the user is trying to recover a quarantined account.
     pub async fn register_authenticated(
         &self,
-        provider: Provider,
-        uuid: &str,
+        account_id: &str,
         email: &str,
-    ) -> Result<(), quota_core::accounts::AccountError> {
-        // Lock order: scheduler before accounts. See this struct's doc comment.
-        let mut sched = self.scheduler.lock().await;
-        let mut accounts = self.accounts.lock().await;
+        tokens: StoredTokens,
+    ) -> Result<(), String> {
+        let provider = tokens.provider();
+        let workspace_id = tokens.workspace_id().map(str::to_string);
+        let is_fedramp = tokens.is_fedramp();
 
-        // Matched on **(provider, uuid)**, not on `uuid` alone: docs/design.md
-        // §9.3 records that nothing stops two providers from issuing the same
-        // id string, and this is the one lookup in the application that used
-        // to get away with ignoring that, because it was only ever called for
-        // Anthropic. A Codex login sharing an id with an existing Anthropic
-        // account must not inherit that account's `display_label`,
-        // `created_at`, or `last_ok_at`.
-        let existing =
-            accounts.list().iter().find(|a| a.account_id == uuid && a.provider == provider).cloned();
-        accounts.upsert(Account {
-            account_id: uuid.to_string(),
-            provider,
-            display_label: existing
-                .as_ref()
-                .map(|a| a.display_label.clone())
-                .unwrap_or_else(|| email.to_string()),
-            email: email.to_string(),
-            created_at: existing.as_ref().map(|a| a.created_at).unwrap_or_else(Utc::now),
-            last_ok_at: existing.as_ref().and_then(|a| a.last_ok_at),
-            // Clearing this is the point of a re-login (§7.2).
-            quarantined: false,
-            // Overwritten by `upsert` either way: preserved for a known uuid,
-            // set to the list length for a new one (accounts.rs:71-83).
-            sort_order: 0,
-        })?;
+        // Login and refresh share this lock. Without it, a refresh can finish
+        // between the new credential write and the metadata write and replace
+        // the grant that just authenticated successfully.
+        let _account_lock = self.refresh_locks.lock_account(provider, account_id).await;
 
-        // `Scheduler::add` returns immediately for a uuid it already holds, so
-        // it alone would leave a quarantined entry AUTH_DEAD forever — and
-        // Task 17 persists `quarantined`, so that now survives every restart.
-        // Drop the entry and rebuild it.
-        sched.remove(provider, uuid);
-        sched.add(provider, uuid);
-        // ...which hands the rebuilt entry `add`'s startup stagger, and — since
-        // it goes to the end of `order` — the largest offset of the lot.
-        // Measured on the device: the third account added through the settings
-        // window sat on `Loading` for 30 seconds, the fourth for 45, and a
-        // re-login (§7.2's remedy, with the user watching) always draws the
-        // worst case. §6.1's stagger is about startup and about staying
-        // de-synchronised over time; one deliberate registration is neither, and
-        // §6.1's floor is untouched — see `make_due_now`.
-        sched.make_due_now(provider, uuid);
+        // Refuse a known workspace conflict before touching the credential
+        // store. The same validation runs again at commit time because account
+        // metadata remains editable while the blocking store work runs.
+        {
+            let accounts = self.accounts.lock().await;
+            let existing = accounts
+                .list()
+                .iter()
+                .find(|a| a.provider == provider && a.account_id == account_id);
+            let account = authenticated_account(
+                existing,
+                provider,
+                account_id,
+                email,
+                workspace_id.as_deref(),
+                is_fedramp,
+            );
+            accounts
+                .validate_upsert(&account)
+                .map_err(|e| format!("the account could not be saved: {e}"))?;
+        }
+
+        let store = self.secrets();
+        let previous = {
+            let store = Arc::clone(&store);
+            let id = account_id.to_string();
+            match tauri::async_runtime::spawn_blocking(move || {
+                load_tokens(store.as_ref(), provider, &id)
+            })
+            .await
+            .map_err(|e| format!("the token store task failed: {e}"))?
+            {
+                Ok(tokens) => Some(tokens),
+                // Re-login is the remedy for both an absent credential and a
+                // corrupt/partial one. Neither has a trustworthy value that
+                // can be restored, so a later rollback removes the attempted
+                // set completely.
+                Err(StoredTokenError::Missing | StoredTokenError::Corrupt) => None,
+                Err(e) => return Err(format!("the existing token could not be read: {e}")),
+            }
+        };
+
+        let save_result = {
+            let store = Arc::clone(&store);
+            let id = account_id.to_string();
+            let saved = tokens.clone();
+            tauri::async_runtime::spawn_blocking(move || {
+                save_tokens(store.as_ref(), provider, &id, &saved)
+            })
+            .await
+            .map_err(|e| format!("the token store task failed: {e}"))?
+        };
+        if let Err(save_error) = save_result {
+            let rollback = rollback_tokens(
+                Arc::clone(&store),
+                provider,
+                account_id.to_string(),
+                previous.clone(),
+            )
+            .await;
+            return match rollback {
+                Ok(()) => Err(format!("the token could not be stored: {save_error}")),
+                Err(rollback_error) => Err(format!(
+                    "the token could not be stored ({save_error}); {rollback_error}"
+                )),
+            };
+        }
+
+        // Lock order: scheduler before accounts. No credential-store operation
+        // occurs while either is held.
+        let metadata_error = {
+            let mut sched = self.scheduler.lock().await;
+            let mut accounts = self.accounts.lock().await;
+            let existing = accounts
+                .list()
+                .iter()
+                .find(|a| a.provider == provider && a.account_id == account_id)
+                .cloned();
+            let account = authenticated_account(
+                existing.as_ref(),
+                provider,
+                account_id,
+                email,
+                workspace_id.as_deref(),
+                is_fedramp,
+            );
+
+            match accounts.validate_upsert(&account) {
+                Err(e) => Some(e),
+                Ok(()) => match accounts.upsert(account) {
+                    Ok(()) => {
+                        // Rebuild to clear a persisted quarantine, then bypass
+                        // the startup stagger while the user is watching.
+                        sched.remove(provider, account_id);
+                        sched.add(provider, account_id);
+                        sched.make_due_now(provider, account_id);
+                        None
+                    }
+                    Err(e) => {
+                        // `AccountStore::upsert` mutates memory before flushing.
+                        // Restore the in-memory view too; the second flush may
+                        // fail for the same reason and is deliberately ignored.
+                        match existing {
+                            Some(previous) => {
+                                let _ = accounts.upsert(previous);
+                            }
+                            None => {
+                                let _ = accounts.remove(provider, account_id);
+                            }
+                        }
+                        Some(e)
+                    }
+                },
+            }
+        };
+
+        if let Some(error) = metadata_error {
+            if let Err(rollback_error) = rollback_tokens(
+                Arc::clone(&store),
+                provider,
+                account_id.to_string(),
+                previous,
+            )
+            .await
+            {
+                return Err(format!(
+                    "the account could not be saved ({error}); {rollback_error}"
+                ));
+            }
+            return Err(format!("the account could not be saved: {error}"));
+        }
+
         Ok(())
     }
 
@@ -455,28 +576,16 @@ impl AppState {
     /// Nothing below may therefore panic on input it does not control, which is
     /// why the unclassifiable-error arm degrades instead of asserting.
     async fn poll_claimed(&self, provider: Provider, uuid: &str) {
-        // Task 10b owns read -> refresh -> write. Inlining it here would let
+        // `auth::stored` owns read -> refresh -> write. Inlining it here would let
         // scheduler polls and manual refreshes invalidate each other's refresh
         // tokens (§10.5).
         // One `Arc` clone taken before the await, so no lock is held across
         // one. A store swapped in mid-poll therefore takes effect from the
         // next poll, and this one finishes against the store it started with.
         let store = self.secrets();
-        // Selected by provider, not `&self.cfg` unconditionally: `ensure_fresh`
-        // takes `provider` only for the lock and store keys (auth/stored.rs)
-        // — the spec is what actually reaches the network, in `refresh`'s
-        // POST to `cfg.token_url`. The identical defect this task already
-        // fixed at the revoke call, on a path that runs on every token
-        // rotation instead of once at removal: an unconditional `&self.cfg`
-        // here would POST a live Codex refresh token to `platform.claude.com`
-        // every time a Codex access token expires — routine, not an edge case.
-        let cfg = match provider {
-            Provider::Anthropic => &self.cfg,
-            Provider::Openai => &self.openai_cfg,
-        };
         let fresh = match ensure_fresh(
             &self.http,
-            cfg,
+            &self.auth_configs,
             store.as_ref(),
             &self.refresh_locks,
             provider,
@@ -510,9 +619,59 @@ impl AppState {
             Provider::Anthropic => &self.usage_url,
             Provider::Openai => &self.openai_usage_url,
         };
-        let fetched =
-            fetch_usage_captured_at(&self.http, provider, usage_url, &fresh.tokens.access_token)
-                .await;
+        let mut fetched_access = fresh.tokens.access_token().to_string();
+        let mut fetched_workspace = fresh.tokens.workspace_id().map(str::to_string);
+        let mut fetched_is_fedramp = fresh.tokens.is_fedramp();
+        let mut fetched = fetch_usage_captured_for_account_at(
+            &self.http,
+            provider,
+            usage_url,
+            &fetched_access,
+            fetched_workspace.as_deref(),
+            fetched_is_fedramp,
+        )
+        .await;
+
+        // A 401 is the authoritative access-token rejection. Force one
+        // rotation using the rejected token as the race witness, then retry the
+        // usage request exactly once. A second 401 falls through to the normal
+        // AuthExpired mapping; there is deliberately no retry loop.
+        if matches!(&fetched.outcome, Err(UsageError::Unauthorized)) {
+            match refresh_after_unauthorized(
+                &self.http,
+                &self.auth_configs,
+                store.as_ref(),
+                &self.refresh_locks,
+                provider,
+                uuid,
+                &fetched_access,
+            )
+            .await
+            {
+                Ok(rotated) => {
+                    if let Err(e) = &rotated.persisted {
+                        eprintln!("{uuid}: the 401-triggered rotation could not be persisted: {e}");
+                    }
+                    fetched_access = rotated.tokens.access_token().to_string();
+                    fetched_workspace = rotated.tokens.workspace_id().map(str::to_string);
+                    fetched_is_fedramp = rotated.tokens.is_fedramp();
+                    fetched = fetch_usage_captured_for_account_at(
+                        &self.http,
+                        provider,
+                        usage_url,
+                        &fetched_access,
+                        fetched_workspace.as_deref(),
+                        fetched_is_fedramp,
+                    )
+                    .await;
+                }
+                Err(e) => {
+                    let kind = FailureKind::from_stored_token_error(&e);
+                    self.record(provider, uuid, kind).await;
+                    return;
+                }
+            }
+        }
         if let Some(raw) = fetched.raw {
             self.record_raw(provider, uuid, raw);
         }
@@ -521,7 +680,7 @@ impl AppState {
             Ok(windows) => {
                 // The fingerprint is taken from the token that produced *this*
                 // fetch, not re-read from the store afterwards.
-                let fp = fingerprint(&fresh.tokens.access_token);
+                let fp = fingerprint(&fetched_access);
                 let snap = {
                     let mut sched = self.scheduler.lock().await;
                     sched.record_success(provider, uuid, windows, extra);
@@ -639,7 +798,13 @@ pub async fn poll_loop(handle: tauri::AppHandle) {
 pub(crate) mod tests {
     use super::*;
     use quota_core::accounts::Account;
+    use quota_core::auth::openai::{OpenAiAuthConfig, OpenAiTokenSet};
+    use quota_core::auth::token::TokenSet;
     use quota_core::model::AccountState;
+    use quota_core::provider::{
+        openai_access_token_key, openai_refresh_token_key, openai_token_meta_key, token_key,
+        ProviderSpec,
+    };
     use quota_core::scheduler::PollPolicy;
     use quota_core::secrets::timeout::TimeoutStore;
     use std::time::{Duration, Instant};
@@ -670,6 +835,42 @@ pub(crate) mod tests {
         }
     }
 
+    #[derive(Default)]
+    struct FailOnePutStore {
+        inner: quota_core::secrets::MemoryStore,
+        fail_key: std::sync::Mutex<Option<String>>,
+    }
+
+    impl FailOnePutStore {
+        fn fail_once_on(&self, key: String) {
+            *self.fail_key.lock().unwrap() = Some(key);
+        }
+    }
+
+    impl SecretStore for FailOnePutStore {
+        fn put(&self, key: &str, value: &[u8]) -> Result<(), SecretError> {
+            let mut fail_key = self.fail_key.lock().unwrap();
+            if fail_key.as_deref() == Some(key) {
+                *fail_key = None;
+                return Err(SecretError::Backend("injected put failure".into()));
+            }
+            drop(fail_key);
+            self.inner.put(key, value)
+        }
+
+        fn get(&self, key: &str) -> Result<Option<Vec<u8>>, SecretError> {
+            self.inner.get(key)
+        }
+
+        fn delete(&self, key: &str) -> Result<bool, SecretError> {
+            self.inner.delete(key)
+        }
+
+        fn describe(&self) -> String {
+            "fail-one-put (test only)".into()
+        }
+    }
+
     /// Unique per call. The harness runs tests as threads in one process, so a
     /// pid alone collides — the same trap `accounts.rs`'s test helper documents.
     /// A counter is used rather than `rand` so this needs no new dependency on
@@ -687,6 +888,8 @@ pub(crate) mod tests {
         Account {
             account_id: uuid.into(),
             provider: Provider::Anthropic,
+            workspace_id: None,
+            is_fedramp: false,
             display_label: uuid.into(),
             email: format!("{uuid}@example.invalid"),
             created_at: chrono::Utc::now(),
@@ -694,6 +897,29 @@ pub(crate) mod tests {
             quarantined: false,
             sort_order: 0,
         }
+    }
+
+    fn anthropic_tokens(access_token: &str) -> StoredTokens {
+        StoredTokens::Anthropic(TokenSet {
+            access_token: access_token.into(),
+            refresh_token: format!("{access_token}-refresh"),
+            expires_at: Utc::now() + chrono::TimeDelta::hours(1),
+            refresh_token_expires_at: Utc::now() + chrono::TimeDelta::days(30),
+            scopes: vec!["user:profile".into()],
+            client_id: "test".into(),
+        })
+    }
+
+    fn openai_tokens(account_id: &str, workspace_id: &str, access_token: &str) -> StoredTokens {
+        StoredTokens::Openai(OpenAiTokenSet {
+            access_token: access_token.into(),
+            refresh_token: format!("{access_token}-refresh"),
+            expires_at: Utc::now() + chrono::TimeDelta::hours(1),
+            client_id: "test".into(),
+            account_id: account_id.into(),
+            workspace_id: workspace_id.into(),
+            is_fedramp: false,
+        })
     }
 
     /// Builds an `AppState` around `secrets`, with accounts a and b registered.
@@ -728,18 +954,18 @@ pub(crate) mod tests {
             secrets: RwLock::new(SecretsHandle { store: secrets, kind }),
             last_raw: std::sync::Mutex::new(RawLog::default()),
             pending_manual: std::sync::Mutex::new(None),
+            active_login: std::sync::Mutex::new(None),
+            login_commit: Mutex::new(()),
             http: quota_core::auth::token::ReqwestHttp::new().unwrap(),
-            // Unreachable in these tests: the store fails before any request.
-            cfg: ProviderSpec {
-                token_url: "http://127.0.0.1:1/never".into(),
-                ..Provider::Anthropic.spec()
-            },
-            // Same dead address, same reason — a test that needs a real Codex
-            // login exchange overrides this field directly, the same way
-            // existing tests override `cfg.token_url`.
-            openai_cfg: ProviderSpec {
-                token_url: "http://127.0.0.1:1/never".into(),
-                ..Provider::Openai.spec()
+            auth_configs: AuthConfigs {
+                anthropic: ProviderSpec {
+                    token_url: "http://127.0.0.1:1/never".into(),
+                    ..Provider::Anthropic.spec()
+                },
+                openai: OpenAiAuthConfig {
+                    issuer: "http://127.0.0.1:1/never".into(),
+                    ..OpenAiAuthConfig::default()
+                },
             },
             refresh_locks: RefreshLocks::default(),
             poll_permit: Mutex::new(()),
@@ -879,7 +1105,10 @@ pub(crate) mod tests {
         tokio::time::sleep(Duration::from_millis(50)).await;
         let login = {
             let s = Arc::clone(&state);
-            tokio::spawn(async move { s.register_authenticated(Provider::Anthropic, "a", "a@example.invalid").await })
+            tokio::spawn(async move {
+                s.register_authenticated("a", "a@example.invalid", anthropic_tokens("new-a"))
+                    .await
+            })
         };
 
         let both = tokio::time::timeout(Duration::from_secs(3), async {
@@ -909,6 +1138,8 @@ pub(crate) mod tests {
                 .upsert(Account {
                     account_id: "a".into(),
                     provider: Provider::Anthropic,
+                    workspace_id: None,
+                    is_fedramp: false,
                     display_label: "work".into(),
                     email: "old@example.invalid".into(),
                     created_at: created,
@@ -925,7 +1156,14 @@ pub(crate) mod tests {
             "premise: the account reads as quarantined before the re-login"
         );
 
-        state.register_authenticated(Provider::Anthropic, "a", "different@example.invalid").await.unwrap();
+        state
+            .register_authenticated(
+                "a",
+                "different@example.invalid",
+                anthropic_tokens("new-a"),
+            )
+            .await
+            .unwrap();
 
         {
             let accounts = state.accounts.lock().await;
@@ -970,6 +1208,8 @@ pub(crate) mod tests {
                 .upsert(Account {
                     account_id: "shared-id".into(),
                     provider: Provider::Anthropic,
+                    workspace_id: None,
+                    is_fedramp: false,
                     display_label: "claude work".into(),
                     email: "claude@example.invalid".into(),
                     created_at: anthropic_created,
@@ -981,7 +1221,11 @@ pub(crate) mod tests {
         }
 
         state
-            .register_authenticated(Provider::Openai, "shared-id", "codex@example.invalid")
+            .register_authenticated(
+                "shared-id",
+                "codex@example.invalid",
+                openai_tokens("shared-id", "workspace-codex", "codex-access"),
+            )
             .await
             .unwrap();
 
@@ -1016,6 +1260,327 @@ pub(crate) mod tests {
         ));
     }
 
+    #[tokio::test]
+    async fn every_partial_openai_save_failure_deletes_a_new_grant() {
+        let account_id = "new-codex-user";
+        let failing_keys = [
+            openai_refresh_token_key(account_id),
+            openai_access_token_key(account_id),
+            openai_token_meta_key(account_id),
+        ];
+
+        for key in failing_keys {
+            let store = Arc::new(FailOnePutStore::default());
+            store.fail_once_on(key.clone());
+            let state = app_state(store.clone());
+
+            let error = state
+                .register_authenticated(
+                    account_id,
+                    "new@example.invalid",
+                    openai_tokens(account_id, "workspace-new", "new-access"),
+                )
+                .await
+                .expect_err("the injected split-store failure was ignored");
+            assert!(error.contains("could not be stored"), "{key}: {error}");
+            assert!(
+                matches!(
+                    load_tokens(store.as_ref(), Provider::Openai, account_id),
+                    Err(StoredTokenError::Missing)
+                ),
+                "{key}: a partial new credential survived rollback"
+            );
+            assert!(
+                state
+                    .accounts
+                    .lock()
+                    .await
+                    .list()
+                    .iter()
+                    .all(|account| {
+                        account.provider != Provider::Openai
+                            || account.account_id != account_id
+                    }),
+                "{key}: a failed token save still registered an account"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn every_partial_openai_save_failure_restores_the_previous_grant() {
+        let account_id = "existing-codex-user";
+        let failing_keys = [
+            openai_refresh_token_key(account_id),
+            openai_access_token_key(account_id),
+            openai_token_meta_key(account_id),
+        ];
+
+        for key in failing_keys {
+            let store = Arc::new(FailOnePutStore::default());
+            let state = app_state(store.clone());
+            state
+                .register_authenticated(
+                    account_id,
+                    "old@example.invalid",
+                    openai_tokens(account_id, "workspace-one", "old-access"),
+                )
+                .await
+                .unwrap();
+            store.fail_once_on(key.clone());
+
+            state
+                .register_authenticated(
+                    account_id,
+                    "new@example.invalid",
+                    openai_tokens(account_id, "workspace-one", "new-access"),
+                )
+                .await
+                .expect_err("the injected split-store failure was ignored");
+
+            let restored = load_tokens(store.as_ref(), Provider::Openai, account_id)
+                .expect("the previous complete credential was not restored");
+            assert_eq!(restored.access_token(), "old-access", "failed at {key}");
+            assert_eq!(
+                restored.refresh_token(),
+                "old-access-refresh",
+                "failed at {key}"
+            );
+            let account = state
+                .accounts
+                .lock()
+                .await
+                .list()
+                .iter()
+                .find(|account| {
+                    account.provider == Provider::Openai && account.account_id == account_id
+                })
+                .cloned()
+                .unwrap();
+            assert_eq!(account.email, "old@example.invalid", "failed at {key}");
+        }
+    }
+
+    #[tokio::test]
+    async fn workspace_conflict_is_refused_before_the_existing_token_is_overwritten() {
+        let store = Arc::new(quota_core::secrets::MemoryStore::default());
+        let state = app_state(store.clone());
+        state
+            .register_authenticated(
+                "workspace-user",
+                "old@example.invalid",
+                openai_tokens("workspace-user", "workspace-one", "old-access"),
+            )
+            .await
+            .unwrap();
+
+        let error = state
+            .register_authenticated(
+                "workspace-user",
+                "new@example.invalid",
+                openai_tokens("workspace-user", "workspace-two", "new-access"),
+            )
+            .await
+            .expect_err("a second workspace silently replaced the first");
+        assert!(error.contains("different workspace"), "{error}");
+        let stored = load_tokens(store.as_ref(), Provider::Openai, "workspace-user").unwrap();
+        assert_eq!(stored.access_token(), "old-access");
+        assert_eq!(stored.workspace_id(), Some("workspace-one"));
+    }
+
+    #[tokio::test]
+    async fn a_metadata_failure_deletes_a_newly_saved_credential() {
+        let store = Arc::new(quota_core::secrets::MemoryStore::default());
+        let path = tmp("unreadable-accounts");
+        std::fs::write(&path, b"not valid account JSON").unwrap();
+        let mut state = app_state(store.clone());
+        state.accounts = Mutex::new(AccountStore::load(&path));
+
+        let error = state
+            .register_authenticated(
+                "metadata-user",
+                "metadata@example.invalid",
+                openai_tokens("metadata-user", "workspace-one", "new-access"),
+            )
+            .await
+            .expect_err("an unreadable account file accepted a registration");
+        assert!(error.contains("account could not be saved"), "{error}");
+        assert!(matches!(
+            load_tokens(store.as_ref(), Provider::Openai, "metadata-user"),
+            Err(StoredTokenError::Missing)
+        ));
+        assert!(state.accounts.lock().await.list().is_empty());
+        std::fs::remove_file(path).ok();
+    }
+
+    #[tokio::test]
+    async fn a_metadata_failure_restores_the_previous_credential_and_row() {
+        let store = Arc::new(quota_core::secrets::MemoryStore::default());
+        let dir = tmp("account-directory");
+        let moved = dir.with_extension("moved");
+        std::fs::create_dir_all(&dir).unwrap();
+        let accounts_path = dir.join("accounts.json");
+        let mut accounts = AccountStore::load(&accounts_path);
+        accounts
+            .upsert(authenticated_account(
+                None,
+                Provider::Openai,
+                "metadata-user",
+                "old@example.invalid",
+                Some("workspace-one"),
+                false,
+            ))
+            .unwrap();
+        save_tokens(
+            store.as_ref(),
+            Provider::Openai,
+            "metadata-user",
+            &openai_tokens("metadata-user", "workspace-one", "old-access"),
+        )
+        .unwrap();
+        let mut state = app_state(store.clone());
+        state.accounts = Mutex::new(accounts);
+
+        std::fs::rename(&dir, &moved).unwrap();
+        std::fs::write(&dir, b"blocks the account directory").unwrap();
+        state
+            .register_authenticated(
+                "metadata-user",
+                "new@example.invalid",
+                openai_tokens("metadata-user", "workspace-one", "new-access"),
+            )
+            .await
+            .expect_err("the blocked metadata path accepted a registration");
+
+        let restored = load_tokens(store.as_ref(), Provider::Openai, "metadata-user").unwrap();
+        assert_eq!(restored.access_token(), "old-access");
+        let accounts = state.accounts.lock().await;
+        let restored_account = accounts
+            .list()
+            .iter()
+            .find(|account| {
+                account.provider == Provider::Openai && account.account_id == "metadata-user"
+            })
+            .unwrap();
+        assert_eq!(restored_account.email, "old@example.invalid");
+        drop(accounts);
+
+        std::fs::remove_file(&dir).ok();
+        std::fs::rename(&moved, &dir).ok();
+        std::fs::remove_file(accounts_path).ok();
+        std::fs::remove_dir(dir).ok();
+    }
+
+    #[tokio::test]
+    async fn corrupt_anthropic_credentials_can_be_repaired_by_re_login() {
+        let store = Arc::new(quota_core::secrets::MemoryStore::default());
+        store
+            .put(&token_key(Provider::Anthropic, "a"), b"not valid token JSON")
+            .unwrap();
+        let state = app_state(store.clone());
+        {
+            let mut accounts = state.accounts.lock().await;
+            let mut saved = accounts
+                .list()
+                .iter()
+                .find(|account| {
+                    account.provider == Provider::Anthropic && account.account_id == "a"
+                })
+                .cloned()
+                .unwrap();
+            saved.quarantined = true;
+            accounts.upsert(saved).unwrap();
+        }
+        state
+            .scheduler
+            .lock()
+            .await
+            .record_failure(Provider::Anthropic, "a", FailureKind::AuthDead);
+
+        state
+            .register_authenticated("a", "repaired@example.invalid", anthropic_tokens("repaired"))
+            .await
+            .unwrap();
+
+        let repaired = load_tokens(store.as_ref(), Provider::Anthropic, "a").unwrap();
+        assert_eq!(repaired.access_token(), "repaired");
+        assert_ne!(
+            state.scheduler.lock().await.state(Provider::Anthropic, "a"),
+            Some(AccountState::AuthDead)
+        );
+        assert!(
+            !state
+                .accounts
+                .lock()
+                .await
+                .list()
+                .iter()
+                .find(|account| {
+                    account.provider == Provider::Anthropic && account.account_id == "a"
+                })
+                .unwrap()
+                .quarantined
+        );
+    }
+
+    #[tokio::test]
+    async fn partial_openai_credentials_can_be_repaired_by_re_login() {
+        for present_entries in [1, 2] {
+            let account_id = format!("partial-user-{present_entries}");
+            let store = Arc::new(quota_core::secrets::MemoryStore::default());
+            store
+                .put(
+                    &openai_refresh_token_key(&account_id),
+                    b"orphaned-refresh",
+                )
+                .unwrap();
+            if present_entries == 2 {
+                store
+                    .put(&openai_access_token_key(&account_id), b"orphaned-access")
+                    .unwrap();
+            }
+            let state = app_state(store.clone());
+            {
+                let mut account = account(&account_id);
+                account.provider = Provider::Openai;
+                account.workspace_id = Some("workspace-one".into());
+                account.quarantined = true;
+                state.accounts.lock().await.upsert(account).unwrap();
+                state.scheduler.lock().await.add(Provider::Openai, &account_id);
+                state.scheduler.lock().await.record_failure(
+                    Provider::Openai,
+                    &account_id,
+                    FailureKind::AuthDead,
+                );
+            }
+
+            state
+                .register_authenticated(
+                    &account_id,
+                    "repaired@example.invalid",
+                    openai_tokens(&account_id, "workspace-one", "repaired-access"),
+                )
+                .await
+                .unwrap();
+
+            let repaired = load_tokens(store.as_ref(), Provider::Openai, &account_id).unwrap();
+            assert_eq!(repaired.access_token(), "repaired-access");
+            assert_ne!(
+                state.scheduler.lock().await.state(Provider::Openai, &account_id),
+                Some(AccountState::AuthDead),
+                "{present_entries}-entry partial set stayed quarantined"
+            );
+            let accounts = state.accounts.lock().await;
+            let repaired_account = accounts
+                .list()
+                .iter()
+                .find(|account| {
+                    account.provider == Provider::Openai && account.account_id == account_id
+                })
+                .unwrap();
+            assert!(!repaired_account.quarantined);
+        }
+    }
+
     /// **docs/design.md §9.2's fallback had never been exercised by the
     /// application.** `EncryptedFileStore` is well tested inside `crates/core`,
     /// but nothing in `src-tauri` had ever constructed one: it was reachable
@@ -1034,8 +1599,6 @@ pub(crate) mod tests {
     /// three behaviours are one test rather than three.
     #[tokio::test]
     async fn unlocking_installs_the_encrypted_file_store_and_the_poll_path_uses_it() {
-        use quota_core::auth::token::TokenSet;
-        use quota_core::provider::token_key;
         use quota_core::secrets::encrypted_file::EncryptedFileStore;
 
         let path = tmp("tokens");
@@ -1069,7 +1632,11 @@ pub(crate) mod tests {
                 .map(|s| Box::new(s) as Box<dyn SecretStore>)
         })
         .expect("the encrypted-file fallback opens");
-        drop(state.install_store(Arc::new(opened), StoreKind::EncryptedFile));
+        let replaced = match state.install_fallback_store(Arc::new(opened)) {
+            Ok(replaced) => replaced,
+            Err(_) => panic!("the fallback store was refused from NoBackend"),
+        };
+        drop(replaced);
         assert_eq!(state.store_kind(), StoreKind::EncryptedFile);
 
         state.poll_one(Provider::Anthropic, "a").await;
@@ -1143,10 +1710,13 @@ pub(crate) mod tests {
     /// waits the longest of all.
     #[tokio::test]
     async fn an_account_registered_through_the_login_flow_is_polled_at_once() {
-        let state = app_state(Arc::new(LockedStore));
+        let state = app_state(Arc::new(quota_core::secrets::MemoryStore::default()));
         let b_before = state.scheduler.lock().await.next_wake(Provider::Anthropic, "b").unwrap();
 
-        state.register_authenticated(Provider::Anthropic, "c", "c@example.invalid").await.unwrap();
+        state
+            .register_authenticated("c", "c@example.invalid", anthropic_tokens("new-c"))
+            .await
+            .unwrap();
 
         let sched = state.scheduler.lock().await;
         assert!(
@@ -1174,14 +1744,14 @@ pub(crate) mod tests {
     /// would also produce if the wrong mock happened to answer.
     #[tokio::test]
     async fn a_codex_account_is_polled_against_its_own_url_not_anthropics() {
-        use quota_core::auth::token::TokenSet;
-        use quota_core::provider::token_key;
-        use wiremock::matchers::method;
+        use wiremock::matchers::{header, method};
         use wiremock::{Mock, MockServer, ResponseTemplate};
 
         let anthropic_server = MockServer::start().await;
         let openai_server = MockServer::start().await;
         Mock::given(method("GET"))
+            .and(header("chatgpt-account-id", "workspace-a"))
+            .and(header("x-openai-fedramp", "true"))
             .respond_with(ResponseTemplate::new(200).set_body_string(
                 r#"{"rate_limit":{"primary_window":{"used_percent":10,
                     "limit_window_seconds":604800,"reset_after_seconds":604800,
@@ -1198,18 +1768,16 @@ pub(crate) mod tests {
         state.usage_url = anthropic_server.uri();
         state.openai_usage_url = openai_server.uri();
 
-        let tokens = TokenSet {
+        let tokens = StoredTokens::Openai(OpenAiTokenSet {
             access_token: "codex-access".into(),
             refresh_token: "codex-refresh".into(),
             expires_at: Utc::now() + chrono::TimeDelta::hours(1),
-            refresh_token_expires_at: Utc::now() + chrono::TimeDelta::days(30),
-            scopes: vec![],
             client_id: "test".into(),
-        };
-        state
-            .secrets()
-            .put(&token_key(Provider::Openai, "codex-a"), &serde_json::to_vec(&tokens).unwrap())
-            .unwrap();
+            account_id: "codex-a".into(),
+            workspace_id: "workspace-a".into(),
+            is_fedramp: true,
+        });
+        save_tokens(state.secrets().as_ref(), Provider::Openai, "codex-a", &tokens).unwrap();
         state.scheduler.lock().await.add(Provider::Openai, "codex-a");
 
         state.poll_one(Provider::Openai, "codex-a").await;
@@ -1235,7 +1803,7 @@ pub(crate) mod tests {
     /// poll: `ensure_fresh`'s `cfg` argument, not its `provider` argument, is
     /// what reaches the network — `refresh` (auth/token.rs) posts
     /// `refresh_token` and `client_id` to `cfg.token_url`. An unconditional
-    /// `&self.cfg` in `poll_claimed` would send a live Codex refresh token to
+    /// Anthropic's config in `poll_claimed` would send a live Codex refresh token to
     /// Anthropic's token endpoint on **every token rotation**, not once at
     /// removal like the revoke call this task already fixed — routinely,
     /// whenever a Codex access token expires.
@@ -1247,8 +1815,6 @@ pub(crate) mod tests {
     /// would never reach this code path.
     #[tokio::test]
     async fn a_codex_account_is_refreshed_against_its_own_token_endpoint_not_anthropics() {
-        use quota_core::auth::token::TokenSet;
-        use quota_core::provider::token_key;
         use wiremock::matchers::method;
         use wiremock::{Mock, MockServer, ResponseTemplate};
 
@@ -1256,10 +1822,8 @@ pub(crate) mod tests {
         let openai_server = MockServer::start().await;
         Mock::given(method("POST"))
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-                "access_token": "new-codex-access",
+                "access_token": "e30.eyJleHAiOjk5OTk5OTk5OTl9.signature",
                 "refresh_token": "new-codex-refresh",
-                "expires_in": 27000,
-                "scope": ""
             })))
             .mount(&openai_server)
             .await;
@@ -1267,21 +1831,20 @@ pub(crate) mod tests {
         // as the sibling test above.
 
         let mut state = app_state(Arc::new(quota_core::secrets::MemoryStore::default()));
-        state.cfg.token_url = format!("{}/v1/oauth/token", anthropic_server.uri());
-        state.openai_cfg.token_url = format!("{}/api/accounts/oauth/token", openai_server.uri());
+        state.auth_configs.anthropic.token_url =
+            format!("{}/v1/oauth/token", anthropic_server.uri());
+        state.auth_configs.openai.issuer = openai_server.uri();
 
-        let tokens = TokenSet {
+        let tokens = StoredTokens::Openai(OpenAiTokenSet {
             access_token: "codex-access".into(),
             refresh_token: "codex-refresh".into(),
             expires_at: Utc::now() - chrono::TimeDelta::seconds(1),
-            refresh_token_expires_at: Utc::now() + chrono::TimeDelta::days(30),
-            scopes: vec![],
             client_id: "test".into(),
-        };
-        state
-            .secrets()
-            .put(&token_key(Provider::Openai, "codex-a"), &serde_json::to_vec(&tokens).unwrap())
-            .unwrap();
+            account_id: "codex-a".into(),
+            workspace_id: "workspace-a".into(),
+            is_fedramp: false,
+        });
+        save_tokens(state.secrets().as_ref(), Provider::Openai, "codex-a", &tokens).unwrap();
         state.scheduler.lock().await.add(Provider::Openai, "codex-a");
 
         state.poll_one(Provider::Openai, "codex-a").await;
@@ -1293,6 +1856,112 @@ pub(crate) mod tests {
         assert!(
             anthropic_server.received_requests().await.unwrap().is_empty(),
             "a Codex refresh token was sent to Anthropic's token endpoint"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_usage_401_forces_one_refresh_and_retries_with_the_rotated_access_token() {
+        use wiremock::matchers::{header, method};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let usage = MockServer::start().await;
+        let auth = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(header("authorization", "Bearer rejected-access"))
+            .respond_with(ResponseTemplate::new(401))
+            .expect(1)
+            .mount(&usage)
+            .await;
+        Mock::given(method("GET"))
+            .and(header("authorization", "Bearer rotated-access"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "five_hour": {
+                    "utilization": 23,
+                    "resets_at": "2030-01-01T00:00:00Z"
+                },
+                "seven_day": null,
+                "limits": []
+            })))
+            .expect(1)
+            .mount(&usage)
+            .await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "access_token": "rotated-access",
+                "refresh_token": "rotated-refresh",
+                "expires_in": 27000,
+                "scope": "user:profile"
+            })))
+            .expect(1)
+            .mount(&auth)
+            .await;
+
+        let store = Arc::new(quota_core::secrets::MemoryStore::default());
+        save_tokens(
+            store.as_ref(),
+            Provider::Anthropic,
+            "a",
+            &anthropic_tokens("rejected-access"),
+        )
+        .unwrap();
+        let mut state = app_state(store.clone());
+        state.usage_url = usage.uri();
+        state.auth_configs.anthropic.token_url = format!("{}/token", auth.uri());
+
+        state.poll_one(Provider::Anthropic, "a").await;
+
+        assert!(matches!(
+            state.scheduler.lock().await.state(Provider::Anthropic, "a"),
+            Some(AccountState::Ok { .. })
+        ));
+        assert_eq!(
+            load_tokens(store.as_ref(), Provider::Anthropic, "a")
+                .unwrap()
+                .access_token(),
+            "rotated-access"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_second_usage_401_is_not_refreshed_or_retried_again() {
+        use wiremock::matchers::method;
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let usage = MockServer::start().await;
+        let auth = MockServer::start().await;
+        Mock::given(method("GET"))
+            .respond_with(ResponseTemplate::new(401))
+            .expect(2)
+            .mount(&usage)
+            .await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "access_token": "rotated-access",
+                "refresh_token": "rotated-refresh",
+                "expires_in": 27000,
+                "scope": "user:profile"
+            })))
+            .expect(1)
+            .mount(&auth)
+            .await;
+
+        let store = Arc::new(quota_core::secrets::MemoryStore::default());
+        save_tokens(
+            store.as_ref(),
+            Provider::Anthropic,
+            "a",
+            &anthropic_tokens("rejected-access"),
+        )
+        .unwrap();
+        let mut state = app_state(store);
+        state.usage_url = usage.uri();
+        state.auth_configs.anthropic.token_url = format!("{}/token", auth.uri());
+
+        state.poll_one(Provider::Anthropic, "a").await;
+
+        assert_eq!(
+            state.scheduler.lock().await.state(Provider::Anthropic, "a"),
+            Some(AccountState::AuthExpired)
         );
     }
 }

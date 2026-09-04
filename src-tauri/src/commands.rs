@@ -1,15 +1,19 @@
-use crate::state::{AppState, StoreKind};
+use crate::state::{AppState, PendingManual, StoreKind};
 use quota_core::auth::callback::Callback;
+use quota_core::auth::openai::{self, DeviceCode, OpenAiIdentity, OpenAiPendingAuth, OpenAiTokenSet};
 use quota_core::auth::pkce::{
     authorize_url_for, begin, manual_redirect_uri, parse_manual_code, success_redirect, PendingAuth,
 };
-use quota_core::auth::token::{backfill_email, exchange_code, revoke, TokenSet};
+use quota_core::auth::stored::{
+    delete_tokens, load_tokens, revoke_tokens, StoredTokens,
+};
+use quota_core::auth::token::{exchange_code as exchange_anthropic_code, AuthError};
 use quota_core::model::AccountState;
-use quota_core::provider::{token_key, Provider, ProviderSpec};
+use quota_core::provider::Provider;
 use quota_core::scheduler::PollPolicy;
 use quota_core::secrets::{encrypted_file::EncryptedFileStore, timeout::TimeoutStore, SecretStore};
 use quota_core::usage::raw::RawResponse;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 use tauri::{Emitter, Manager, State};
@@ -170,17 +174,26 @@ pub(crate) async fn refresh_account_for(
 /// queued: each `begin_login` binds its own loopback port and holds it until
 /// its callback arrives, so N concurrent attempts leak N ports and N tasks,
 /// and only whichever callback lands first can win.
-static LOGIN_IN_FLIGHT: AtomicBool = AtomicBool::new(false);
+const NO_LOGIN: u64 = 0;
+static LOGIN_IN_FLIGHT: AtomicU64 = AtomicU64::new(NO_LOGIN);
+static NEXT_LOGIN_GENERATION: AtomicU64 = AtomicU64::new(1);
 
 /// Releases the flag on **every** exit path, including an early `return` deep
 /// inside the spawned task. A bare `store(false)` on the happy path would let
 /// one failed login block every later one for the life of the process, with
 /// the flag claiming a login is in progress and no task behind it.
-struct LoginGuard;
+struct LoginGuard {
+    generation: u64,
+}
 
 impl Drop for LoginGuard {
     fn drop(&mut self) {
-        LOGIN_IN_FLIGHT.store(false, Ordering::SeqCst);
+        let _ = LOGIN_IN_FLIGHT.compare_exchange(
+            self.generation,
+            NO_LOGIN,
+            Ordering::SeqCst,
+            Ordering::SeqCst,
+        );
     }
 }
 
@@ -212,16 +225,30 @@ fn login_timeout_secs() -> u64 {
     LOGIN_TIMEOUT_SECS
 }
 
-/// The two authorize URLs one login has (§10.3: "Always construct both URLs").
+/// The provider-specific login the settings window should present.
 ///
-/// Mirrors `LoginUrls` in `src/lib/types.ts`. Change both together.
+/// Internally tagged so the webview cannot mistake a Codex browser/device flow
+/// for Claude's manual `code#state` path. Mirrors `LoginStart` in
+/// `src/lib/types.ts`.
 #[derive(serde::Serialize)]
-pub struct LoginUrls {
-    /// `None` when no loopback socket could be bound, which is not fatal: the
-    /// manual redirect needs no local port, so the login continues with the
-    /// paste path alone.
-    pub loopback: Option<String>,
-    pub manual: String,
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum LoginStart {
+    ClaudeBrowser {
+        /// `None` when no loopback socket could be bound. Claude's manual URL
+        /// remains usable without one.
+        loopback: Option<String>,
+        manual: String,
+    },
+    CodexBrowser {
+        authorize_url: String,
+    },
+    CodexDevice {
+        verification_url: String,
+        /// A short-lived credential intentionally shown to the user. This type
+        /// does not derive `Debug`, so it cannot leak through incidental logs.
+        user_code: String,
+        expires_at: chrono::DateTime<chrono::Utc>,
+    },
 }
 
 /// Payload of `auth://manual-fallback`. Mirrors `ManualFallback` in
@@ -234,159 +261,418 @@ pub struct ManualFallback {
     pub reason: String,
 }
 
-/// Which `ProviderSpec` a login should use.
-///
-/// Both carry a debug-only `token_url` override (`main.rs`'s `token_url()`
-/// and `openai_token_url()`), used for Step 11's local-mock verification —
-/// the same seam `usage_url`/`openai_usage_url` already give the usage
-/// endpoint. Without OpenAI's half, `Provider::Openai` always resolved to the
-/// real `auth.openai.com`, and nothing could exercise a Codex login —
-/// `begin_login` → `complete_login` → `register_authenticated` — without
-/// reaching the real network, which AGENTS.md forbids a test to do.
-fn login_cfg(state: &AppState, provider: Provider) -> ProviderSpec {
-    match provider {
-        Provider::Anthropic => state.cfg.clone(),
-        Provider::Openai => state.openai_cfg.clone(),
+enum LoginTask {
+    ClaudeBrowser {
+        generation: u64,
+        callback: Callback,
+        pending: PendingAuth,
+        fallback_url: String,
+        cancelled: tokio::sync::oneshot::Receiver<()>,
+    },
+    CodexBrowser {
+        generation: u64,
+        callback: Callback,
+        pending: OpenAiPendingAuth,
+    },
+    CodexDevice {
+        generation: u64,
+        device: DeviceCode,
+    },
+}
+
+struct PreparedLogin {
+    start: LoginStart,
+    task: Option<LoginTask>,
+}
+
+enum LoginTaskFailure {
+    ClaudeFallback(ManualFallback),
+    Terminal(String),
+    Cancelled,
+}
+
+fn codex_device_start_error(error: AuthError) -> String {
+    if matches!(error, AuthError::OAuth { status: 404, .. }) {
+        return "Codex device sign-in is unavailable; enable it in ChatGPT security/workspace settings or free localhost ports 1455/1457 and try again".into();
+    }
+    error.to_string()
+}
+
+fn finish_login_generation(state: &AppState, generation: u64) {
+    let mut active = state.active_login.lock().unwrap();
+    if *active != Some(generation) {
+        return;
+    }
+    *active = None;
+    let mut pending = state.pending_manual.lock().unwrap();
+    if pending.as_ref().is_some_and(|value| value.generation == generation) {
+        if let Some(cancel) = pending.take().and_then(|value| value.cancel) {
+            let _ = cancel.send(());
+        }
     }
 }
 
-/// Starts a login. Returns both authorize URLs; the loopback callback, when
-/// there is one, is awaited in the background.
+fn release_login_single_flight(generation: u64) {
+    let _ = LOGIN_IN_FLIGHT.compare_exchange(
+        generation,
+        NO_LOGIN,
+        Ordering::SeqCst,
+        Ordering::SeqCst,
+    );
+}
+
+fn login_generation_is_active(state: &AppState, generation: u64) -> bool {
+    *state.active_login.lock().unwrap() == Some(generation)
+}
+
+async fn install_login_generation(
+    state: &AppState,
+    generation: u64,
+    pending: Option<PendingManual>,
+) {
+    let _commit = state.login_commit.lock().await;
+    let mut active = state.active_login.lock().unwrap();
+    let mut slot = state.pending_manual.lock().unwrap();
+    if let Some(cancel) = slot.take().and_then(|value| value.cancel) {
+        let _ = cancel.send(());
+    }
+    *slot = pending;
+    *active = Some(generation);
+}
+
+async fn prepare_claude_login(
+    state: &AppState,
+    generation: u64,
+    callback: std::io::Result<Callback>,
+) -> Result<PreparedLogin, String> {
+    let cfg = &state.auth_configs.anthropic;
+    let (pending, loopback, callback) = match callback {
+        Ok(callback) => {
+            let (pending, url) =
+                begin(cfg, &callback.redirect_uri()).map_err(|e| e.to_string())?;
+            (pending, Some(url), Some(callback))
+        }
+        Err(_) => (
+            begin(cfg, manual_redirect_uri())
+                .map_err(|e| e.to_string())?
+                .0,
+            None,
+            None,
+        ),
+    };
+    let manual = authorize_url_for(cfg, &pending, manual_redirect_uri())
+        .map_err(|e| e.to_string())?;
+
+    let (cancel, cancelled) = tokio::sync::oneshot::channel();
+    let has_callback = callback.is_some();
+    install_login_generation(
+        state,
+        generation,
+        Some(PendingManual {
+            generation,
+            pending: PendingAuth {
+                verifier: pending.verifier.clone(),
+                state: pending.state.clone(),
+                redirect_uri: manual_redirect_uri().to_string(),
+            },
+            cancel: has_callback.then_some(cancel),
+        }),
+    )
+    .await;
+
+    let task = callback.map(|callback| LoginTask::ClaudeBrowser {
+        generation,
+        callback,
+        pending,
+        fallback_url: manual.clone(),
+        cancelled,
+    });
+    Ok(PreparedLogin {
+        start: LoginStart::ClaudeBrowser { loopback, manual },
+        task,
+    })
+}
+
+async fn prepare_codex_login(
+    state: &AppState,
+    generation: u64,
+    callback: std::io::Result<Callback>,
+) -> Result<PreparedLogin, String> {
+    match callback {
+        Ok(callback) => {
+            let (pending, authorize_url) =
+                openai::begin_browser(&state.auth_configs.openai, &callback)
+                    .map_err(|e| e.to_string())?;
+            install_login_generation(state, generation, None).await;
+            Ok(PreparedLogin {
+                start: LoginStart::CodexBrowser { authorize_url },
+                task: Some(LoginTask::CodexBrowser {
+                    generation,
+                    callback,
+                    pending,
+                }),
+            })
+        }
+        Err(_) => {
+            let device = openai::request_device_code(&state.http, &state.auth_configs.openai)
+                .await
+                .map_err(codex_device_start_error)?;
+            let start = LoginStart::CodexDevice {
+                verification_url: device.verification_url.clone(),
+                user_code: device.user_code.clone(),
+                expires_at: device.expires_at,
+            };
+            install_login_generation(state, generation, None).await;
+            Ok(PreparedLogin {
+                start,
+                task: Some(LoginTask::CodexDevice { generation, device }),
+            })
+        }
+    }
+}
+
+async fn register_openai_grant(
+    state: &AppState,
+    tokens: OpenAiTokenSet,
+    identity: OpenAiIdentity,
+) -> Result<(), String> {
+    state
+        .register_authenticated(
+            &identity.account_id,
+            &identity.email,
+            StoredTokens::Openai(tokens),
+        )
+        .await
+}
+
+async fn complete_anthropic_login(
+    state: &AppState,
+    pending: &PendingAuth,
+    code: &str,
+    returned_state: &str,
+) -> Result<(), String> {
+    let (tokens, identity) = exchange_anthropic_code(
+        &state.http,
+        &state.auth_configs.anthropic,
+        Provider::Anthropic,
+        pending,
+        code,
+        returned_state,
+    )
+    .await
+    .map_err(|e| e.to_string())?;
+    let identity = identity.ok_or("the token response carried no account block")?;
+    state
+        .register_authenticated(
+            &identity.uuid,
+            &identity.email,
+            StoredTokens::Anthropic(tokens),
+        )
+        .await?;
+    Ok(())
+}
+
+async fn run_login_task(
+    state: &AppState,
+    task: LoginTask,
+) -> Result<Provider, LoginTaskFailure> {
+    match task {
+        LoginTask::ClaudeBrowser {
+            generation,
+            callback,
+            pending,
+            fallback_url,
+            mut cancelled,
+        } => {
+            let waited = tokio::select! {
+                _ = &mut cancelled => return Err(LoginTaskFailure::Cancelled),
+                waited = tokio::time::timeout(
+                    Duration::from_secs(login_timeout_secs()),
+                    callback.wait_for_code(success_redirect(), &pending.state),
+                ) => waited,
+            };
+            let fallback = |reason: String| {
+                LoginTaskFailure::ClaudeFallback(ManualFallback {
+                    url: fallback_url.clone(),
+                    reason,
+                })
+            };
+            let params = match waited {
+                Ok(Ok(params)) => params,
+                Ok(Err(e)) => {
+                    return Err(fallback(format!(
+                        "the browser reached this app but the reply could not be read ({e})"
+                    )))
+                }
+                Err(_) => {
+                    return Err(fallback(
+                        "no reply arrived from the browser. If it opened on another machine, it could not have reached this one"
+                            .into(),
+                    ))
+                }
+            };
+            let (Some(code), Some(returned_state)) =
+                (params.get("code"), params.get("state"))
+            else {
+                return Err(fallback(
+                    "the browser replied without an authorization code".into(),
+                ));
+            };
+            let _commit = state.login_commit.lock().await;
+            if !login_generation_is_active(state, generation) {
+                return Err(LoginTaskFailure::Cancelled);
+            }
+            if let Err(error) =
+                complete_anthropic_login(state, &pending, code, returned_state).await
+            {
+                finish_login_generation(state, generation);
+                return Err(LoginTaskFailure::Terminal(error));
+            }
+            finish_login_generation(state, generation);
+            Ok(Provider::Anthropic)
+        }
+        LoginTask::CodexBrowser {
+            generation,
+            callback,
+            pending,
+        } => {
+            let params = tokio::time::timeout(
+                Duration::from_secs(login_timeout_secs()),
+                callback.wait_for_code(&state.auth_configs.openai.issuer, pending.state()),
+            )
+            .await;
+            let params = match params {
+                Ok(Ok(params)) => params,
+                Ok(Err(e)) => {
+                    finish_login_generation(state, generation);
+                    return Err(LoginTaskFailure::Terminal(format!(
+                        "the browser callback could not be read ({e})"
+                    )));
+                }
+                Err(_) => {
+                    finish_login_generation(state, generation);
+                    return Err(LoginTaskFailure::Terminal(
+                        "no reply arrived from the browser".into(),
+                    ));
+                }
+            };
+            let (Some(code), Some(returned_state)) =
+                (params.get("code"), params.get("state"))
+            else {
+                finish_login_generation(state, generation);
+                return Err(LoginTaskFailure::Terminal(
+                    "the browser replied without an authorization code".into(),
+                ));
+            };
+            let _commit = state.login_commit.lock().await;
+            if !login_generation_is_active(state, generation) {
+                return Err(LoginTaskFailure::Cancelled);
+            }
+            let exchanged = openai::exchange_code(
+                &state.http,
+                &state.auth_configs.openai,
+                &pending,
+                code,
+                returned_state,
+            )
+            .await;
+            let (tokens, identity) = match exchanged {
+                Ok(value) => value,
+                Err(error) => {
+                    finish_login_generation(state, generation);
+                    return Err(LoginTaskFailure::Terminal(error.to_string()));
+                }
+            };
+            if let Err(error) = register_openai_grant(state, tokens, identity).await {
+                finish_login_generation(state, generation);
+                return Err(LoginTaskFailure::Terminal(error));
+            }
+            finish_login_generation(state, generation);
+            Ok(Provider::Openai)
+        }
+        LoginTask::CodexDevice { generation, device } => {
+            let completed = openai::complete_device_code(
+                &state.http,
+                &state.auth_configs.openai,
+                &device,
+            )
+            .await;
+            let _commit = state.login_commit.lock().await;
+            if !login_generation_is_active(state, generation) {
+                return Err(LoginTaskFailure::Cancelled);
+            }
+            let (tokens, identity) = match completed {
+                Ok(value) => value,
+                Err(error) => {
+                    finish_login_generation(state, generation);
+                    return Err(LoginTaskFailure::Terminal(error.to_string()));
+                }
+            };
+            if let Err(error) = register_openai_grant(state, tokens, identity).await {
+                finish_login_generation(state, generation);
+                return Err(LoginTaskFailure::Terminal(error));
+            }
+            finish_login_generation(state, generation);
+            Ok(Provider::Openai)
+        }
+    }
+}
+
+/// Starts the selected provider's login and waits for its completion in the
+/// background when there is a listener or device grant to wait on.
 ///
 /// Events: `accounts://changed` on success, `auth://failed` when a login
 /// definitely cannot be recovered, and `auth://manual-fallback` when the
 /// loopback path gave up but §10.3's paste path still can finish it.
 #[tauri::command]
-pub async fn begin_login(app: tauri::AppHandle, provider: Provider) -> Result<LoginUrls, String> {
+pub async fn begin_login(app: tauri::AppHandle, provider: Provider) -> Result<LoginStart, String> {
+    let generation = NEXT_LOGIN_GENERATION.fetch_add(1, Ordering::SeqCst);
     if LOGIN_IN_FLIGHT
-        .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+        .compare_exchange(NO_LOGIN, generation, Ordering::SeqCst, Ordering::SeqCst)
         .is_err()
     {
         return Err("a login is already in progress".into());
     }
-    let guard = LoginGuard;
+    let guard = LoginGuard { generation };
 
-    let cfg = login_cfg(&app.state::<AppState>(), provider);
-
-    // Bind before building the authorize URL: `redirect_uri` must carry the
-    // real port, and that exact string is replayed at token exchange
-    // (auth/callback.rs:25-27, pkce.rs `PendingAuth::redirect_uri`).
-    //
-    // **A bind failure is no longer fatal.** It used to end the login; §10.3's
-    // manual redirect needs no socket of our own, so the only thing lost is the
-    // automatic half.
-    let cb = Callback::bind().await;
-    // `begin` returns a `Result` because `authorize_url` is user-overridable
-    // (§10.2), so a bad config value surfaces here instead of crashing a login
-    // in progress (pkce.rs:75-81).
-    let (pending, loopback) = match &cb {
-        Ok(cb) => {
-            let (p, u) = begin(&cfg, &cb.redirect_uri()).map_err(|e| e.to_string())?;
-            (p, Some(u))
+    let state = app.state::<AppState>();
+    let prepared = match provider {
+        Provider::Anthropic => {
+            prepare_claude_login(&state, generation, Callback::bind().await).await?
         }
-        // The PKCE pair still has to exist for the paste path, and this one is
-        // born with the manual redirect_uri because it will never be exchanged
-        // against any other.
-        Err(_) => (begin(&cfg, manual_redirect_uri()).map_err(|e| e.to_string())?.0, None),
+        Provider::Openai => {
+            prepare_codex_login(&state, generation, Callback::bind_openai().await).await?
+        }
+    };
+    let PreparedLogin { start, task } = prepared;
+
+    let Some(task) = task else {
+        // Claude's manual-only path has no background work. Do not leave the
+        // single-flight flag claiming otherwise.
+        drop(guard);
+        return Ok(start);
     };
 
-    let manual = authorize_url_for(&cfg, &pending, manual_redirect_uri()).map_err(|e| e.to_string())?;
-
-    // Stored before either path runs — see `AppState::pending_manual`. Only the
-    // redirect_uri differs from `pending`; sharing the verifier and state is
-    // what lets a code issued for either URL be exchanged here. `provider`
-    // travels alongside it so `finish_manual_login` knows which token endpoint
-    // a pasted code belongs to.
-    *app.state::<AppState>().pending_manual.lock().unwrap() = Some((
-        provider,
-        PendingAuth {
-            verifier: pending.verifier.clone(),
-            state: pending.state.clone(),
-            redirect_uri: manual_redirect_uri().to_string(),
-        },
-    ));
-
-    let Ok(cb) = cb else {
-        // Nothing to wait on, so `guard` drops here and releases the
-        // single-flight flag rather than stranding it behind a task that does
-        // not exist. The webview sees `loopback: None` and goes straight to the
-        // paste form.
-        return Ok(LoginUrls { loopback: None, manual });
-    };
-
-    let fallback_url = manual.clone();
     let handle = app.clone();
     tauri::async_runtime::spawn(async move {
-        // Moved in, so the single-flight flag is released whichever way this
-        // task ends.
         let _guard = guard;
         let state = handle.state::<AppState>();
-
-        // The whole wait is bounded. `wait_for_code`'s own timeout covers one
-        // connection's header read and then continues (callback.rs:99-105);
-        // nothing inside it bounds the overall wait, so an abandoned login
-        // would hold its port for the life of the process.
-        let waited = tokio::time::timeout(
-            Duration::from_secs(login_timeout_secs()),
-            // The second argument is the listener's own state guard, not a
-            // duplicate of `exchange_code`'s check: the listener is
-            // single-shot, so without it "a single stray or forged request
-            // with the wrong state would consume the listener and strand the
-            // real callback with nowhere to land" (callback.rs:59-61).
-            cb.wait_for_code(success_redirect(), &pending.state),
-        )
-        .await;
-
-        // Everything up to holding a code is a *loopback* failure, and §10.3's
-        // paste path can still finish the same login — the PKCE pair is shared
-        // and already stored. So these three report `auth://manual-fallback`
-        // rather than `auth://failed`, which would tell the user a login had
-        // ended when the half that can still work has not been offered yet.
-        //
-        // Each reason is a different sentence on purpose: "no callback arrived"
-        // and "the callback was unreadable" send the user to different places,
-        // and the first is the ordinary outcome of authorising in a browser on
-        // another machine, which is the case this whole path exists for.
-        let fallback = |reason: &str| {
-            let _ = handle.emit(
-                "auth://manual-fallback",
-                ManualFallback { url: fallback_url.clone(), reason: reason.to_string() },
-            );
-        };
-
-        let params = match waited {
-            Ok(Ok(p)) => p,
-            Ok(Err(e)) => {
-                fallback(&format!("the browser reached this app but the reply could not be read ({e})"));
-                return;
-            }
-            Err(_) => {
-                fallback(
-                    "no reply arrived from the browser. If it opened on another machine, \
-                     it could not have reached this one",
-                );
-                return;
-            }
-        };
-
-        let (Some(code), Some(returned_state)) = (params.get("code"), params.get("state")) else {
-            fallback("the browser replied without an authorization code");
-            return;
-        };
-
-        // This path reports both outcomes as events, because nobody is waiting
-        // on its return value — it runs in a detached task.
-        match complete_login(&state, provider, &pending, code, returned_state).await {
-            Ok(()) => {
+        match run_login_task(&state, task).await {
+            Ok(provider) => {
                 let _ = handle.emit("accounts://changed", ());
+                let _ = handle.emit("auth://completed", provider);
             }
-            Err(e) => {
-                let _ = handle.emit("auth://failed", e);
+            Err(LoginTaskFailure::ClaudeFallback(fallback)) => {
+                let _ = handle.emit("auth://manual-fallback", fallback);
             }
+            Err(LoginTaskFailure::Terminal(error)) => {
+                let _ = handle.emit("auth://failed", error);
+            }
+            Err(LoginTaskFailure::Cancelled) => {}
         }
     });
 
-    Ok(LoginUrls { loopback, manual })
+    Ok(start)
 }
 
 /// Mirrors `AutostartView` in `src/lib/types.ts`. Change both together.
@@ -446,31 +732,45 @@ pub fn set_autostart(app: tauri::AppHandle, enabled: bool) -> Result<AutostartVi
 /// guessing which.
 #[tauri::command]
 pub async fn submit_manual_code(app: tauri::AppHandle, pasted: String) -> Result<(), String> {
-    finish_manual_login(&app.state::<AppState>(), &pasted).await?;
-    let _ = app.emit("accounts://changed", ());
-    Ok(())
+    let events = app.clone();
+    finish_manual_login_with(&app.state::<AppState>(), &pasted, move || {
+        let _ = events.emit("accounts://changed", ());
+        let _ = events.emit("auth://completed", Provider::Anthropic);
+    })
+    .await
 }
 
 /// The whole of `submit_manual_code` except the event, so that it can be
 /// tested: `src-tauri` has no dev-dependency on tauri's `test` feature, and a
 /// function holding an `AppHandle` cannot be called without one. Same split as
 /// `complete_login`, for the same reason.
-pub(crate) async fn finish_manual_login(state: &AppState, pasted: &str) -> Result<(), String> {
+async fn finish_manual_login_with<F>(
+    state: &AppState,
+    pasted: &str,
+    on_success: F,
+) -> Result<(), String>
+where
+    F: FnOnce() + Send,
+{
     let (code, returned_state) = parse_manual_code(pasted).ok_or(
         "that is not a code#state line. Copy the whole line from the page, \
          including the # and everything after it",
     )?;
 
-    // Cloned out from under the lock rather than held across the exchange: this
-    // is a `std::sync` guard and `complete_login` awaits. `provider` travels
-    // with `pending` — see `AppState::pending_manual` — so a pasted Codex code
-    // is exchanged against Codex's token endpoint, not Anthropic's.
-    let (provider, pending) = state
-        .pending_manual
-        .lock()
-        .unwrap()
-        .clone()
-        .ok_or("no login is waiting for a code. Press Add account to start one")?;
+    // Serialize the generation check with the exchange and persistence. A new
+    // begin_login can replace an abandoned manual-only attempt, but it cannot
+    // replace one after its code has begun committing.
+    let _commit = state.login_commit.lock().await;
+    let (generation, pending) = {
+        let waiting = state.pending_manual.lock().unwrap();
+        let waiting = waiting
+            .as_ref()
+            .ok_or("no login is waiting for a code. Press Add account to start one")?;
+        (waiting.generation, waiting.pending.clone())
+    };
+    if !login_generation_is_active(state, generation) {
+        return Err("that login attempt is no longer active. Press Add account to start one".into());
+    }
 
     // **Advisory, not the enforcement.** `exchange_code` performs this same
     // comparison before it touches the network (auth/token.rs:226-231) and is
@@ -484,89 +784,22 @@ pub(crate) async fn finish_manual_login(state: &AppState, pasted: &str) -> Resul
             .into());
     }
 
-    complete_login(state, provider, &pending, code, returned_state).await
+    complete_anthropic_login(state, &pending, code, returned_state).await?;
+    // Emit completion while the generation is still current and the commit
+    // mutex is held. Otherwise a new login can start between persistence and
+    // this event and receive the previous attempt's completion signal.
+    on_success();
+    finish_login_generation(state, generation);
+    // The loopback task may still be unwinding from its cancellation. Release
+    // immediately for the manual path; its generation-aware guard cannot clear
+    // a newer attempt when it eventually drops.
+    release_login_single_flight(generation);
+    Ok(())
 }
 
-/// Exchanges an authorization code, stores the token, and registers the
-/// account.
-///
-/// **Shared by both of §10.3's paths** — the loopback callback and the manual
-/// paste. They differ only in `pending.redirect_uri`, which `exchange_code`
-/// replays exactly as given, so nothing in here branches on which one is
-/// running. One copy is the point: every failure below is a case where doing
-/// the obvious thing instead would register a broken account, and a second copy
-/// would go stale on whichever path its author was not looking at.
-///
-/// **Reports neither outcome itself, and takes no `AppHandle`.** The two
-/// callers need different things: the detached loopback task has no return
-/// value anyone reads and must emit both outcomes, while `submit_manual_code`
-/// is a command whose rejection belongs in its own `Result` so the paste form
-/// can show it beside the field. Keeping `AppHandle` out is also what makes
-/// this function reachable from a test — `src-tauri` has no dev-dependency on
-/// `tauri`'s `test` feature, so anything holding a handle cannot be called
-/// without one.
-pub(crate) async fn complete_login(
-    state: &AppState,
-    provider: Provider,
-    pending: &PendingAuth,
-    code: &str,
-    returned_state: &str,
-) -> Result<(), String> {
-    let cfg = login_cfg(state, provider);
-    let (tokens, identity) = exchange_code(&state.http, &cfg, provider, pending, code, returned_state)
-        .await
-        .map_err(|e| e.to_string())?;
-    // Without an identifier there is no key. Never substitute the email
-    // (§9.3) — it is display-only and user-editable. Reachable only for
-    // Anthropic: `exchange_code` never returns `Ok((_, None))` for OpenAI,
-    // whose absence instead fails loudly through `AuthError::NoAccountIdentifier`
-    // above (Step 3 of the Codex login task).
-    let mut identity = identity.ok_or("the token response carried no account block")?;
-
-    // §9.3: OpenAI's token response may carry no email at all — that shape has
-    // never been measured — and a row whose label defaults to an empty string
-    // is one the user cannot tell apart from another. A no-op for Anthropic,
-    // whose response always carries one. A failed usage fetch here must not
-    // fail a login that already succeeded — `backfill_email` swallows it and
-    // leaves the label blank instead, which the user can rename.
-    let usage_url = match provider {
-        Provider::Anthropic => &state.usage_url,
-        Provider::Openai => &state.openai_usage_url,
-    };
-    backfill_email(&state.http, provider, usage_url, &mut identity, &tokens.access_token).await;
-
-    // Serialization failure fails loudly. Falling through to the account write
-    // would register an account with no credential behind it: `ensure_fresh`
-    // would report `Missing`, that classifies to AUTH_DEAD, `record()` would
-    // persist the quarantine, and the user would be looking at a dead account
-    // produced by a login that appeared to succeed.
-    let blob = serde_json::to_vec(&tokens)
-        .map_err(|e| format!("the token could not be serialized: {e}"))?;
-
-    // Synchronous and able to block a real thread (timeout.rs:144-156), so it
-    // goes on a blocking thread rather than an async worker — the same
-    // principle `refresh_account` applies when it answers AUTH_EXPIRED instead
-    // of waiting on the refresh mutex.
-    let store = state.secrets();
-    let key = token_key(provider, &identity.uuid);
-    tauri::async_runtime::spawn_blocking(move || store.put(&key, &blob))
-        .await
-        .map_err(|e| format!("the token store task failed: {e}"))?
-        .map_err(|e| format!("the token could not be stored: {e}"))?;
-
-    state
-        .register_authenticated(provider, &identity.uuid, &identity.email)
-        .await
-        .map_err(|e| format!("the account could not be saved: {e}"))?;
-
-    // The login is over, so §10.3's paste copy of it is a dead value. Left
-    // behind, the next loopback failure would hand the user a form that refuses
-    // every code as belonging to an older attempt. Cleared here rather than in
-    // `submit_manual_code` so a login finished through the loopback clears it
-    // too — both routes end here.
-    *state.pending_manual.lock().unwrap() = None;
-
-    Ok(())
+#[cfg(test)]
+pub(crate) async fn finish_manual_login(state: &AppState, pasted: &str) -> Result<(), String> {
+    finish_manual_login_with(state, pasted, || {}).await
 }
 
 #[tauri::command]
@@ -581,7 +814,7 @@ pub async fn remove_account(
 }
 
 /// The whole of `remove_account` except the event, so it can be tested without
-/// an `AppHandle` — the same split `finish_manual_login`/`complete_login` use.
+/// an `AppHandle` — the same split the login completion helpers use.
 ///
 /// Takes `provider` rather than assuming Anthropic: the primary key is the
 /// pair (§9.3), and an id-only lookup would remove the wrong account, or
@@ -592,8 +825,8 @@ pub(crate) async fn remove_account_for(
     provider: Provider,
     uuid: &str,
 ) -> Result<(), String> {
-    let key = token_key(provider, uuid);
     let store = state.secrets();
+    let _account_lock = state.refresh_locks.lock_account(provider, uuid).await;
 
     // Both store calls run on a blocking thread. `SecretStore` is synchronous
     // and `TimeoutStore` blocks a real thread on `recv_timeout`
@@ -604,42 +837,33 @@ pub(crate) async fn remove_account_for(
     //
     // Server-side revocation is best-effort (§10.6) and already bounded at 5s
     // internally (auth/token.rs:24, :330-338) — it needs no timeout of its own.
-    let raw = {
+    let loaded = {
         let store = Arc::clone(&store);
-        let key = key.clone();
-        tauri::async_runtime::spawn_blocking(move || store.get(&key)).await
+        let id = uuid.to_string();
+        tauri::async_runtime::spawn_blocking(move || load_tokens(store.as_ref(), provider, &id))
+            .await
+            .map_err(|e| format!("the token load task failed: {e}"))?
     };
-    if let Ok(Ok(Some(raw))) = raw {
-        if let Ok(t) = serde_json::from_slice::<TokenSet>(&raw) {
-            // `login_cfg`, not `state.cfg`: the token being revoked belongs to
-            // whichever provider this account is, and `state.cfg` is always
-            // Anthropic's spec. Sending an OpenAI refresh token to
-            // `state.cfg.revoke_url` would post a live Codex credential to
-            // `platform.claude.com` — not a silent no-op, a working credential
-            // reaching a vendor it does not belong to.
-            revoke(&state.http, &login_cfg(state, provider), &t.refresh_token).await;
-        }
+    if let Ok(tokens) = loaded {
+        revoke_tokens(&state.http, &state.auth_configs, &tokens).await;
     }
-    // **Not `let _ =`.** The comment above marks the server-side *revocation*
-    // as best-effort per §10.6; it says nothing about the local deletion, and
-    // the two are not equally harmless. This arm is reachable whenever the
-    // store is `LockedStore` or a `TimeoutStore` that has gone stuck, and in
-    // exactly that case the `store.get` above failed too, so the token is
-    // neither revoked server-side nor deleted locally — while the account row
-    // it belonged to disappears, leaving nothing that will ever retry it.
-    // Reporting it is the floor: the cached-snapshot arm below already prints
-    // its failure, and a surviving credential must not be quieter than a
-    // surviving percentage.
-    {
+    // Local deletion is not best-effort. If it fails, retain the row and
+    // scheduler entry so the user has a visible retry path to remove the still
+    // stored credential.
+    let _deleted = {
         let store = Arc::clone(&store);
-        let key = key.clone();
-        if let Ok(Err(e)) = tauri::async_runtime::spawn_blocking(move || store.delete(&key)).await {
-            eprintln!(
-                "{uuid}: the stored token could not be deleted ({e}); it may still be in the \
-                 credential store"
-            );
-        }
-    }
+        let id = uuid.to_string();
+        tauri::async_runtime::spawn_blocking(move || {
+            delete_tokens(store.as_ref(), provider, &id)
+        })
+        .await
+        .map_err(|e| format!("the token deletion task failed: {e}"))?
+        .map_err(|e| {
+            format!(
+                "the stored token could not be deleted ({e}); the account was kept so removal can be retried"
+            )
+        })?
+    };
 
     // Lock order: scheduler before accounts.
     state.scheduler.lock().await.remove(provider, uuid);
@@ -790,6 +1014,23 @@ pub async fn store_status(state: State<'_, AppState>) -> Result<StoreStatus, Str
     Ok(store_status_now(&state))
 }
 
+fn ensure_unlock_allowed(state: &AppState) -> Result<(), String> {
+    match state.store_kind() {
+        StoreKind::Keychain => {
+            Err("the OS keychain is open — there is nothing to unlock".into())
+        }
+        StoreKind::EncryptedFile => Err(
+            "the encrypted token store is already open — close and restart Quota Board to change it"
+                .into(),
+        ),
+        StoreKind::KeychainLocked => Err(
+            "a keychain exists on this machine but did not answer; unlock it in the OS and restart Quota Board. A passphrase here would open a different, empty store"
+                .into(),
+        ),
+        StoreKind::NoBackend => Ok(()),
+    }
+}
+
 /// docs/design.md §9.2's encrypted-file fallback, opened with a passphrase the
 /// user typed, and installed as this process's token store.
 #[tauri::command]
@@ -808,18 +1049,7 @@ pub async fn unlock_secrets(
     // `record_failure`'s one-strike quarantine never retries it. Only
     // `NoBackend` — no credential store registered on this machine at all —
     // may reach the fallback.
-    match state.store_kind() {
-        StoreKind::Keychain => {
-            return Err("the OS keychain is open — there is nothing to unlock".into())
-        }
-        StoreKind::KeychainLocked => {
-            return Err("a keychain exists on this machine but did not answer; \
-                        unlock it in the OS and restart Quota Board. A passphrase \
-                        here would open a different, empty store"
-                .into())
-        }
-        StoreKind::NoBackend | StoreKind::EncryptedFile => {}
-    }
+    ensure_unlock_allowed(&state)?;
     if passphrase.is_empty() {
         return Err("a passphrase is required".into());
     }
@@ -858,8 +1088,20 @@ pub async fn unlock_secrets(
         Err(e) => return Err(format!("the token store could not be opened: {e}")),
     };
 
-    // Dropped after the write guard is released — see `install_store`.
-    drop(state.install_store(store, StoreKind::EncryptedFile));
+    // A second command may have passed the first check while this one was
+    // deriving its key. The conditional install performs the re-check and swap
+    // under one write guard, so concurrent unlocks cannot install two
+    // independently cached views of the same encrypted file.
+    let replaced = match state.install_fallback_store(store) {
+        Ok(replaced) => replaced,
+        Err(unused) => {
+            drop(unused);
+            ensure_unlock_allowed(&state)?;
+            return Err("another token store was opened while this one was unlocking".into());
+        }
+    };
+    // Dropped after the write guard is released.
+    drop(replaced);
     // Every account has been failing against a store that was not there, so
     // each carries an exponential backoff of up to 64x the interval. Without
     // this the user types the right passphrase and nothing visible happens for
@@ -963,49 +1205,126 @@ pub async fn last_response(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::state::tests::app_state;
+    use crate::state::tests::{app_state, app_state_with};
     use quota_core::auth::pkce::PendingAuth;
-    use quota_core::secrets::MemoryStore;
+    use quota_core::auth::stored::{load_tokens, save_tokens};
+    use quota_core::auth::token::TokenSet;
+    use quota_core::provider::token_key;
+    use quota_core::secrets::{MemoryStore, SecretError};
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use wiremock::matchers::{method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
-    /// The manual pending a `begin_login` would have left behind, for the
-    /// given provider.
-    fn armed_as(state: &AppState, provider: Provider) -> PendingAuth {
+    #[derive(Default)]
+    struct DeleteFailsOnceStore {
+        inner: MemoryStore,
+        fail: std::sync::atomic::AtomicBool,
+    }
+
+    impl DeleteFailsOnceStore {
+        fn arm(&self) {
+            self.fail.store(true, Ordering::SeqCst);
+        }
+    }
+
+    impl SecretStore for DeleteFailsOnceStore {
+        fn put(&self, key: &str, value: &[u8]) -> Result<(), SecretError> {
+            self.inner.put(key, value)
+        }
+
+        fn get(&self, key: &str) -> Result<Option<Vec<u8>>, SecretError> {
+            self.inner.get(key)
+        }
+
+        fn delete(&self, key: &str) -> Result<bool, SecretError> {
+            if key.ends_with(":refresh") && self.fail.swap(false, Ordering::SeqCst) {
+                return Err(SecretError::Backend("injected delete failure".into()));
+            }
+            self.inner.delete(key)
+        }
+
+        fn describe(&self) -> String {
+            "delete-fails-once (test only)".into()
+        }
+    }
+
+    async fn send_callback(port: u16, path: &str, state: &str) {
+        let mut socket = tokio::net::TcpStream::connect(("127.0.0.1", port))
+            .await
+            .unwrap();
+        socket
+            .write_all(
+                format!(
+                    "GET {path}?code=loopback-code&state={state} HTTP/1.1\r\nHost: localhost\r\n\r\n"
+                )
+                .as_bytes(),
+            )
+            .await
+            .unwrap();
+        let mut response = Vec::new();
+        socket.read_to_end(&mut response).await.unwrap();
+    }
+
+    /// The Claude manual pending a `begin_login` would have left behind.
+    fn armed(state: &AppState) -> PendingAuth {
         let pending = PendingAuth {
             verifier: "v-verifier".into(),
             state: "s-state".into(),
             redirect_uri: manual_redirect_uri().to_string(),
         };
-        *state.pending_manual.lock().unwrap() = Some((provider, pending.clone()));
+        let generation = NEXT_LOGIN_GENERATION.fetch_add(1, Ordering::SeqCst);
+        *state.active_login.lock().unwrap() = Some(generation);
+        *state.pending_manual.lock().unwrap() = Some(PendingManual {
+            generation,
+            pending: pending.clone(),
+            cancel: None,
+        });
         pending
     }
 
-    /// `armed_as` fixed to `Provider::Anthropic`, which is what every test in
-    /// this module needed before Codex had a login path of its own.
-    fn armed(state: &AppState) -> PendingAuth {
-        armed_as(state, Provider::Anthropic)
-    }
-
-    /// `login_cfg` is the one place `begin_login` and `complete_login` decide
-    /// which endpoints a login talks to. Each provider carries its own
-    /// debug-only override (`main.rs`'s `token_url()` / `openai_token_url()`),
-    /// and the two must stay independent — overriding one must never leak
-    /// into the other, which is the whole reason `AppState` carries `cfg` and
-    /// `openai_cfg` as two fields rather than one.
+    /// The two protocol configs stay distinct rather than guessing OpenAI's
+    /// endpoints through Anthropic's `ProviderSpec` shape.
     #[test]
-    fn each_providers_login_cfg_carries_its_own_override() {
+    fn auth_configs_keep_provider_overrides_separate() {
         let mut state = app_state(Arc::new(MemoryStore::default()));
-        state.cfg.token_url = "http://127.0.0.1:1/overridden-anthropic".into();
-        state.openai_cfg.token_url = "http://127.0.0.1:1/overridden-openai".into();
+        state.auth_configs.anthropic.token_url =
+            "http://127.0.0.1:1/overridden-anthropic".into();
+        state.auth_configs.openai.issuer = "http://127.0.0.1:2/overridden-openai".into();
 
-        assert_eq!(login_cfg(&state, Provider::Anthropic).token_url, state.cfg.token_url);
-        assert_eq!(login_cfg(&state, Provider::Openai).token_url, state.openai_cfg.token_url);
         assert_ne!(
-            login_cfg(&state, Provider::Anthropic).token_url,
-            login_cfg(&state, Provider::Openai).token_url,
+            state.auth_configs.anthropic.token_url,
+            state.auth_configs.openai.issuer,
             "the two providers' overrides must not collide"
         );
+    }
+
+    #[test]
+    fn login_start_serializes_as_three_disjoint_provider_flows() {
+        let claude = serde_json::to_value(LoginStart::ClaudeBrowser {
+            loopback: Some("https://claude.example/loopback".into()),
+            manual: "https://claude.example/manual".into(),
+        })
+        .unwrap();
+        assert_eq!(claude["kind"], "claude_browser");
+        assert!(claude.get("authorize_url").is_none());
+        assert!(claude.get("user_code").is_none());
+
+        let browser = serde_json::to_value(LoginStart::CodexBrowser {
+            authorize_url: "https://openai.example/authorize".into(),
+        })
+        .unwrap();
+        assert_eq!(browser["kind"], "codex_browser");
+        assert!(browser.get("manual").is_none());
+
+        let device = serde_json::to_value(LoginStart::CodexDevice {
+            verification_url: "https://openai.example/device".into(),
+            user_code: "ABCD-EFGH".into(),
+            expires_at: chrono::DateTime::from_timestamp(1_800_000_000, 0).unwrap(),
+        })
+        .unwrap();
+        assert_eq!(device["kind"], "codex_device");
+        assert_eq!(device["user_code"], "ABCD-EFGH");
+        assert!(device.get("manual").is_none());
     }
 
     fn token_body(account: Option<serde_json::Value>) -> serde_json::Value {
@@ -1024,15 +1343,7 @@ mod tests {
 
     async fn state_against(server: &MockServer) -> AppState {
         let mut state = app_state(Arc::new(MemoryStore::default()));
-        state.cfg.token_url = format!("{}/v1/oauth/token", server.uri());
-        state
-    }
-
-    /// Codex's half of `state_against`, pointed at `openai_cfg` instead of
-    /// `cfg` — what makes a Codex login reachable against a mock at all.
-    async fn state_against_openai(server: &MockServer) -> AppState {
-        let mut state = app_state(Arc::new(MemoryStore::default()));
-        state.openai_cfg.token_url = format!("{}/oauth/token", server.uri());
+        state.auth_configs.anthropic.token_url = format!("{}/v1/oauth/token", server.uri());
         state
     }
 
@@ -1103,44 +1414,180 @@ mod tests {
         );
     }
 
-    /// The Codex counterpart to the test above — the same coverage
-    /// `Provider::Anthropic` already had, driven through `finish_manual_login`
-    /// → `complete_login` → `register_authenticated` for `Provider::Openai`
-    /// against a mock standing in for `auth.openai.com`. `begin_login` itself
-    /// still cannot be called directly (it needs a real `AppHandle`), the
-    /// same reason the Anthropic test above goes through the paste path
-    /// rather than the loopback one.
-    ///
-    /// `state_against_openai`'s `openai_cfg.token_url` override is what makes
-    /// this reachable at all: before it existed, `login_cfg` resolved every
-    /// `Provider::Openai` login straight to the real `auth.openai.com`, and
-    /// no test could drive this path without reaching the real network,
-    /// which AGENTS.md forbids.
     #[tokio::test]
-    async fn a_good_codex_paste_stores_the_token_and_registers_the_account() {
+    async fn manual_success_cancels_a_late_callback_before_a_second_exchange() {
         let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/oauth/token"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_delay(Duration::from_millis(150))
+                    .set_body_json(token_body(Some(serde_json::json!({
+                        "uuid": "u-race", "email_address": "race@example.invalid"
+                    })))),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let state = state_against(&server).await;
+        let callback = Callback::bind().await.unwrap();
+        let port = callback.port();
+        let generation = NEXT_LOGIN_GENERATION.fetch_add(1, Ordering::SeqCst);
+        let prepared = prepare_claude_login(&state, generation, Ok(callback))
+            .await
+            .unwrap();
+        let returned_state = state
+            .pending_manual
+            .lock()
+            .unwrap()
+            .as_ref()
+            .unwrap()
+            .pending
+            .state
+            .clone();
+        let state = Arc::new(state);
+        let background = {
+            let state = Arc::clone(&state);
+            tokio::spawn(async move { run_login_task(&state, prepared.task.unwrap()).await })
+        };
+        let manual = {
+            let state = Arc::clone(&state);
+            let pasted = format!("manual-code#{returned_state}");
+            tokio::spawn(async move {
+                finish_manual_login(&state, &pasted).await
+            })
+        };
+
+        for _ in 0..100 {
+            if server.received_requests().await.unwrap().len() == 1 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        send_callback(port, "/callback", &returned_state).await;
+
+        manual.await.unwrap().unwrap();
+        assert!(matches!(
+            background.await.unwrap(),
+            Err(LoginTaskFailure::Cancelled)
+        ));
+        assert_eq!(server.received_requests().await.unwrap().len(), 1);
+        assert!(state.pending_manual.lock().unwrap().is_none());
+        assert!(state.active_login.lock().unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn terminal_claude_callback_failure_clears_the_attempt() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/oauth/token"))
+            .respond_with(ResponseTemplate::new(500))
+            .mount(&server)
+            .await;
+        let state = Arc::new(state_against(&server).await);
+        let callback = Callback::bind().await.unwrap();
+        let port = callback.port();
+        let generation = NEXT_LOGIN_GENERATION.fetch_add(1, Ordering::SeqCst);
+        let prepared = prepare_claude_login(&state, generation, Ok(callback))
+            .await
+            .unwrap();
+        let returned_state = state
+            .pending_manual
+            .lock()
+            .unwrap()
+            .as_ref()
+            .unwrap()
+            .pending
+            .state
+            .clone();
+        LOGIN_IN_FLIGHT.store(generation, Ordering::SeqCst);
+        let guard = LoginGuard { generation };
+        let background = {
+            let state = Arc::clone(&state);
+            tokio::spawn(async move { run_login_task(&state, prepared.task.unwrap()).await })
+        };
+        send_callback(port, "/callback", &returned_state).await;
+
+        assert!(matches!(
+            background.await.unwrap(),
+            Err(LoginTaskFailure::Terminal(_))
+        ));
+        assert!(state.pending_manual.lock().unwrap().is_none());
+        assert!(state.active_login.lock().unwrap().is_none());
+        drop(guard);
+        assert_eq!(LOGIN_IN_FLIGHT.load(Ordering::SeqCst), NO_LOGIN);
+    }
+
+    /// With both registered callback ports unavailable, the desktop requests a
+    /// device code and completes the whole flow in Rust. Every endpoint here is
+    /// loopback; no test consumes a real account's authorization or quota.
+    #[tokio::test]
+    async fn codex_device_fallback_stores_split_tokens_and_registers_context() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/api/accounts/deviceauth/usercode"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "device_auth_id": "device-secret",
+                "user_code": "ABCD-EFGH",
+                "interval": 1
+            })))
+            .mount(&server)
+            .await;
+        let verifier = "device-verifier";
+        Mock::given(method("POST"))
+            .and(path("/api/accounts/deviceauth/token"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "authorization_code": "device-code",
+                "code_challenge": quota_core::auth::pkce::code_challenge_s256(verifier),
+                "code_verifier": verifier
+            })))
+            .mount(&server)
+            .await;
         Mock::given(method("POST"))
             .and(path("/oauth/token"))
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-                "access_token": "codex-at-1",
+                "id_token": concat!(
+                    "e30.",
+                    "eyJlbWFpbCI6Indob0BleGFtcGxlLmludmFsaWQiLCJodHRwczovL2FwaS5vcGVuYWkuY29tL2F1dGgiOnsiY2hhdGdwdF91c2VyX2lkIjoiY29kZXgtdXNlci0xIiwiY2hhdGdwdF9hY2NvdW50X2lkIjoid29ya3NwYWNlLW9uZSIsImNoYXRncHRfcGxhbl90eXBlIjoicGx1cyIsImNoYXRncHRfYWNjb3VudF9pc19mZWRyYW1wIjp0cnVlfX0",
+                    ".signature"
+                ),
+                "access_token": "e30.eyJleHAiOjk5OTk5OTk5OTl9.signature",
                 "refresh_token": "codex-rt-1",
-                "expires_in": 28799,
-                // OpenAI's shape has never been measured — `account_id` is one
-                // of `account_id_from`'s three guessed candidates.
-                "account_id": "codex-user-1"
             })))
             .mount(&server)
             .await;
 
-        let state = state_against_openai(&server).await;
-        armed_as(&state, Provider::Openai);
+        let mut state = app_state(Arc::new(MemoryStore::default()));
+        state.auth_configs.openai.issuer = server.uri();
+        // Proves a Codex start cannot leave Claude's code#state route armed.
+        armed(&state);
+        let prepared = prepare_codex_login(
+            &state,
+            7001,
+            Err(std::io::Error::new(
+                std::io::ErrorKind::AddrInUse,
+                "both registered ports are occupied",
+            )),
+        )
+        .await
+        .unwrap();
+        let start = serde_json::to_value(&prepared.start).unwrap();
+        assert_eq!(start["kind"], "codex_device");
+        assert_eq!(start["user_code"], "ABCD-EFGH");
+        assert!(state.pending_manual.lock().unwrap().is_none());
 
-        finish_manual_login(&state, "the-code#s-state").await.unwrap();
+        let provider = match run_login_task(&state, prepared.task.unwrap()).await {
+            Ok(provider) => provider,
+            Err(_) => panic!("the local device flow did not complete"),
+        };
+        assert_eq!(provider, Provider::Openai);
 
-        let stored = state.secrets().get(&token_key(Provider::Openai, "codex-user-1")).unwrap();
-        assert!(stored.is_some(), "the token never reached the store");
-        let tokens: TokenSet = serde_json::from_slice(&stored.unwrap()).unwrap();
-        assert_eq!(tokens.access_token, "codex-at-1");
+        let stored = load_tokens(state.secrets().as_ref(), Provider::Openai, "codex-user-1")
+            .expect("the split Codex credential was not loadable");
+        assert_eq!(stored.access_token(), "e30.eyJleHAiOjk5OTk5OTk5OTl9.signature");
+        assert_eq!(stored.workspace_id(), Some("workspace-one"));
+        assert!(stored.is_fedramp());
 
         let accounts = state.accounts.lock().await;
         let a = accounts
@@ -1148,11 +1595,93 @@ mod tests {
             .iter()
             .find(|a| a.account_id == "codex-user-1")
             .expect("the Codex account was not registered");
-        assert_eq!(a.provider, Provider::Openai, "the account did not carry the Codex provider");
+        assert_eq!(a.workspace_id.as_deref(), Some("workspace-one"));
+        assert!(a.is_fedramp);
+    }
 
+    #[tokio::test]
+    async fn codex_browser_callback_exchanges_and_registers_without_a_manual_route() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/oauth/token"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "id_token": concat!(
+                    "e30.",
+                    "eyJlbWFpbCI6Indob0BleGFtcGxlLmludmFsaWQiLCJodHRwczovL2FwaS5vcGVuYWkuY29tL2F1dGgiOnsiY2hhdGdwdF91c2VyX2lkIjoiY29kZXgtdXNlci0xIiwiY2hhdGdwdF9hY2NvdW50X2lkIjoid29ya3NwYWNlLW9uZSIsImNoYXRncHRfcGxhbl90eXBlIjoicGx1cyIsImNoYXRncHRfYWNjb3VudF9pc19mZWRyYW1wIjp0cnVlfX0",
+                    ".signature"
+                ),
+                "access_token": "e30.eyJleHAiOjk5OTk5OTk5OTl9.signature",
+                "refresh_token": "browser-refresh"
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let mut state = app_state(Arc::new(MemoryStore::default()));
+        state.auth_configs.openai.issuer = server.uri();
+        let callback = Callback::bind_openai().await.unwrap();
+        let port = callback.port();
+        let prepared = prepare_codex_login(&state, 7002, Ok(callback))
+            .await
+            .unwrap();
+        assert!(matches!(prepared.start, LoginStart::CodexBrowser { .. }));
+        assert!(state.pending_manual.lock().unwrap().is_none());
+        let returned_state = match prepared.task.as_ref().unwrap() {
+            LoginTask::CodexBrowser { pending, .. } => pending.state().to_string(),
+            _ => panic!("a browser callback prepared the wrong task"),
+        };
+        let state = Arc::new(state);
+        let background = {
+            let state = Arc::clone(&state);
+            tokio::spawn(async move { run_login_task(&state, prepared.task.unwrap()).await })
+        };
+        send_callback(port, "/auth/callback", &returned_state).await;
+        assert!(matches!(background.await.unwrap(), Ok(Provider::Openai)));
+        assert!(load_tokens(
+            state.secrets().as_ref(),
+            Provider::Openai,
+            "codex-user-1"
+        )
+        .is_ok());
+    }
+
+    #[test]
+    fn device_404_explains_both_available_remedies() {
+        let message = codex_device_start_error(AuthError::OAuth {
+            status: 404,
+            code: None,
+            description: None,
+        });
+        assert!(message.contains("enable it in ChatGPT"), "{message}");
+        assert!(message.contains("1455/1457"), "{message}");
+        assert!(!message.contains("OAuth error"), "{message}");
+    }
+
+    #[tokio::test]
+    async fn an_open_encrypted_store_cannot_be_swapped_during_refresh() {
+        let installed: Arc<dyn SecretStore> = Arc::new(MemoryStore::default());
+        let state = app_state_with(
+            Arc::clone(&installed),
+            StoreKind::EncryptedFile,
+            std::env::temp_dir().join("quota-repeat-unlock-settings.json"),
+        );
+        let _refresh = state
+            .refresh_locks
+            .lock_account(Provider::Anthropic, "a")
+            .await;
+        let before = state.secrets();
+
+        let error = ensure_unlock_allowed(&state).unwrap_err();
+        assert!(error.contains("already open"), "{error}");
+        let candidate: Arc<dyn SecretStore> = Arc::new(MemoryStore::default());
         assert!(
-            state.pending_manual.lock().unwrap().is_none(),
-            "the finished login was left armed"
+            state.install_fallback_store(candidate).is_err(),
+            "the atomic install bypassed the command's repeated-unlock check"
+        );
+        let after = state.secrets();
+        assert!(
+            Arc::ptr_eq(&before, &after) && Arc::ptr_eq(&installed, &after),
+            "a repeated unlock swapped the live store"
         );
     }
 
@@ -1216,6 +1745,7 @@ mod tests {
         let mut accounts = state.accounts.lock().await;
         let mut twin = accounts.list().iter().find(|a| a.account_id == "a").unwrap().clone();
         twin.provider = Provider::Openai;
+        twin.workspace_id = Some("workspace-a".into());
         accounts.upsert(twin).unwrap();
     }
 
@@ -1334,22 +1864,21 @@ mod tests {
         // comment above.
 
         let mut state = app_state(Arc::new(MemoryStore::default()));
-        state.cfg.revoke_url = format!("{}/v1/oauth/token/revoke", anthropic_server.uri());
-        state.openai_cfg.revoke_url = format!("{}/api/accounts/oauth/revoke", openai_server.uri());
+        state.auth_configs.anthropic.revoke_url =
+            format!("{}/v1/oauth/token/revoke", anthropic_server.uri());
+        state.auth_configs.openai.issuer = openai_server.uri();
         add_openai_twin_of_a(&state).await;
 
-        let tokens = TokenSet {
+        let tokens = StoredTokens::Openai(OpenAiTokenSet {
             access_token: "codex-access".into(),
             refresh_token: "codex-refresh".into(),
             expires_at: chrono::Utc::now() + chrono::TimeDelta::hours(1),
-            refresh_token_expires_at: chrono::Utc::now() + chrono::TimeDelta::days(30),
-            scopes: vec![],
             client_id: "test".into(),
-        };
-        state
-            .secrets()
-            .put(&token_key(Provider::Openai, "a"), &serde_json::to_vec(&tokens).unwrap())
-            .unwrap();
+            account_id: "a".into(),
+            workspace_id: "workspace-a".into(),
+            is_fedramp: false,
+        });
+        save_tokens(state.secrets().as_ref(), Provider::Openai, "a", &tokens).unwrap();
 
         remove_account_for(&state, Provider::Openai, "a").await.unwrap();
 
@@ -1360,6 +1889,66 @@ mod tests {
         assert!(
             anthropic_server.received_requests().await.unwrap().is_empty(),
             "a Codex refresh token was sent to Anthropic's revoke endpoint"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_failed_local_delete_keeps_the_row_until_removal_can_be_retried() {
+        use quota_core::provider::{
+            openai_access_token_key, openai_refresh_token_key, openai_token_meta_key,
+        };
+
+        let store = Arc::new(DeleteFailsOnceStore::default());
+        let state = app_state(store.clone());
+        add_openai_twin_of_a(&state).await;
+        state.scheduler.lock().await.add(Provider::Openai, "a");
+        let tokens = StoredTokens::Openai(OpenAiTokenSet {
+            access_token: "codex-access".into(),
+            refresh_token: "codex-refresh".into(),
+            expires_at: chrono::Utc::now() + chrono::TimeDelta::hours(1),
+            client_id: "test".into(),
+            account_id: "a".into(),
+            workspace_id: "workspace-a".into(),
+            is_fedramp: false,
+        });
+        save_tokens(store.as_ref(), Provider::Openai, "a", &tokens).unwrap();
+        store.arm();
+
+        let first = remove_account_for(&state, Provider::Openai, "a").await;
+        assert!(first.is_err(), "a partial local delete was reported as success");
+        assert!(
+            state
+                .accounts
+                .lock()
+                .await
+                .list()
+                .iter()
+                .any(|account| account.provider == Provider::Openai && account.account_id == "a"),
+            "the only retry path disappeared with the row"
+        );
+        assert!(
+            state.scheduler.lock().await.state(Provider::Openai, "a").is_some(),
+            "the scheduler entry disappeared before local deletion completed"
+        );
+
+        remove_account_for(&state, Provider::Openai, "a")
+            .await
+            .expect("the second removal should repair the partial delete");
+        for key in [
+            openai_refresh_token_key("a"),
+            openai_access_token_key("a"),
+            openai_token_meta_key("a"),
+        ] {
+            assert!(store.get(&key).unwrap().is_none(), "split key survived: {key}");
+        }
+        assert!(
+            state
+                .accounts
+                .lock()
+                .await
+                .list()
+                .iter()
+                .all(|account| account.provider != Provider::Openai || account.account_id != "a")
         );
     }
 

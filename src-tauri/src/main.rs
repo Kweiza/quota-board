@@ -8,9 +8,10 @@ mod state;
 mod tray;
 
 use quota_core::accounts::AccountStore;
-use quota_core::auth::stored::RefreshLocks;
-use quota_core::auth::token::{ReqwestHttp, TokenSet};
-use quota_core::provider::{token_key, Provider, ProviderSpec};
+use quota_core::auth::openai::{OpenAiAuthConfig, OPENAI_ISSUER};
+use quota_core::auth::stored::{load_tokens, AuthConfigs, RefreshLocks};
+use quota_core::auth::token::ReqwestHttp;
+use quota_core::provider::Provider;
 use quota_core::scheduler::{register_accounts, Scheduler, SystemClock};
 use quota_core::secrets::{keychain::KeychainStore, timeout::TimeoutStore, SecretStore, SERVICE};
 /// Named only inside the `QUOTA_FORCE_FALLBACK` block below, which is itself
@@ -33,6 +34,15 @@ use std::sync::Arc;
 /// on one value — a second literal is how they would stop agreeing.
 fn toggle_shortcut() -> Shortcut {
     Shortcut::new(Some(Modifiers::CONTROL | Modifiers::ALT), Code::KeyQ)
+}
+
+fn current_token_fingerprint(
+    store: &dyn SecretStore,
+    provider: Provider,
+    account_id: &str,
+) -> Option<String> {
+    let tokens = load_tokens(store, provider, account_id).ok()?;
+    Some(fingerprint(tokens.access_token()))
 }
 
 fn main() {
@@ -178,11 +188,19 @@ fn main() {
             let mut scheduler = Scheduler::new(settings.poll_policy(), SystemClock);
             let store = Arc::clone(&secrets);
             let current_fp = move |provider: Provider, uuid: &str| -> Option<String> {
-                let raw = store.get(&token_key(provider, uuid)).ok().flatten()?;
-                let tokens: TokenSet = serde_json::from_slice(&raw).ok()?;
-                Some(fingerprint(&tokens.access_token))
+                current_token_fingerprint(store.as_ref(), provider, uuid)
             };
             register_accounts(&mut scheduler, accounts.list(), &mut cache, &current_fp);
+
+            let mut anthropic = Provider::Anthropic.spec();
+            anthropic.token_url = token_url();
+            let auth_configs = AuthConfigs {
+                anthropic,
+                openai: OpenAiAuthConfig {
+                    issuer: openai_issuer(),
+                    ..OpenAiAuthConfig::default()
+                },
+            };
 
             // Managed **before** the loop is spawned: `tokio::time::interval`
             // completes its first tick immediately, so `handle.state::<AppState>()`
@@ -197,9 +215,10 @@ fn main() {
                 }),
                 last_raw: std::sync::Mutex::new(quota_core::usage::raw::RawLog::default()),
                 pending_manual: std::sync::Mutex::new(None),
+                active_login: std::sync::Mutex::new(None),
+                login_commit: tokio::sync::Mutex::new(()),
                 http: ReqwestHttp::new()?,
-                cfg: ProviderSpec { token_url: token_url(), ..Provider::Anthropic.spec() },
-                openai_cfg: ProviderSpec { token_url: openai_token_url(), ..Provider::Openai.spec() },
+                auth_configs,
                 refresh_locks: RefreshLocks::default(),
                 poll_permit: tokio::sync::Mutex::new(()),
                 snapshots_path,
@@ -317,17 +336,88 @@ fn token_url() -> String {
     Provider::Anthropic.spec().token_url
 }
 
-/// Codex's half of the same override. Its own env var rather than reusing
-/// `QUOTA_TOKEN_URL` for both, the same reason `openai_usage_url()` above has
-/// its own: a local run exercising both providers side by side needs two
-/// independent mock servers. **Debug-only for the same reason `token_url()`
-/// is** — the token endpoint receives a refresh token, so an env-settable URL
-/// in a shipped binary would be a credential exfiltration switch.
+/// Debug-only issuer override for a local OpenAI mock. Every OpenAI endpoint is
+/// derived from this root by `OpenAiAuthConfig`; individual endpoint overrides
+/// would let tests exercise a topology production never uses.
 #[cfg(debug_assertions)]
-fn openai_token_url() -> String {
-    std::env::var("QUOTA_OPENAI_TOKEN_URL").unwrap_or_else(|_| Provider::Openai.spec().token_url)
+fn openai_issuer() -> String {
+    std::env::var("QUOTA_OPENAI_ISSUER").unwrap_or_else(|_| OPENAI_ISSUER.to_string())
 }
 #[cfg(not(debug_assertions))]
-fn openai_token_url() -> String {
-    Provider::Openai.spec().token_url
+fn openai_issuer() -> String {
+    OPENAI_ISSUER.to_string()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use quota_core::accounts::Account;
+    use quota_core::auth::openai::OpenAiTokenSet;
+    use quota_core::auth::stored::{save_tokens, StoredTokens};
+    use quota_core::model::{AccountState, UsageWindow};
+    use quota_core::scheduler::PollPolicy;
+    use quota_core::secrets::MemoryStore;
+    use quota_core::snapshots::{self, CachedSnapshot};
+
+    #[test]
+    fn startup_restores_a_split_openai_credentials_snapshot() {
+        let store = MemoryStore::default();
+        let account_id = "startup-user";
+        let access_token = "startup-access";
+        let tokens = StoredTokens::Openai(OpenAiTokenSet {
+            access_token: access_token.into(),
+            refresh_token: "startup-refresh".into(),
+            expires_at: chrono::Utc::now() + chrono::TimeDelta::hours(1),
+            client_id: "test".into(),
+            account_id: account_id.into(),
+            workspace_id: "startup-workspace".into(),
+            is_fedramp: false,
+        });
+        save_tokens(&store, Provider::Openai, account_id, &tokens).unwrap();
+
+        let mut path = std::env::temp_dir();
+        path.push(format!(
+            "quota-startup-snapshot-{}-{}.json",
+            std::process::id(),
+            chrono::Utc::now().timestamp_nanos_opt().unwrap()
+        ));
+        let snapshot = CachedSnapshot {
+            windows: vec![UsageWindow {
+                window_id: "primary".into(),
+                label: "5h".into(),
+                percent: 31.0,
+                resets_at: chrono::Utc::now() + chrono::TimeDelta::hours(1),
+                scope: None,
+            }],
+            fetched_at: chrono::Utc::now(),
+            token_fingerprint: fingerprint(access_token),
+        };
+        snapshots::save(&path, Provider::Openai, account_id, &snapshot).unwrap();
+        let mut cache = snapshots::load(&path);
+        let account = Account {
+            account_id: account_id.into(),
+            provider: Provider::Openai,
+            workspace_id: Some("startup-workspace".into()),
+            is_fedramp: false,
+            display_label: "Codex".into(),
+            email: "startup@example.invalid".into(),
+            created_at: chrono::Utc::now(),
+            last_ok_at: Some(snapshot.fetched_at),
+            quarantined: false,
+            sort_order: 0,
+        };
+        let mut scheduler = Scheduler::new(PollPolicy::with_interval_secs(300), SystemClock);
+        register_accounts(
+            &mut scheduler,
+            &[account],
+            &mut cache,
+            &|provider, id| current_token_fingerprint(&store, provider, id),
+        );
+
+        assert!(matches!(
+            scheduler.state(Provider::Openai, account_id),
+            Some(AccountState::Stale { .. })
+        ));
+        std::fs::remove_file(path).ok();
+    }
 }
