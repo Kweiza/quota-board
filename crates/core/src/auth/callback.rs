@@ -3,6 +3,9 @@ use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 
+/// The only loopback ports registered for OpenAI's Codex OAuth client.
+pub const OPENAI_CALLBACK_PORTS: [u16; 2] = [1455, 1457];
+
 /// How long the listener waits for a connected client to finish sending a
 /// request line + headers before giving up on that one connection. Browsers
 /// open speculative/preconnect sockets to a loopback origin that never carry
@@ -19,6 +22,7 @@ const HEADER_READ_TIMEOUT: Duration = Duration::from_millis(200);
 pub struct Callback {
     port: u16,
     listener: TcpListener,
+    callback_path: &'static str,
 }
 
 impl Callback {
@@ -28,7 +32,41 @@ impl Callback {
     pub async fn bind() -> std::io::Result<Self> {
         let listener = TcpListener::bind("127.0.0.1:0").await?;
         let port = listener.local_addr()?.port();
-        Ok(Self { port, listener })
+        Ok(Self {
+            port,
+            listener,
+            callback_path: "/callback",
+        })
+    }
+
+    /// Binds OpenAI's fixed allow-listed port, falling back from 1455 to 1457.
+    /// An OS-assigned port cannot be used here: the authorization server would
+    /// reject its redirect URI before the browser ever reached this listener.
+    pub async fn bind_openai() -> std::io::Result<Self> {
+        Self::bind_openai_ports(&OPENAI_CALLBACK_PORTS).await
+    }
+
+    pub(crate) async fn bind_openai_ports(ports: &[u16]) -> std::io::Result<Self> {
+        let mut last_error = None;
+        for port in ports {
+            match TcpListener::bind(("127.0.0.1", *port)).await {
+                Ok(listener) => {
+                    let port = listener.local_addr()?.port();
+                    return Ok(Self {
+                        port,
+                        listener,
+                        callback_path: "/auth/callback",
+                    });
+                }
+                Err(error) => last_error = Some(error),
+            }
+        }
+        Err(last_error.unwrap_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::AddrNotAvailable,
+                "no OpenAI callback port was configured",
+            )
+        }))
     }
 
     pub fn port(&self) -> u16 {
@@ -39,10 +77,15 @@ impl Callback {
     /// literally `localhost` — docs/design.md §10.3. The token exchange sends
     /// this same string back, so the two have to agree byte-for-byte.
     pub fn redirect_uri(&self) -> String {
-        format!("http://localhost:{}/callback", self.port)
+        format!("http://localhost:{}{}", self.port, self.callback_path)
     }
 
-    /// Waits for a `GET /callback` whose `state` query parameter equals
+    pub(crate) fn is_openai(&self) -> bool {
+        self.callback_path == "/auth/callback"
+    }
+
+    /// Waits for a GET to this listener's provider-specific callback path whose
+    /// `state` query parameter equals
     /// `expected_state`, 302-redirects it to `done_url`, and returns its query
     /// parameters. docs/design.md §10.3 puts this check in the loopback
     /// server itself, not only in the later token exchange — deliberately
@@ -114,14 +157,17 @@ impl Callback {
                 continue;
             };
 
-            let parsed = match url::Url::parse(&format!("http://127.0.0.1:{}{}", self.port, target)) {
+            let parsed = match url::Url::parse(&format!("http://127.0.0.1:{}{}", self.port, target))
+            {
                 Ok(u) => u,
                 Err(_) => continue,
             };
 
-            if parsed.path() != "/callback" {
+            if parsed.path() != self.callback_path {
                 let _ = sock
-                    .write_all(b"HTTP/1.1 404 Not Found\r\ncontent-length: 0\r\nconnection: close\r\n\r\n")
+                    .write_all(
+                        b"HTTP/1.1 404 Not Found\r\ncontent-length: 0\r\nconnection: close\r\n\r\n",
+                    )
                     .await;
                 let _ = sock.shutdown().await;
                 continue;
@@ -161,7 +207,9 @@ mod tests {
     use tokio::io::AsyncWriteExt;
 
     async fn send(port: u16, request_line: &str) {
-        let mut s = tokio::net::TcpStream::connect(("127.0.0.1", port)).await.unwrap();
+        let mut s = tokio::net::TcpStream::connect(("127.0.0.1", port))
+            .await
+            .unwrap();
         s.write_all(format!("{request_line}\r\nHost: localhost\r\n\r\n").as_bytes())
             .await
             .unwrap();
@@ -171,7 +219,9 @@ mod tests {
     /// Sends a request and reads the response back, for tests that need to
     /// see what the listener replied (not just whether it completed).
     async fn send_and_read(port: u16, request_line: &str) -> String {
-        let mut s = tokio::net::TcpStream::connect(("127.0.0.1", port)).await.unwrap();
+        let mut s = tokio::net::TcpStream::connect(("127.0.0.1", port))
+            .await
+            .unwrap();
         s.write_all(format!("{request_line}\r\nHost: localhost\r\n\r\n").as_bytes())
             .await
             .unwrap();
@@ -192,7 +242,8 @@ mod tests {
     async fn returns_the_query_params_of_a_callback_request() {
         let cb = Callback::bind().await.unwrap();
         let port = cb.port();
-        let task = tokio::spawn(async move { cb.wait_for_code("https://done.example", "xyz").await });
+        let task =
+            tokio::spawn(async move { cb.wait_for_code("https://done.example", "xyz").await });
         send(port, "GET /callback?code=abc123&state=xyz HTTP/1.1").await;
         let params = task.await.unwrap().unwrap();
         assert_eq!(params.get("code").unwrap(), "abc123");
@@ -226,9 +277,55 @@ mod tests {
     async fn redirect_uri_uses_localhost_literal_and_the_real_port() {
         let cb = Callback::bind().await.unwrap();
         let uri = cb.redirect_uri();
-        assert!(uri.starts_with("http://localhost:"), "docs/design.md §10.3: literally localhost");
+        assert!(
+            uri.starts_with("http://localhost:"),
+            "docs/design.md §10.3: literally localhost"
+        );
         assert!(uri.ends_with("/callback"));
-        assert!(uri.contains(&cb.port().to_string()), "must contain the actually assigned port");
+        assert!(
+            uri.contains(&cb.port().to_string()),
+            "must contain the actually assigned port"
+        );
+    }
+
+    #[test]
+    fn openai_ports_are_the_registered_pair_in_preference_order() {
+        assert_eq!(OPENAI_CALLBACK_PORTS, [1455, 1457]);
+    }
+
+    #[tokio::test]
+    async fn openai_callback_falls_back_and_uses_the_auth_callback_path() {
+        let occupied = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let first = occupied.local_addr().unwrap().port();
+        let reserve_second = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let second = reserve_second.local_addr().unwrap().port();
+        drop(reserve_second);
+
+        let cb = Callback::bind_openai_ports(&[first, second]).await.unwrap();
+        assert_eq!(cb.port(), second);
+        assert_eq!(
+            cb.redirect_uri(),
+            format!("http://localhost:{second}/auth/callback")
+        );
+        assert!(cb.is_openai());
+    }
+
+    #[tokio::test]
+    async fn openai_listener_accepts_only_the_auth_callback_path() {
+        let cb = Callback::bind_openai_ports(&[0]).await.unwrap();
+        let port = cb.port();
+        let task = tokio::spawn(async move { cb.wait_for_code("https://done.example", "s").await });
+
+        let response = send_and_read(port, "GET /callback?code=wrong&state=s HTTP/1.1").await;
+        assert!(
+            response.starts_with("HTTP/1.1 404"),
+            "wrong path was accepted: {response}"
+        );
+        send(port, "GET /auth/callback?code=real&state=s HTTP/1.1").await;
+        assert_eq!(
+            task.await.unwrap().unwrap().get("code").map(String::as_str),
+            Some("real")
+        );
     }
 
     /// docs/design.md §10.3: a wrong `state` gets 400 in the listener itself,
@@ -240,11 +337,18 @@ mod tests {
     async fn wrong_state_gets_400_and_the_listener_keeps_waiting_for_the_real_one() {
         let cb = Callback::bind().await.unwrap();
         let port = cb.port();
-        let task = tokio::spawn(async move { cb.wait_for_code("https://done.example", "expected").await });
+        let task =
+            tokio::spawn(async move { cb.wait_for_code("https://done.example", "expected").await });
 
         let resp = send_and_read(port, "GET /callback?code=x&state=wrong HTTP/1.1").await;
-        assert!(resp.starts_with("HTTP/1.1 400"), "expected a 400, got: {resp}");
-        assert!(resp.contains("Invalid state parameter"), "expected the RFC-shaped body, got: {resp}");
+        assert!(
+            resp.starts_with("HTTP/1.1 400"),
+            "expected a 400, got: {resp}"
+        );
+        assert!(
+            resp.contains("Invalid state parameter"),
+            "expected the RFC-shaped body, got: {resp}"
+        );
 
         send(port, "GET /callback?code=real&state=expected HTTP/1.1").await;
         let params = task.await.unwrap().unwrap();
@@ -262,7 +366,9 @@ mod tests {
         let task = tokio::spawn(async move { cb.wait_for_code("https://done.example", "s").await });
 
         // Connect and deliberately never write — simulates the stalled probe.
-        let _stalled = tokio::net::TcpStream::connect(("127.0.0.1", port)).await.unwrap();
+        let _stalled = tokio::net::TcpStream::connect(("127.0.0.1", port))
+            .await
+            .unwrap();
 
         send(port, "GET /callback?code=real&state=s HTTP/1.1").await;
         let params = task.await.unwrap().unwrap();
