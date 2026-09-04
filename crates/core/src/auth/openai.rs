@@ -181,8 +181,8 @@ impl OpenAiTokenSet {
 pub struct DeviceCode {
     pub verification_url: String,
     pub user_code: String,
-    pub interval_secs: u64,
     pub expires_at: DateTime<Utc>,
+    interval_secs: u64,
     device_auth_id: String,
     next_poll_at: DateTime<Utc>,
 }
@@ -202,7 +202,11 @@ impl std::fmt::Debug for DeviceCode {
 
 impl DeviceCode {
     pub fn poll_interval(&self) -> Duration {
-        Duration::from_secs(self.interval_secs)
+        // Re-bound at the point of use even though construction already
+        // bounds it. This field is credential-adjacent mutable state inside
+        // the module; a future restore/migration path must not be able to turn
+        // a corrupt value into a hot loop or an overflowing time conversion.
+        bounded_device_interval(self.interval_secs)
     }
 }
 
@@ -512,6 +516,47 @@ fn retry_after_secs(next_poll_at: DateTime<Utc>, now: DateTime<Utc>) -> u64 {
     millis.saturating_add(999).checked_div(1_000).unwrap_or(0).max(1)
 }
 
+struct DevicePollGate<'a> {
+    next_poll_at: &'a mut DateTime<Utc>,
+    requested_at: DateTime<Utc>,
+    expires_at: DateTime<Utc>,
+    interval: Duration,
+    started: tokio::time::Instant,
+}
+
+impl<'a> DevicePollGate<'a> {
+    fn new(
+        next_poll_at: &'a mut DateTime<Utc>,
+        requested_at: DateTime<Utc>,
+        expires_at: DateTime<Utc>,
+        interval: Duration,
+    ) -> Self {
+        Self {
+            next_poll_at,
+            requested_at,
+            expires_at,
+            interval,
+            started: tokio::time::Instant::now(),
+        }
+    }
+}
+
+impl Drop for DevicePollGate<'_> {
+    fn drop(&mut self) {
+        *self.next_poll_at = TimeDelta::from_std(self.started.elapsed())
+            .ok()
+            .and_then(|elapsed| self.requested_at.checked_add_signed(elapsed))
+            .and_then(|completed_at| {
+                completed_at
+                    .checked_add_signed(TimeDelta::seconds(self.interval.as_secs() as i64))
+            })
+            // Overflow can only come from fabricated state near chrono's
+            // limit. Holding the gate to expiry is conservative and makes the
+            // next call fail closed as `DeviceCodeExpired`.
+            .unwrap_or(self.expires_at);
+    }
+}
+
 /// Checks a device ceremony exactly once.
 ///
 /// The core owns both the advertised interval and the expiry. Calling this
@@ -539,14 +584,24 @@ pub async fn poll_device_code<H: TokenHttp>(
         user_code: &device.user_code,
     })
     .map_err(|_| protocol_error("the device-code poll could not be encoded"))?;
-    let grant: DevicePollResponse = match http.post_json(&endpoint, &body).await {
+    let interval = device.poll_interval();
+    let expires_at = device.expires_at;
+    let response = {
+        // This guard advances the gate on success, error, panic unwind, and
+        // future cancellation. The latter matters to lifecycle-driven hosts:
+        // dropping an in-flight check must not make an already-sent request
+        // immediately eligible for replay.
+        let _gate = DevicePollGate::new(&mut device.next_poll_at, now, expires_at, interval);
+        http.post_json(&endpoint, &body).await
+    };
+
+    let grant: DevicePollResponse = match response {
         Ok((response, _raw)) => response,
         Err(AuthError::OAuth {
             status: 403 | 404, ..
         }) => {
-            device.next_poll_at = now + TimeDelta::seconds(device.interval_secs as i64);
             return Ok(DeviceLoginPoll::Pending {
-                retry_after_secs: device.interval_secs,
+                retry_after_secs: interval.as_secs(),
             });
         }
         Err(error) => return Err(error),
@@ -575,23 +630,40 @@ pub async fn poll_device_code<H: TokenHttp>(
     })
 }
 
+async fn complete_device_code_with_timeout<H: TokenHttp>(
+    http: &H,
+    cfg: &OpenAiAuthConfig,
+    device: &DeviceCode,
+    timeout: Duration,
+) -> Result<(OpenAiTokenSet, OpenAiIdentity), AuthError> {
+    let mut device = device.clone();
+    tokio::time::timeout(timeout, async {
+        loop {
+            match poll_device_code(http, cfg, &mut device, Utc::now()).await? {
+                DeviceLoginPoll::Pending { retry_after_secs } => {
+                    tokio::time::sleep(Duration::from_secs(retry_after_secs)).await;
+                }
+                DeviceLoginPoll::Complete { tokens, identity } => {
+                    return Ok((*tokens, *identity));
+                }
+            }
+        }
+    })
+    .await
+    .map_err(|_| AuthError::DeviceCodeExpired)?
+}
+
 /// Polls for at most fifteen minutes, then exchanges the issued device grant.
 pub async fn complete_device_code<H: TokenHttp>(
     http: &H,
     cfg: &OpenAiAuthConfig,
     device: &DeviceCode,
 ) -> Result<(OpenAiTokenSet, OpenAiIdentity), AuthError> {
-    let mut device = device.clone();
-    loop {
-        match poll_device_code(http, cfg, &mut device, Utc::now()).await? {
-            DeviceLoginPoll::Pending { retry_after_secs } => {
-                tokio::time::sleep(Duration::from_secs(retry_after_secs)).await;
-            }
-            DeviceLoginPoll::Complete { tokens, identity } => {
-                return Ok((*tokens, *identity));
-            }
-        }
-    }
+    let remaining = (device.expires_at - Utc::now())
+        .to_std()
+        .unwrap_or(Duration::ZERO)
+        .min(DEVICE_AUTH_TIMEOUT);
+    complete_device_code_with_timeout(http, cfg, device, remaining).await
 }
 
 #[derive(Serialize)]
@@ -1430,7 +1502,7 @@ mod tests {
         assert!(matches!(
             early,
             DeviceLoginPoll::Pending {
-                retry_after_secs: 4
+                retry_after_secs: 4 | 5
             }
         ));
         assert_eq!(
@@ -1438,6 +1510,172 @@ mod tests {
             1,
             "lifecycle callbacks bypassed the advertised interval and created a hot loop"
         );
+    }
+
+    #[tokio::test]
+    async fn a_slow_pending_response_cannot_consume_the_next_poll_interval() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/api/accounts/deviceauth/token"))
+            .respond_with(
+                ResponseTemplate::new(403)
+                    .set_delay(Duration::from_millis(1_100)),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+        let now = Utc::now();
+        let mut device = DeviceCode {
+            verification_url: String::new(),
+            user_code: "USER-CODE".into(),
+            interval_secs: 1,
+            expires_at: now + TimeDelta::minutes(15),
+            device_auth_id: "device-id".into(),
+            next_poll_at: now,
+        };
+        let http = ReqwestHttp::new().unwrap();
+        let started = std::time::Instant::now();
+
+        let first = poll_device_code(&http, &cfg(&server), &mut device, now)
+            .await
+            .unwrap();
+        assert!(matches!(first, DeviceLoginPoll::Pending { .. }));
+        let after_response = now
+            + TimeDelta::from_std(started.elapsed()).expect("the test delay fits chrono");
+        let early = poll_device_code(
+            &http,
+            &cfg(&server),
+            &mut device,
+            after_response + TimeDelta::milliseconds(100),
+        )
+        .await
+        .unwrap();
+        assert!(matches!(early, DeviceLoginPoll::Pending { .. }));
+        assert_eq!(
+            server.received_requests().await.unwrap().len(),
+            1,
+            "response latency consumed the advertised delay between polls"
+        );
+    }
+
+    #[tokio::test]
+    async fn every_poll_attempt_advances_the_gate_even_when_the_request_fails() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/api/accounts/deviceauth/token"))
+            .respond_with(ResponseTemplate::new(500))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let now = Utc::now();
+        let mut device = DeviceCode {
+            verification_url: String::new(),
+            user_code: "USER-CODE".into(),
+            interval_secs: 7,
+            expires_at: now + TimeDelta::minutes(15),
+            device_auth_id: "device-id".into(),
+            next_poll_at: now,
+        };
+        let http = ReqwestHttp::new().unwrap();
+
+        let first = poll_device_code(&http, &cfg(&server), &mut device, now)
+            .await
+            .unwrap_err();
+        assert!(matches!(first, AuthError::OAuth { status: 500, .. }));
+        let early = poll_device_code(
+            &http,
+            &cfg(&server),
+            &mut device,
+            now + TimeDelta::seconds(1),
+        )
+        .await
+        .unwrap();
+        assert!(matches!(
+            early,
+            DeviceLoginPoll::Pending {
+                retry_after_secs: 6 | 7
+            }
+        ));
+        assert_eq!(server.received_requests().await.unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn cancelling_an_in_flight_poll_still_advances_the_gate() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/api/accounts/deviceauth/token"))
+            .respond_with(
+                ResponseTemplate::new(403)
+                    .set_delay(Duration::from_millis(200)),
+            )
+            .mount(&server)
+            .await;
+        let now = Utc::now();
+        let mut device = DeviceCode {
+            verification_url: String::new(),
+            user_code: "USER-CODE".into(),
+            interval_secs: 5,
+            expires_at: now + TimeDelta::minutes(15),
+            device_auth_id: "device-id".into(),
+            next_poll_at: now,
+        };
+        let http = ReqwestHttp::new().unwrap();
+
+        let cancelled = tokio::time::timeout(
+            Duration::from_millis(20),
+            poll_device_code(&http, &cfg(&server), &mut device, now),
+        )
+        .await;
+        assert!(cancelled.is_err(), "the delayed request unexpectedly completed");
+        let early = tokio::time::timeout(
+            Duration::from_millis(20),
+            poll_device_code(
+                &http,
+                &cfg(&server),
+                &mut device,
+                now + TimeDelta::milliseconds(20),
+            ),
+        )
+        .await
+        .expect("the gate should answer without starting another HTTP request")
+        .unwrap();
+        assert!(matches!(early, DeviceLoginPoll::Pending { .. }));
+    }
+
+    #[tokio::test]
+    async fn an_internal_interval_is_rebounded_before_time_arithmetic() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/api/accounts/deviceauth/token"))
+            .respond_with(ResponseTemplate::new(403))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let now = Utc::now();
+        let mut device = DeviceCode {
+            verification_url: String::new(),
+            user_code: "USER-CODE".into(),
+            interval_secs: u64::MAX,
+            expires_at: now + TimeDelta::minutes(15),
+            device_auth_id: "device-id".into(),
+            next_poll_at: now,
+        };
+
+        let result = poll_device_code(
+            &ReqwestHttp::new().unwrap(),
+            &cfg(&server),
+            &mut device,
+            now,
+        )
+        .await
+        .unwrap();
+        assert!(matches!(
+            result,
+            DeviceLoginPoll::Pending {
+                retry_after_secs: 900
+            }
+        ));
+        assert_eq!(device.poll_interval(), Duration::from_secs(900));
     }
 
     #[tokio::test]
@@ -1546,5 +1784,35 @@ mod tests {
         .unwrap_err();
         assert!(matches!(error, AuthError::DeviceCodeExpired));
         assert!(server.received_requests().await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn the_desktop_wrapper_has_a_monotonic_hard_deadline() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/api/accounts/deviceauth/token"))
+            .respond_with(ResponseTemplate::new(404))
+            .mount(&server)
+            .await;
+        let http = ReqwestHttp::new().unwrap();
+        let now = Utc::now();
+        let device = DeviceCode {
+            verification_url: String::new(),
+            user_code: "USER-CODE".into(),
+            interval_secs: 1,
+            expires_at: now + TimeDelta::milliseconds(200),
+            device_auth_id: "device-id".into(),
+            next_poll_at: now,
+        };
+
+        let started = tokio::time::Instant::now();
+        let error = complete_device_code(&http, &cfg(&server), &device)
+            .await
+            .unwrap_err();
+        assert!(matches!(error, AuthError::DeviceCodeExpired));
+        assert!(
+            started.elapsed() < Duration::from_millis(750),
+            "the public desktop wrapper waited out the one-second poll sleep"
+        );
     }
 }
