@@ -967,6 +967,13 @@ initial request means device authorization is unavailable, not a reason to
 invent a redirect. The successful device poll yields an authorization code and
 verifier which use the same form exchange as the browser flow.
 
+The reusable core exposes that ceremony as a one-shot mutable poll. It refuses
+an early call without HTTP, returns the remaining wait, and reports expiry and
+unavailability as typed errors. The desktop composes the one-shot operation
+into its background wait; lifecycle-driven hosts such as mobile call it once
+per explicit or scheduled check, so cancellation never waits behind a
+15-minute future.
+
 Codex identity comes from namespaced ID-token claims: `chatgpt_user_id`, then
 the nested auth `user_id`, is the row's `account_id`; an optional
 `chatgpt_account_id` is workspace routing context. Email falls back from the

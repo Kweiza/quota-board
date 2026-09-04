@@ -142,7 +142,9 @@ impl FailureKind {
                 AuthError::OAuth { .. }
                 | AuthError::StateMismatch
                 | AuthError::Decode(_)
-                | AuthError::IdentityMismatch { .. } => {
+                | AuthError::IdentityMismatch { .. }
+                | AuthError::DeviceCodeExpired
+                | AuthError::DeviceCodeUnavailable => {
                     FailureKind::AuthExpired
                 }
             },
