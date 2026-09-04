@@ -50,12 +50,15 @@ pub struct CreditSpend {
 pub struct ResetCredits {
     /// Reset credits on the account.
     pub available: u32,
-    /// The subset applicable to the limit currently in force.
+    /// The subset applicable to the limit currently in force, when the
+    /// service reports it.
     ///
     /// **Measured 0 while `available` was 1** (Spike F), so the two are not
     /// interchangeable: an account can hold a credit that does nothing for the
     /// limit it is actually hitting.
-    pub applicable: u32,
+    /// Current official responses may carry only `available_count`. `None`
+    /// preserves that absence; it must never be rendered as a confident zero.
+    pub applicable: Option<u32>,
 }
 
 /// The one optional line a row may carry under its bars.
@@ -186,7 +189,10 @@ mod tests {
         assert_eq!(v["kind"], "credit");
         assert_eq!(v["used_minor"], 2231);
 
-        let resets = ExtraLine::ResetCredits(ResetCredits { available: 1, applicable: 0 });
+        let resets = ExtraLine::ResetCredits(ResetCredits {
+            available: 1,
+            applicable: Some(0),
+        });
         let v = serde_json::to_value(&resets).unwrap();
         assert_eq!(v["kind"], "reset_credits");
         assert_eq!(v["available"], 1);

@@ -33,6 +33,7 @@
 //!   under `cargo test` and `cargo clippy --all-targets` and fails only under a
 //!   plain `cargo build`. Neither project gate catches it.)
 
+use crate::auth::openai::{self, OpenAiAuthConfig, OpenAiTokenSet};
 use crate::auth::token::{refresh, AuthError, TokenHttp, TokenSet};
 use crate::provider::{token_key, Provider, ProviderSpec};
 use crate::secrets::{SecretError, SecretStore};
@@ -43,6 +44,28 @@ use std::sync::{Arc, Mutex};
 /// a second pass exists only to adopt a value stored underneath us and
 /// re-evaluate it. More than that is not contention, it is a bug.
 const MAX_ATTEMPTS: usize = 2;
+
+/// The two auth protocols a polling process uses.
+///
+/// Kept as two typed values rather than one provider-generic endpoint record:
+/// Anthropic refreshes with its measured JSON-plus-scopes request, while
+/// OpenAI refreshes with a different JSON response whose token fields are all
+/// optional. Sharing an HTTP client is sound; pretending those payloads are
+/// one protocol is not.
+#[derive(Debug, Clone)]
+pub struct AuthConfigs {
+    pub anthropic: ProviderSpec,
+    pub openai: OpenAiAuthConfig,
+}
+
+impl Default for AuthConfigs {
+    fn default() -> Self {
+        Self {
+            anthropic: ProviderSpec::anthropic(),
+            openai: OpenAiAuthConfig::default(),
+        }
+    }
+}
 
 #[derive(Debug, thiserror::Error)]
 pub enum StoredTokenError {
@@ -56,8 +79,12 @@ pub enum StoredTokenError {
     Corrupt,
     #[error(transparent)]
     Secrets(#[from] SecretError),
-    #[error(transparent)]
-    Auth(#[from] AuthError),
+    #[error("{source}")]
+    Auth {
+        provider: Provider,
+        #[source]
+        source: AuthError,
+    },
 }
 
 /// One lock per account, identified by provider and id together — see
@@ -110,11 +137,68 @@ impl RefreshLocks {
     }
 }
 
-/// `Debug` is derived, which is safe only because `TokenSet` hand-writes its
-/// own redacting `Debug`. If that ever changes, this leaks both tokens.
+/// The provider-specific credential read from one provider-specific key.
+///
+/// This enum is deliberately **not** serialized. Existing Anthropic entries
+/// contain an untagged `TokenSet` JSON object, and wrapping it in an enum would
+/// orphan every mobile and desktop account on upgrade. The key tells `load`
+/// which concrete type to deserialize; OpenAI uses a new namespaced key and can
+/// therefore start with its own shape.
+#[derive(Debug, Clone)]
+pub enum StoredTokens {
+    Anthropic(TokenSet),
+    Openai(OpenAiTokenSet),
+}
+
+impl StoredTokens {
+    pub fn provider(&self) -> Provider {
+        match self {
+            Self::Anthropic(_) => Provider::Anthropic,
+            Self::Openai(_) => Provider::Openai,
+        }
+    }
+
+    pub fn access_token(&self) -> &str {
+        match self {
+            Self::Anthropic(tokens) => &tokens.access_token,
+            Self::Openai(tokens) => &tokens.access_token,
+        }
+    }
+
+    pub fn refresh_token(&self) -> &str {
+        match self {
+            Self::Anthropic(tokens) => &tokens.refresh_token,
+            Self::Openai(tokens) => &tokens.refresh_token,
+        }
+    }
+
+    pub fn workspace_id(&self) -> Option<&str> {
+        match self {
+            Self::Anthropic(_) => None,
+            Self::Openai(tokens) => tokens.workspace_id.as_deref(),
+        }
+    }
+
+    pub fn is_fedramp(&self) -> Option<bool> {
+        match self {
+            Self::Anthropic(_) => None,
+            Self::Openai(tokens) => tokens.is_fedramp,
+        }
+    }
+
+    fn needs_refresh(&self) -> bool {
+        match self {
+            Self::Anthropic(tokens) => tokens.needs_refresh(),
+            Self::Openai(tokens) => tokens.needs_refresh_at(chrono::Utc::now()),
+        }
+    }
+}
+
+/// `Debug` is derived, which is safe only because both stored token variants
+/// hand-write their own redacting `Debug`.
 #[derive(Debug)]
 pub struct Fresh {
-    pub tokens: TokenSet,
+    pub tokens: StoredTokens,
     /// `Err` when the rotation succeeded over HTTP but the store write did not.
     /// The tokens are live and usable for this cycle.
     ///
@@ -134,28 +218,106 @@ pub struct Fresh {
     pub persisted: Result<(), SecretError>,
 }
 
-fn load(
+pub fn load_tokens(
     store: &dyn SecretStore,
     provider: Provider,
     uuid: &str,
-) -> Result<TokenSet, StoredTokenError> {
-    let raw = store.get(&token_key(provider, uuid))?.ok_or(StoredTokenError::Missing)?;
-    serde_json::from_slice(&raw).map_err(|_| StoredTokenError::Corrupt)
+) -> Result<StoredTokens, StoredTokenError> {
+    let raw = store
+        .get(&token_key(provider, uuid))?
+        .ok_or(StoredTokenError::Missing)?;
+    match provider {
+        Provider::Anthropic => serde_json::from_slice(&raw)
+            .map(StoredTokens::Anthropic)
+            .map_err(|_| StoredTokenError::Corrupt),
+        Provider::Openai => serde_json::from_slice(&raw)
+            .map(StoredTokens::Openai)
+            .map_err(|_| StoredTokenError::Corrupt),
+    }
 }
 
-fn save(
+pub fn save_tokens(
     store: &dyn SecretStore,
     provider: Provider,
     uuid: &str,
+    tokens: &StoredTokens,
+) -> Result<(), SecretError> {
+    if tokens.provider() != provider {
+        return Err(SecretError::Backend(
+            "refusing to store a credential under another provider's key".into(),
+        ));
+    }
+    // Both token structs are plain data, so serializing cannot fail in
+    // practice. Match before serializing so Anthropic remains an untagged
+    // `TokenSet` object byte-for-byte compatible with existing entries.
+    let blob = match tokens {
+        StoredTokens::Anthropic(tokens) => serde_json::to_vec(tokens),
+        StoredTokens::Openai(tokens) => serde_json::to_vec(tokens),
+    }
+    .map_err(|_| SecretError::Backend("failed to serialize the token set".into()))?;
+    store.put(&token_key(provider, uuid), &blob)
+}
+
+pub fn save_anthropic_tokens(
+    store: &dyn SecretStore,
+    account_id: &str,
     tokens: &TokenSet,
 ) -> Result<(), SecretError> {
-    // `TokenSet` is plain data, so serializing it cannot fail in practice.
-    // Report it as a store error rather than as `Corrupt`: nothing was parsed
-    // and nothing was stored, and the caller's useful response is identical to
-    // any other failed write — the value did not reach the store.
-    let blob = serde_json::to_vec(tokens)
-        .map_err(|_| SecretError::Backend("failed to serialize the token set".into()))?;
-    store.put(&token_key(provider, uuid), &blob)
+    save_tokens(
+        store,
+        Provider::Anthropic,
+        account_id,
+        &StoredTokens::Anthropic(tokens.clone()),
+    )
+}
+
+pub fn save_openai_tokens(
+    store: &dyn SecretStore,
+    account_id: &str,
+    tokens: &OpenAiTokenSet,
+) -> Result<(), SecretError> {
+    save_tokens(
+        store,
+        Provider::Openai,
+        account_id,
+        &StoredTokens::Openai(tokens.clone()),
+    )
+}
+
+async fn refresh_tokens<H: TokenHttp>(
+    http: &H,
+    configs: &AuthConfigs,
+    current: &StoredTokens,
+) -> Result<StoredTokens, AuthError> {
+    match current {
+        StoredTokens::Anthropic(tokens) => refresh(http, &configs.anthropic, tokens)
+            .await
+            .map(StoredTokens::Anthropic),
+        StoredTokens::Openai(tokens) => openai::refresh(http, &configs.openai, tokens)
+            .await
+            .map(StoredTokens::Openai),
+    }
+}
+
+/// Provider-aware best-effort server-side revocation.
+pub async fn revoke_tokens<H: TokenHttp>(http: &H, configs: &AuthConfigs, tokens: &StoredTokens) {
+    match tokens {
+        StoredTokens::Anthropic(tokens) => {
+            crate::auth::token::revoke(http, &configs.anthropic, &tokens.refresh_token).await
+        }
+        StoredTokens::Openai(tokens) => openai::revoke(http, &configs.openai, tokens).await,
+    }
+}
+
+/// Delete the provider-specific local entry. Server revocation is a separate
+/// best-effort step because local deletion must still proceed if the network is
+/// unavailable.
+pub fn delete_tokens(
+    store: &dyn SecretStore,
+    provider: Provider,
+    account_id: &str,
+) -> Result<bool, SecretError> {
+    store.delete(&token_key(provider, account_id))
 }
 
 /// Refreshes the stored token set if §10.5's five-minute skew says it is due,
@@ -185,37 +347,79 @@ fn save(
 /// alongside `uuid` rather than assumed to be Anthropic.
 pub async fn ensure_fresh<H: TokenHttp>(
     http: &H,
-    cfg: &ProviderSpec,
+    configs: &AuthConfigs,
     store: &dyn SecretStore,
     locks: &RefreshLocks,
     provider: Provider,
     uuid: &str,
 ) -> Result<Fresh, StoredTokenError> {
+    ensure_fresh_inner(http, configs, store, locks, provider, uuid, None).await
+}
+
+/// Force one provider-aware refresh after a usage endpoint rejected the
+/// access token. This is the recovery path for an OpenAI access token whose
+/// `exp` claim is absent or unreadable: unknown expiry is not fabricated as
+/// 1970, but a 401 must not produce an endless `AUTH_EXPIRED` loop either.
+pub async fn refresh_after_unauthorized<H: TokenHttp>(
+    http: &H,
+    configs: &AuthConfigs,
+    store: &dyn SecretStore,
+    locks: &RefreshLocks,
+    provider: Provider,
+    uuid: &str,
+    rejected_access_token: &str,
+) -> Result<Fresh, StoredTokenError> {
+    ensure_fresh_inner(
+        http,
+        configs,
+        store,
+        locks,
+        provider,
+        uuid,
+        Some(rejected_access_token),
+    )
+    .await
+}
+
+async fn ensure_fresh_inner<H: TokenHttp>(
+    http: &H,
+    configs: &AuthConfigs,
+    store: &dyn SecretStore,
+    locks: &RefreshLocks,
+    provider: Provider,
+    uuid: &str,
+    rejected_access_token: Option<&str>,
+) -> Result<Fresh, StoredTokenError> {
     let guard = locks.for_account(provider, uuid);
     let _held = guard.lock().await;
 
     for _ in 0..MAX_ATTEMPTS {
-        let current = load(store, provider, uuid)?;
-        if !current.needs_refresh() {
+        let current = load_tokens(store, provider, uuid)?;
+        if rejected_access_token
+            .is_some_and(|rejected| current.access_token() != rejected)
+            || (rejected_access_token.is_none() && !current.needs_refresh())
+        {
             // The double check. A caller that waited on the lock lands here and
             // returns what the winner stored, with no second request. Nothing
             // was written on this path, so there is no write to have failed.
             return Ok(Fresh { tokens: current, persisted: Ok(()) });
         }
 
-        let witness = current.refresh_token.clone();
-        let new = refresh(http, cfg, &current).await?;
+        let witness = current.refresh_token().to_string();
+        let new = refresh_tokens(http, configs, &current)
+            .await
+            .map_err(|source| StoredTokenError::Auth { provider, source })?;
 
         // Compare-and-swap (§10.5). Every arm is explicit on purpose: a
         // catch-all that falls through to the write is wrong in two distinct
         // ways, and both cost the user a permanently dead account.
-        match load(store, provider, uuid) {
+        match load_tokens(store, provider, uuid) {
             // Someone stored a different chain underneath us — realistically a
             // re-login landing mid-refresh. §10.5 says adopt it rather than
             // overwrite. `continue` re-reads and re-evaluates freshness, which
             // is what makes "adopt" literal: the token we just obtained is
             // dropped rather than written.
-            Ok(stored) if stored.refresh_token != witness => continue,
+            Ok(stored) if stored.refresh_token() != witness => continue,
             Ok(_) => {}
             // The key is gone: `remove_account` deleted it while we were on the
             // network, and it revoked this refresh token first (§10.6). Writing
@@ -239,14 +443,20 @@ pub async fn ensure_fresh<H: TokenHttp>(
         // is dead and `new` is the only live credential. A failed write is
         // reported, never propagated: returning `Err` here would discard the
         // live token and waste the poll cycle on top of the durability loss.
-        let persisted = save(store, provider, uuid, &new);
-        return Ok(Fresh { tokens: new, persisted });
+        let persisted = save_tokens(store, provider, uuid, &new);
+        return Ok(Fresh {
+            tokens: new,
+            persisted,
+        });
     }
 
     // Two adoptions in a row means some third writer keeps storing already
     // stale token sets. Hand back what is actually stored and let the next poll
     // cycle re-evaluate, rather than refreshing in a loop.
-    Ok(Fresh { tokens: load(store, provider, uuid)?, persisted: Ok(()) })
+    Ok(Fresh {
+        tokens: load_tokens(store, provider, uuid)?,
+        persisted: Ok(()),
+    })
 }
 
 #[cfg(test)]
@@ -261,10 +471,13 @@ mod tests {
 
     const UUID: &str = "acc-1";
 
-    async fn cfg_for(server: &MockServer) -> ProviderSpec {
-        ProviderSpec {
-            token_url: format!("{}/v1/oauth/token", server.uri()),
-            ..Provider::Anthropic.spec()
+    async fn cfg_for(server: &MockServer) -> AuthConfigs {
+        AuthConfigs {
+            anthropic: ProviderSpec {
+                token_url: format!("{}/v1/oauth/token", server.uri()),
+                ..ProviderSpec::anthropic()
+            },
+            ..AuthConfigs::default()
         }
     }
 
@@ -275,7 +488,7 @@ mod tests {
             expires_at: Utc::now() - TimeDelta::seconds(1),
             refresh_token_expires_at: Utc::now() + TimeDelta::days(30),
             scopes: vec!["user:profile".into()],
-            client_id: Provider::Anthropic.spec().client_id,
+            client_id: ProviderSpec::anthropic().client_id,
         }
     }
 
@@ -292,7 +505,22 @@ mod tests {
 
     fn stored_refresh_token(store: &dyn SecretStore) -> Option<String> {
         let raw = store.get(&token_key(Provider::Anthropic, UUID)).unwrap()?;
-        Some(serde_json::from_slice::<TokenSet>(&raw).unwrap().refresh_token)
+        Some(
+            serde_json::from_slice::<TokenSet>(&raw)
+                .unwrap()
+                .refresh_token,
+        )
+    }
+
+    fn openai_tokens(access_token: &str) -> OpenAiTokenSet {
+        OpenAiTokenSet {
+            access_token: access_token.into(),
+            refresh_token: "openai-refresh-old".into(),
+            client_id: openai::CLIENT_ID.into(),
+            user_id: "user-one".into(),
+            workspace_id: Some("workspace-one".into()),
+            is_fedramp: None,
+        }
     }
 
     /// Counts writes and can be made to fail them, so "no write on the no-op
@@ -363,9 +591,17 @@ mod tests {
             ensure_fresh(&http, &cfg, &store, &locks, Provider::Anthropic, UUID),
         );
 
-        assert_eq!(posts.load(Ordering::SeqCst), 1, "the refresh was not serialized");
-        assert_eq!(a.unwrap().tokens.refresh_token, "rt-1");
-        assert_eq!(b.unwrap().tokens.refresh_token, "rt-1", "the waiter re-read stale state");
+        assert_eq!(
+            posts.load(Ordering::SeqCst),
+            1,
+            "the refresh was not serialized"
+        );
+        assert_eq!(a.unwrap().tokens.refresh_token(), "rt-1");
+        assert_eq!(
+            b.unwrap().tokens.refresh_token(),
+            "rt-1",
+            "the waiter re-read stale state"
+        );
     }
 
     /// docs/design.md §10.5: "if the value changed underneath us, adopt the new
@@ -405,7 +641,8 @@ mod tests {
         .unwrap();
 
         assert_eq!(
-            out.tokens.refresh_token, "rt-login",
+            out.tokens.refresh_token(),
+            "rt-login",
             "we overwrote the newer chain instead of adopting it"
         );
         assert_eq!(stored_refresh_token(store.as_ref()).as_deref(), Some("rt-login"));
@@ -478,9 +715,175 @@ mod tests {
         .await
         .unwrap();
 
-        assert_eq!(out.tokens.refresh_token, "rt-0");
+        assert_eq!(out.tokens.refresh_token(), "rt-0");
         assert!(out.persisted.is_ok());
-        assert_eq!(store.puts.load(Ordering::SeqCst), 0, "a fresh token was re-written");
+        assert_eq!(
+            store.puts.load(Ordering::SeqCst),
+            0,
+            "a fresh token was re-written"
+        );
+    }
+
+    /// The enum is an in-memory dispatch only. If serde ever wraps the
+    /// Anthropic value as `{"Anthropic": ...}`, every existing keychain entry
+    /// becomes unreadable by the prior release and an upgrade forces all users
+    /// to sign in again.
+    #[test]
+    fn saving_anthropic_tokens_writes_the_old_untagged_blob() {
+        let store = MemoryStore::default();
+        let tokens = fresh_tokens("rt-old-shape");
+        save_anthropic_tokens(&store, UUID, &tokens).unwrap();
+        let stored = store
+            .get(&token_key(Provider::Anthropic, UUID))
+            .unwrap()
+            .unwrap();
+        assert_eq!(stored, serde_json::to_vec(&tokens).unwrap());
+        let value: serde_json::Value = serde_json::from_slice(&stored).unwrap();
+        assert!(
+            value.get("Anthropic").is_none(),
+            "an enum tag reached the old blob"
+        );
+    }
+
+    #[test]
+    fn openai_tokens_round_trip_only_under_the_namespaced_user_key() {
+        let store = MemoryStore::default();
+        let tokens = openai_tokens("opaque-access");
+        save_openai_tokens(&store, "user-one", &tokens).unwrap();
+        assert!(
+            store.get("user-one:tokens").unwrap().is_none(),
+            "the Claude key was reused"
+        );
+        let got = load_tokens(&store, Provider::Openai, "user-one").unwrap();
+        assert_eq!(got.access_token(), "opaque-access");
+        assert_eq!(got.workspace_id(), Some("workspace-one"));
+    }
+
+    /// Unknown expiry is not 1970 and therefore does not trigger a speculative
+    /// rotation on every poll. But once the usage endpoint returns 401, the
+    /// forced path must rotate exactly once even though the same opaque access
+    /// token still has no readable `exp` claim.
+    #[tokio::test]
+    async fn a_401_forces_openai_refresh_when_access_expiry_is_unreadable() {
+        let server = MockServer::start().await;
+        let posts = Arc::new(AtomicUsize::new(0));
+        let count = posts.clone();
+        Mock::given(method("POST"))
+            .respond_with(move |_: &Request| {
+                count.fetch_add(1, Ordering::SeqCst);
+                ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "access_token": "still-opaque-but-new"
+                }))
+            })
+            .mount(&server)
+            .await;
+
+        let store = MemoryStore::default();
+        save_openai_tokens(&store, "user-one", &openai_tokens("opaque-old")).unwrap();
+        let configs = AuthConfigs {
+            openai: OpenAiAuthConfig {
+                token_url: format!("{}/oauth/token", server.uri()),
+                ..OpenAiAuthConfig::default()
+            },
+            ..AuthConfigs::default()
+        };
+        let locks = RefreshLocks::default();
+        let http = ReqwestHttp::new().unwrap();
+
+        let before = ensure_fresh(
+            &http,
+            &configs,
+            &store,
+            &locks,
+            Provider::Openai,
+            "user-one",
+        )
+        .await
+        .unwrap();
+        assert_eq!(before.tokens.access_token(), "opaque-old");
+        assert_eq!(
+            posts.load(Ordering::SeqCst),
+            0,
+            "unknown expiry was guessed as expired"
+        );
+
+        let after = refresh_after_unauthorized(
+            &http,
+            &configs,
+            &store,
+            &locks,
+            Provider::Openai,
+            "user-one",
+            "opaque-old",
+        )
+        .await
+        .unwrap();
+        assert_eq!(after.tokens.access_token(), "still-opaque-but-new");
+        assert_eq!(
+            posts.load(Ordering::SeqCst),
+            1,
+            "the 401 did not force exactly one refresh"
+        );
+    }
+
+    /// Both callers observed the same rejected access token. The first rotates
+    /// it while the second waits on the account lock; the waiter must adopt the
+    /// already-rotated access token instead of consuming the single-use refresh
+    /// chain a second time. The delayed response is what makes the waiter
+    /// actually queue behind the first request.
+    #[tokio::test]
+    async fn concurrent_401_refreshes_use_the_rejected_access_token_as_a_witness() {
+        let server = MockServer::start().await;
+        let posts = Arc::new(AtomicUsize::new(0));
+        let count = posts.clone();
+        Mock::given(method("POST"))
+            .respond_with(move |_: &Request| {
+                count.fetch_add(1, Ordering::SeqCst);
+                ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!({
+                        "access_token": "opaque-new"
+                    }))
+                    .set_delay(std::time::Duration::from_millis(50))
+            })
+            .mount(&server)
+            .await;
+
+        let store = MemoryStore::default();
+        save_openai_tokens(&store, "user-one", &openai_tokens("opaque-old")).unwrap();
+        let configs = AuthConfigs {
+            openai: OpenAiAuthConfig {
+                token_url: format!("{}/oauth/token", server.uri()),
+                ..OpenAiAuthConfig::default()
+            },
+            ..AuthConfigs::default()
+        };
+        let locks = RefreshLocks::default();
+        let http = ReqwestHttp::new().unwrap();
+
+        let (a, b) = tokio::join!(
+            refresh_after_unauthorized(
+                &http,
+                &configs,
+                &store,
+                &locks,
+                Provider::Openai,
+                "user-one",
+                "opaque-old",
+            ),
+            refresh_after_unauthorized(
+                &http,
+                &configs,
+                &store,
+                &locks,
+                Provider::Openai,
+                "user-one",
+                "opaque-old",
+            ),
+        );
+
+        assert_eq!(posts.load(Ordering::SeqCst), 1);
+        assert_eq!(a.unwrap().tokens.access_token(), "opaque-new");
+        assert_eq!(b.unwrap().tokens.access_token(), "opaque-new");
     }
 
     /// A store write that fails after a successful rotation must not discard
@@ -513,7 +916,11 @@ mod tests {
         .await
         .unwrap();
 
-        assert_eq!(out.tokens.refresh_token, "rt-1", "the live rotated token was discarded");
+        assert_eq!(
+            out.tokens.refresh_token(),
+            "rt-1",
+            "the live rotated token was discarded"
+        );
         // Pins the error itself, not just that one occurred: reducing this to a
         // boolean is what §9.2/§9.3 forbid, and asserting `is_err()` alone
         // would keep passing if it were.
@@ -529,7 +936,10 @@ mod tests {
     /// `Debug` — this test is what holds that dependency in place.
     #[test]
     fn fresh_debug_redacts_the_tokens() {
-        let fresh = Fresh { tokens: expired_tokens("sk-ant-SENTINEL"), persisted: Ok(()) };
+        let fresh = Fresh {
+            tokens: StoredTokens::Anthropic(expired_tokens("sk-ant-SENTINEL")),
+            persisted: Ok(()),
+        };
         let printed = format!("{fresh:?}");
         assert!(!printed.contains("SENTINEL"), "Fresh leaked a token: {printed}");
         assert!(printed.contains("<redacted>"));
@@ -576,7 +986,11 @@ mod tests {
         .unwrap_err();
 
         assert!(
-            matches!(err, StoredTokenError::Auth(ref e) if e.is_dead_grant()),
+            matches!(
+                err,
+                StoredTokenError::Auth { provider, ref source }
+                    if source.is_dead_grant_for(provider)
+            ),
             "the dead-grant flag did not survive the wrapper, got {err:?}"
         );
     }

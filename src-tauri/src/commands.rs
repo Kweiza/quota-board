@@ -3,9 +3,14 @@ use quota_core::auth::callback::Callback;
 use quota_core::auth::pkce::{
     authorize_url_for, begin, manual_redirect_uri, parse_manual_code, success_redirect, PendingAuth,
 };
-use quota_core::auth::token::{backfill_email, exchange_code, revoke, TokenSet};
+use quota_core::auth::stored::{delete_tokens, load_tokens, revoke_tokens, save_anthropic_tokens};
+use quota_core::auth::token::exchange_code;
+#[cfg(test)]
+use quota_core::auth::token::TokenSet;
 use quota_core::model::AccountState;
-use quota_core::provider::{token_key, Provider, ProviderSpec};
+#[cfg(test)]
+use quota_core::provider::token_key;
+use quota_core::provider::{Provider, ProviderSpec};
 use quota_core::scheduler::PollPolicy;
 use quota_core::secrets::{encrypted_file::EncryptedFileStore, timeout::TimeoutStore, SecretStore};
 use quota_core::usage::raw::RawResponse;
@@ -234,20 +239,10 @@ pub struct ManualFallback {
     pub reason: String,
 }
 
-/// Which `ProviderSpec` a login should use.
-///
-/// Both carry a debug-only `token_url` override (`main.rs`'s `token_url()`
-/// and `openai_token_url()`), used for Step 11's local-mock verification —
-/// the same seam `usage_url`/`openai_usage_url` already give the usage
-/// endpoint. Without OpenAI's half, `Provider::Openai` always resolved to the
-/// real `auth.openai.com`, and nothing could exercise a Codex login —
-/// `begin_login` → `complete_login` → `register_authenticated` — without
-/// reaching the real network, which CLAUDE.md forbids a test to do.
-fn login_cfg(state: &AppState, provider: Provider) -> ProviderSpec {
-    match provider {
-        Provider::Anthropic => state.cfg.clone(),
-        Provider::Openai => state.openai_cfg.clone(),
-    }
+/// Anthropic's browser-login configuration. OpenAI never reaches this helper;
+/// its device protocol is `quota_core::auth::openai`.
+fn login_cfg(state: &AppState) -> ProviderSpec {
+    state.cfg.clone()
 }
 
 /// Starts a login. Returns both authorize URLs; the loopback callback, when
@@ -258,6 +253,12 @@ fn login_cfg(state: &AppState, provider: Provider) -> ProviderSpec {
 /// loopback path gave up but §10.3's paste path still can finish it.
 #[tauri::command]
 pub async fn begin_login(app: tauri::AppHandle, provider: Provider) -> Result<LoginUrls, String> {
+    if provider == Provider::Openai {
+        return Err(
+            "Codex login now requires the device-code flow; this desktop screen has not adopted it yet"
+                .into(),
+        );
+    }
     if LOGIN_IN_FLIGHT
         .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
         .is_err()
@@ -266,7 +267,7 @@ pub async fn begin_login(app: tauri::AppHandle, provider: Provider) -> Result<Lo
     }
     let guard = LoginGuard;
 
-    let cfg = login_cfg(&app.state::<AppState>(), provider);
+    let cfg = login_cfg(&app.state::<AppState>());
 
     // Bind before building the authorize URL: `redirect_uri` must carry the
     // real port, and that exact string is replayed at token exchange
@@ -512,8 +513,13 @@ pub(crate) async fn complete_login(
     code: &str,
     returned_state: &str,
 ) -> Result<(), String> {
-    let cfg = login_cfg(state, provider);
-    let (tokens, identity) = exchange_code(&state.http, &cfg, provider, pending, code, returned_state)
+    if provider == Provider::Openai {
+        return Err(
+            "Codex login uses device authorization; the browser-paste flow is Claude-only".into(),
+        );
+    }
+    let cfg = login_cfg(state);
+    let (tokens, identity) = exchange_code(&state.http, &cfg, pending, code, returned_state)
         .await
         .map_err(|e| e.to_string())?;
     // Without an identifier there is no key. Never substitute the email
@@ -521,41 +527,23 @@ pub(crate) async fn complete_login(
     // Anthropic: `exchange_code` never returns `Ok((_, None))` for OpenAI,
     // whose absence instead fails loudly through `AuthError::NoAccountIdentifier`
     // above (Step 3 of the Codex login task).
-    let mut identity = identity.ok_or("the token response carried no account block")?;
-
-    // §9.3: OpenAI's token response may carry no email at all — that shape has
-    // never been measured — and a row whose label defaults to an empty string
-    // is one the user cannot tell apart from another. A no-op for Anthropic,
-    // whose response always carries one. A failed usage fetch here must not
-    // fail a login that already succeeded — `backfill_email` swallows it and
-    // leaves the label blank instead, which the user can rename.
-    let usage_url = match provider {
-        Provider::Anthropic => &state.usage_url,
-        Provider::Openai => &state.openai_usage_url,
-    };
-    backfill_email(&state.http, provider, usage_url, &mut identity, &tokens.access_token).await;
-
-    // Serialization failure fails loudly. Falling through to the account write
-    // would register an account with no credential behind it: `ensure_fresh`
-    // would report `Missing`, that classifies to AUTH_DEAD, `record()` would
-    // persist the quarantine, and the user would be looking at a dead account
-    // produced by a login that appeared to succeed.
-    let blob = serde_json::to_vec(&tokens)
-        .map_err(|e| format!("the token could not be serialized: {e}"))?;
+    let identity = identity.ok_or("the token response carried no account block")?;
 
     // Synchronous and able to block a real thread (timeout.rs:144-156), so it
     // goes on a blocking thread rather than an async worker — the same
     // principle `refresh_account` applies when it answers AUTH_EXPIRED instead
     // of waiting on the refresh mutex.
     let store = state.secrets();
-    let key = token_key(provider, &identity.uuid);
-    tauri::async_runtime::spawn_blocking(move || store.put(&key, &blob))
+    let id = identity.uuid.clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        save_anthropic_tokens(store.as_ref(), &id, &tokens)
+    })
         .await
         .map_err(|e| format!("the token store task failed: {e}"))?
         .map_err(|e| format!("the token could not be stored: {e}"))?;
 
     state
-        .register_authenticated(provider, &identity.uuid, &identity.email)
+        .register_authenticated(provider, &identity.uuid, &identity.email, None)
         .await
         .map_err(|e| format!("the account could not be saved: {e}"))?;
 
@@ -592,7 +580,6 @@ pub(crate) async fn remove_account_for(
     provider: Provider,
     uuid: &str,
 ) -> Result<(), String> {
-    let key = token_key(provider, uuid);
     let store = state.secrets();
 
     // Both store calls run on a blocking thread. `SecretStore` is synchronous
@@ -604,21 +591,14 @@ pub(crate) async fn remove_account_for(
     //
     // Server-side revocation is best-effort (§10.6) and already bounded at 5s
     // internally (auth/token.rs:24, :330-338) — it needs no timeout of its own.
-    let raw = {
+    let loaded = {
         let store = Arc::clone(&store);
-        let key = key.clone();
-        tauri::async_runtime::spawn_blocking(move || store.get(&key)).await
+        let id = uuid.to_string();
+        tauri::async_runtime::spawn_blocking(move || load_tokens(store.as_ref(), provider, &id))
+            .await
     };
-    if let Ok(Ok(Some(raw))) = raw {
-        if let Ok(t) = serde_json::from_slice::<TokenSet>(&raw) {
-            // `login_cfg`, not `state.cfg`: the token being revoked belongs to
-            // whichever provider this account is, and `state.cfg` is always
-            // Anthropic's spec. Sending an OpenAI refresh token to
-            // `state.cfg.revoke_url` would post a live Codex credential to
-            // `platform.claude.com` — not a silent no-op, a working credential
-            // reaching a vendor it does not belong to.
-            revoke(&state.http, &login_cfg(state, provider), &t.refresh_token).await;
-        }
+    if let Ok(Ok(tokens)) = loaded {
+        revoke_tokens(&state.http, &state.auth_configs, &tokens).await;
     }
     // **Not `let _ =`.** The comment above marks the server-side *revocation*
     // as best-effort per §10.6; it says nothing about the local deletion, and
@@ -632,8 +612,12 @@ pub(crate) async fn remove_account_for(
     // surviving percentage.
     {
         let store = Arc::clone(&store);
-        let key = key.clone();
-        if let Ok(Err(e)) = tauri::async_runtime::spawn_blocking(move || store.delete(&key)).await {
+        let id = uuid.to_string();
+        if let Ok(Err(e)) = tauri::async_runtime::spawn_blocking(move || {
+            delete_tokens(store.as_ref(), provider, &id)
+        })
+        .await
+        {
             eprintln!(
                 "{uuid}: the stored token could not be deleted ({e}); it may still be in the \
                  credential store"
@@ -659,8 +643,9 @@ pub(crate) async fn remove_account_for(
     // caller.
     let path = state.snapshots_path.clone();
     let id = uuid.to_string();
-    if let Ok(Err(e)) =
-        tauri::async_runtime::spawn_blocking(move || quota_core::snapshots::remove(&path, provider, &id))
+    if let Ok(Err(e)) = tauri::async_runtime::spawn_blocking(move || {
+        quota_core::snapshots::remove(&path, provider, &id)
+    })
             .await
     {
         eprintln!("{uuid}: the cached snapshot could not be removed: {e}");
@@ -987,25 +972,13 @@ mod tests {
         armed_as(state, Provider::Anthropic)
     }
 
-    /// `login_cfg` is the one place `begin_login` and `complete_login` decide
-    /// which endpoints a login talks to. Each provider carries its own
-    /// debug-only override (`main.rs`'s `token_url()` / `openai_token_url()`),
-    /// and the two must stay independent — overriding one must never leak
-    /// into the other, which is the whole reason `AppState` carries `cfg` and
-    /// `openai_cfg` as two fields rather than one.
+    /// The browser helper is now Anthropic-only. This test keeps its debug URL
+    /// seam real without implying that OpenAI shares the protocol.
     #[test]
-    fn each_providers_login_cfg_carries_its_own_override() {
+    fn the_browser_login_cfg_carries_the_anthropic_override() {
         let mut state = app_state(Arc::new(MemoryStore::default()));
         state.cfg.token_url = "http://127.0.0.1:1/overridden-anthropic".into();
-        state.openai_cfg.token_url = "http://127.0.0.1:1/overridden-openai".into();
-
-        assert_eq!(login_cfg(&state, Provider::Anthropic).token_url, state.cfg.token_url);
-        assert_eq!(login_cfg(&state, Provider::Openai).token_url, state.openai_cfg.token_url);
-        assert_ne!(
-            login_cfg(&state, Provider::Anthropic).token_url,
-            login_cfg(&state, Provider::Openai).token_url,
-            "the two providers' overrides must not collide"
-        );
+        assert_eq!(login_cfg(&state).token_url, state.cfg.token_url);
     }
 
     fn token_body(account: Option<serde_json::Value>) -> serde_json::Value {
@@ -1025,14 +998,6 @@ mod tests {
     async fn state_against(server: &MockServer) -> AppState {
         let mut state = app_state(Arc::new(MemoryStore::default()));
         state.cfg.token_url = format!("{}/v1/oauth/token", server.uri());
-        state
-    }
-
-    /// Codex's half of `state_against`, pointed at `openai_cfg` instead of
-    /// `cfg` — what makes a Codex login reachable against a mock at all.
-    async fn state_against_openai(server: &MockServer) -> AppState {
-        let mut state = app_state(Arc::new(MemoryStore::default()));
-        state.openai_cfg.token_url = format!("{}/oauth/token", server.uri());
         state
     }
 
@@ -1103,56 +1068,47 @@ mod tests {
         );
     }
 
-    /// The Codex counterpart to the test above — the same coverage
-    /// `Provider::Anthropic` already had, driven through `finish_manual_login`
-    /// → `complete_login` → `register_authenticated` for `Provider::Openai`
-    /// against a mock standing in for `auth.openai.com`. `begin_login` itself
-    /// still cannot be called directly (it needs a real `AppHandle`), the
-    /// same reason the Anthropic test above goes through the paste path
-    /// rather than the loopback one.
-    ///
-    /// `state_against_openai`'s `openai_cfg.token_url` override is what makes
-    /// this reachable at all: before it existed, `login_cfg` resolved every
-    /// `Provider::Openai` login straight to the real `auth.openai.com`, and
-    /// no test could drive this path without reaching the real network,
-    /// which CLAUDE.md forbids.
+    /// OpenAI device authorization has no pasteable `code#state` route. The
+    /// old desktop path reused Anthropic's manual redirect and only failed
+    /// after a real code had been spent. Refuse before the token endpoint and
+    /// before either store changes; `auth::openai` owns the replacement flow.
     #[tokio::test]
-    async fn a_good_codex_paste_stores_the_token_and_registers_the_account() {
+    async fn a_codex_paste_is_refused_without_storing_or_registering_anything() {
         let server = MockServer::start().await;
         Mock::given(method("POST"))
-            .and(path("/oauth/token"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-                "access_token": "codex-at-1",
-                "refresh_token": "codex-rt-1",
-                "expires_in": 28799,
-                // OpenAI's shape has never been measured — `account_id` is one
-                // of `account_id_from`'s three guessed candidates.
-                "account_id": "codex-user-1"
-            })))
+            .respond_with(ResponseTemplate::new(500))
             .mount(&server)
             .await;
 
-        let state = state_against_openai(&server).await;
+        let mut state = app_state(Arc::new(MemoryStore::default()));
+        state.auth_configs.openai.token_url = format!("{}/oauth/token", server.uri());
         armed_as(&state, Provider::Openai);
 
-        finish_manual_login(&state, "the-code#s-state").await.unwrap();
-
-        let stored = state.secrets().get(&token_key(Provider::Openai, "codex-user-1")).unwrap();
-        assert!(stored.is_some(), "the token never reached the store");
-        let tokens: TokenSet = serde_json::from_slice(&stored.unwrap()).unwrap();
-        assert_eq!(tokens.access_token, "codex-at-1");
-
-        let accounts = state.accounts.lock().await;
-        let a = accounts
-            .list()
-            .iter()
-            .find(|a| a.account_id == "codex-user-1")
-            .expect("the Codex account was not registered");
-        assert_eq!(a.provider, Provider::Openai, "the account did not carry the Codex provider");
-
+        let err = finish_manual_login(&state, "the-code#s-state")
+            .await
+            .unwrap_err();
+        assert!(err.contains("device authorization"), "wrong refusal: {err}");
         assert!(
-            state.pending_manual.lock().unwrap().is_none(),
-            "the finished login was left armed"
+            server.received_requests().await.unwrap().is_empty(),
+            "the code was sent anyway"
+        );
+        assert!(
+            state
+                .accounts
+                .lock()
+                .await
+                .list()
+                .iter()
+                .all(|a| a.provider != Provider::Openai),
+            "a refused paste registered an OpenAI account"
+        );
+        assert!(
+            state
+                .secrets()
+                .get(&token_key(Provider::Openai, "codex-user-1"))
+                .unwrap()
+                .is_none(),
+            "a refused paste stored a credential"
         );
     }
 
@@ -1216,6 +1172,7 @@ mod tests {
         let mut accounts = state.accounts.lock().await;
         let mut twin = accounts.list().iter().find(|a| a.account_id == "a").unwrap().clone();
         twin.provider = Provider::Openai;
+        twin.workspace_id = Some("workspace-a".into());
         accounts.upsert(twin).unwrap();
     }
 
@@ -1335,20 +1292,20 @@ mod tests {
 
         let mut state = app_state(Arc::new(MemoryStore::default()));
         state.cfg.revoke_url = format!("{}/v1/oauth/token/revoke", anthropic_server.uri());
-        state.openai_cfg.revoke_url = format!("{}/api/accounts/oauth/revoke", openai_server.uri());
+        state.auth_configs.anthropic.revoke_url =
+            format!("{}/v1/oauth/token/revoke", anthropic_server.uri());
+        state.auth_configs.openai.revoke_url = format!("{}/oauth/revoke", openai_server.uri());
         add_openai_twin_of_a(&state).await;
 
-        let tokens = TokenSet {
+        let tokens = quota_core::auth::openai::OpenAiTokenSet {
             access_token: "codex-access".into(),
             refresh_token: "codex-refresh".into(),
-            expires_at: chrono::Utc::now() + chrono::TimeDelta::hours(1),
-            refresh_token_expires_at: chrono::Utc::now() + chrono::TimeDelta::days(30),
-            scopes: vec![],
             client_id: "test".into(),
+            user_id: "a".into(),
+            workspace_id: Some("workspace-a".into()),
+            is_fedramp: None,
         };
-        state
-            .secrets()
-            .put(&token_key(Provider::Openai, "a"), &serde_json::to_vec(&tokens).unwrap())
+        quota_core::auth::stored::save_openai_tokens(state.secrets().as_ref(), "a", &tokens)
             .unwrap();
 
         remove_account_for(&state, Provider::Openai, "a").await.unwrap();

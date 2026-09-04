@@ -492,6 +492,20 @@ describe('AccountRow reset-credits line', () => {
     expect(screen.queryByText(/applicable/)).toBeNull()
   })
 
+  it('shows only the available count when applicability was not reported', () => {
+    render(AccountRow, {
+      account: acct({
+        provider: 'openai',
+        state: {
+          kind: 'ok', windows: [], fetched_at: NOW.toISOString(),
+          extra: { kind: 'reset_credits', available: 3, applicable: null },
+        },
+      }),
+    })
+    expect(screen.getByText('3')).toBeTruthy()
+    expect(screen.queryByText(/applicable/)).toBeNull()
+  })
+
   /**
    * `.account.stale :global(.amounts)` reaches `CreditLine`'s third column by
    * class name alone, with no `ResetCreditsLine`-specific rule — so this either

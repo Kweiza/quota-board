@@ -10,7 +10,7 @@
    * noise.
    */
   $: text =
-    credits.applicable === credits.available
+    credits.applicable === null || credits.applicable === credits.available
       ? `${credits.available}`
       : `${credits.available} (${credits.applicable} applicable)`
 </script>

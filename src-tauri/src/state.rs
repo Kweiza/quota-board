@@ -1,7 +1,9 @@
 use chrono::Utc;
 use quota_core::accounts::{Account, AccountStore};
 use quota_core::auth::pkce::PendingAuth;
-use quota_core::auth::stored::{ensure_fresh, RefreshLocks};
+use quota_core::auth::stored::{
+    ensure_fresh, refresh_after_unauthorized, AuthConfigs, RefreshLocks,
+};
 use quota_core::auth::token::ReqwestHttp;
 use quota_core::provider::{Provider, ProviderSpec};
 use quota_core::scheduler::{
@@ -10,7 +12,7 @@ use quota_core::scheduler::{
 use quota_core::secrets::{SecretError, SecretStore};
 use quota_core::settings::SettingsStore;
 use quota_core::snapshots::{fingerprint, save as save_snapshot};
-use quota_core::usage::http::{fetch_usage_captured_at, UsageError};
+use quota_core::usage::http::{fetch_usage_captured_for_account_at, UsageError};
 use quota_core::usage::raw::{RawLog, RawResponse};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -109,22 +111,10 @@ pub struct AppState {
     /// Anthropic's login endpoints, with `main.rs`'s `token_url()` override
     /// baked in (debug-only, Step 11's local-mock verification).
     pub cfg: ProviderSpec,
-    /// Codex's half of the same pair. Kept as its own field rather than a map,
-    /// for the same reason `usage_url`/`openai_usage_url` below are: `Provider`
-    /// is a closed set of two, and a `HashMap` would buy nothing over one field
-    /// per variant while making a typo'd key a runtime `None` instead of a
-    /// compile error.
-    ///
-    /// **Without this, nothing could exercise a Codex login against a mock.**
-    /// `login_cfg` in `commands.rs` used to resolve every OpenAI login straight
-    /// to `Provider::Openai.spec()` — the real `auth.openai.com` — because no
-    /// override existed for it, unlike the identical seam
-    /// `QUOTA_OPENAI_USAGE_URL` already gave the usage endpoint. That left the
-    /// whole login path — `begin_login` → `complete_login` →
-    /// `register_authenticated` — for Codex with no test able to reach it
-    /// without touching the real network, which CLAUDE.md forbids. `main.rs`'s
-    /// `openai_token_url()` is the same override, one endpoint over.
-    pub openai_cfg: ProviderSpec,
+    /// Provider-aware refresh configuration. Login keeps the two legacy fields
+    /// above until the desktop UI adopts device code; polling must not use
+    /// them, because OpenAI's refresh protocol is not its browser exchange.
+    pub auth_configs: AuthConfigs,
     /// Per-account refresh locks (Task 10b). **Exactly one instance may exist
     /// in the whole application** — two copies serialize nothing, because each
     /// hands out its own mutex (auth/stored.rs:76-84).
@@ -380,6 +370,7 @@ impl AppState {
         provider: Provider,
         uuid: &str,
         email: &str,
+        workspace_id: Option<&str>,
     ) -> Result<(), quota_core::accounts::AccountError> {
         // Lock order: scheduler before accounts. See this struct's doc comment.
         let mut sched = self.scheduler.lock().await;
@@ -397,6 +388,11 @@ impl AppState {
         accounts.upsert(Account {
             account_id: uuid.to_string(),
             provider,
+            // Request context must come from this authentication, never from
+            // stale metadata. Polling reads it from the matching token; keeping
+            // the old value here while saving a bearer-only token would make
+            // disk and the request disagree about which quota this row reads.
+            workspace_id: workspace_id.map(str::to_string),
             display_label: existing
                 .as_ref()
                 .map(|a| a.display_label.clone())
@@ -462,21 +458,9 @@ impl AppState {
         // one. A store swapped in mid-poll therefore takes effect from the
         // next poll, and this one finishes against the store it started with.
         let store = self.secrets();
-        // Selected by provider, not `&self.cfg` unconditionally: `ensure_fresh`
-        // takes `provider` only for the lock and store keys (auth/stored.rs)
-        // — the spec is what actually reaches the network, in `refresh`'s
-        // POST to `cfg.token_url`. The identical defect this task already
-        // fixed at the revoke call, on a path that runs on every token
-        // rotation instead of once at removal: an unconditional `&self.cfg`
-        // here would POST a live Codex refresh token to `platform.claude.com`
-        // every time a Codex access token expires — routine, not an edge case.
-        let cfg = match provider {
-            Provider::Anthropic => &self.cfg,
-            Provider::Openai => &self.openai_cfg,
-        };
         let fresh = match ensure_fresh(
             &self.http,
-            cfg,
+            &self.auth_configs,
             store.as_ref(),
             &self.refresh_locks,
             provider,
@@ -510,9 +494,57 @@ impl AppState {
             Provider::Anthropic => &self.usage_url,
             Provider::Openai => &self.openai_usage_url,
         };
-        let fetched =
-            fetch_usage_captured_at(&self.http, provider, usage_url, &fresh.tokens.access_token)
-                .await;
+        let mut fetched_access = fresh.tokens.access_token().to_string();
+        let mut fetched_workspace = fresh.tokens.workspace_id().map(str::to_string);
+        let mut fetched = fetch_usage_captured_for_account_at(
+            &self.http,
+            provider,
+            usage_url,
+            &fetched_access,
+            fetched_workspace.as_deref(),
+            fresh.tokens.is_fedramp(),
+        )
+        .await;
+
+        // Unknown OpenAI access-token expiry is not fabricated as 1970. A 401
+        // is the authoritative signal instead, and it must force a rotation or
+        // this row loops through AuthExpired forever while `ensure_fresh`
+        // keeps returning the same opaque token.
+        if matches!(&fetched.outcome, Err(UsageError::Unauthorized)) {
+            match refresh_after_unauthorized(
+                &self.http,
+                &self.auth_configs,
+                store.as_ref(),
+                &self.refresh_locks,
+                provider,
+                uuid,
+                &fetched_access,
+            )
+            .await
+            {
+                Ok(rotated) => {
+                    if let Err(e) = &rotated.persisted {
+                        eprintln!("{uuid}: the 401-triggered rotation could not be persisted: {e}");
+                    }
+                    fetched_access = rotated.tokens.access_token().to_string();
+                    fetched_workspace = rotated.tokens.workspace_id().map(str::to_string);
+                    fetched = fetch_usage_captured_for_account_at(
+                        &self.http,
+                        provider,
+                        usage_url,
+                        &fetched_access,
+                        fetched_workspace.as_deref(),
+                        rotated.tokens.is_fedramp(),
+                    )
+                    .await;
+                }
+                Err(e) => {
+                    let kind = FailureKind::from_stored_token_error(&e);
+                    self.record(provider, uuid, kind).await;
+                    return;
+                }
+            }
+        }
         if let Some(raw) = fetched.raw {
             self.record_raw(provider, uuid, raw);
         }
@@ -521,7 +553,7 @@ impl AppState {
             Ok(windows) => {
                 // The fingerprint is taken from the token that produced *this*
                 // fetch, not re-read from the store afterwards.
-                let fp = fingerprint(&fresh.tokens.access_token);
+                let fp = fingerprint(&fetched_access);
                 let snap = {
                     let mut sched = self.scheduler.lock().await;
                     sched.record_success(provider, uuid, windows, extra);
@@ -560,9 +592,11 @@ impl AppState {
             // `Throttled` is the one variant `from_usage_error` returns `None`
             // for, by design: folding it into `record_failure` would discard the
             // `Retry-After` that §6.2 makes the entire input to the policy.
-            Err(UsageError::Throttled { retry_after_secs }) => {
-                self.scheduler.lock().await.record_throttle(provider, uuid, retry_after_secs)
-            }
+            Err(UsageError::Throttled { retry_after_secs }) => self
+                .scheduler
+                .lock()
+                .await
+                .record_throttle(provider, uuid, retry_after_secs),
             Err(e) => {
                 // `Throttled` is the only `None` today, and it is handled
                 // above — so this fallback is unreachable as the code stands.
@@ -621,9 +655,9 @@ pub async fn poll_loop(handle: tauri::AppHandle) {
         // `!self.visible` early return). Mapping focus loss to
         // `set_visible(false)` freezes polling the moment the user clicks
         // anything else, which is the exact inversion of §6.3's rationale.
-        let shown = handle.get_webview_window("widget").is_none_or(|w| {
-            w.is_visible().unwrap_or(true) && !w.is_minimized().unwrap_or(false)
-        });
+        let shown = handle
+            .get_webview_window("widget")
+            .is_none_or(|w| w.is_visible().unwrap_or(true) && !w.is_minimized().unwrap_or(false));
         let visible = shown && state.webview_visible.load(Ordering::Relaxed);
         state.scheduler.lock().await.set_visible(visible);
 
@@ -687,6 +721,7 @@ pub(crate) mod tests {
         Account {
             account_id: uuid.into(),
             provider: Provider::Anthropic,
+            workspace_id: None,
             display_label: uuid.into(),
             email: format!("{uuid}@example.invalid"),
             created_at: chrono::Utc::now(),
@@ -732,14 +767,17 @@ pub(crate) mod tests {
             // Unreachable in these tests: the store fails before any request.
             cfg: ProviderSpec {
                 token_url: "http://127.0.0.1:1/never".into(),
-                ..Provider::Anthropic.spec()
+                ..ProviderSpec::anthropic()
             },
-            // Same dead address, same reason — a test that needs a real Codex
-            // login exchange overrides this field directly, the same way
-            // existing tests override `cfg.token_url`.
-            openai_cfg: ProviderSpec {
-                token_url: "http://127.0.0.1:1/never".into(),
-                ..Provider::Openai.spec()
+            auth_configs: AuthConfigs {
+                anthropic: ProviderSpec {
+                    token_url: "http://127.0.0.1:1/never".into(),
+                    ..ProviderSpec::anthropic()
+                },
+                openai: quota_core::auth::openai::OpenAiAuthConfig {
+                    token_url: "http://127.0.0.1:1/never".into(),
+                    ..Default::default()
+                },
             },
             refresh_locks: RefreshLocks::default(),
             poll_permit: Mutex::new(()),
@@ -879,7 +917,10 @@ pub(crate) mod tests {
         tokio::time::sleep(Duration::from_millis(50)).await;
         let login = {
             let s = Arc::clone(&state);
-            tokio::spawn(async move { s.register_authenticated(Provider::Anthropic, "a", "a@example.invalid").await })
+            tokio::spawn(async move {
+                s.register_authenticated(Provider::Anthropic, "a", "a@example.invalid", None)
+                    .await
+            })
         };
 
         let both = tokio::time::timeout(Duration::from_secs(3), async {
@@ -909,6 +950,7 @@ pub(crate) mod tests {
                 .upsert(Account {
                     account_id: "a".into(),
                     provider: Provider::Anthropic,
+                    workspace_id: None,
                     display_label: "work".into(),
                     email: "old@example.invalid".into(),
                     created_at: created,
@@ -925,7 +967,10 @@ pub(crate) mod tests {
             "premise: the account reads as quarantined before the re-login"
         );
 
-        state.register_authenticated(Provider::Anthropic, "a", "different@example.invalid").await.unwrap();
+        state
+            .register_authenticated(Provider::Anthropic, "a", "different@example.invalid", None)
+            .await
+            .unwrap();
 
         {
             let accounts = state.accounts.lock().await;
@@ -970,6 +1015,7 @@ pub(crate) mod tests {
                 .upsert(Account {
                     account_id: "shared-id".into(),
                     provider: Provider::Anthropic,
+                    workspace_id: None,
                     display_label: "claude work".into(),
                     email: "claude@example.invalid".into(),
                     created_at: anthropic_created,
@@ -981,7 +1027,12 @@ pub(crate) mod tests {
         }
 
         state
-            .register_authenticated(Provider::Openai, "shared-id", "codex@example.invalid")
+            .register_authenticated(
+                Provider::Openai,
+                "shared-id",
+                "codex@example.invalid",
+                Some("workspace-codex"),
+            )
             .await
             .unwrap();
 
@@ -1014,6 +1065,46 @@ pub(crate) mod tests {
             state.scheduler.lock().await.state(Provider::Openai, "shared-id"),
             Some(AccountState::Loading)
         ));
+    }
+
+    /// A re-login with no workspace claim must not borrow the old metadata
+    /// value. Polling reads workspace context from the newly saved token, not
+    /// from this record, so preserving only the record would make the file say
+    /// workspace-scoped while the request silently became bearer-only.
+    #[tokio::test]
+    async fn a_missing_openai_workspace_does_not_inherit_the_previous_one() {
+        let state = app_state(Arc::new(quota_core::secrets::MemoryStore::default()));
+        state
+            .register_authenticated(
+                Provider::Openai,
+                "user-one",
+                "one@example.invalid",
+                Some("workspace-one"),
+            )
+            .await
+            .unwrap();
+
+        let result = state
+            .register_authenticated(
+                Provider::Openai,
+                "user-one",
+                "one@example.invalid",
+                None,
+            )
+            .await;
+        assert!(matches!(
+            result,
+            Err(quota_core::accounts::AccountError::WorkspaceConflict)
+        ));
+        let accounts = state.accounts.lock().await;
+        let account = accounts
+            .list()
+            .iter()
+            .find(|account| {
+                account.provider == Provider::Openai && account.account_id == "user-one"
+            })
+            .expect("the original OpenAI account remains registered");
+        assert_eq!(account.workspace_id.as_deref(), Some("workspace-one"));
     }
 
     /// **docs/design.md §9.2's fallback had never been exercised by the
@@ -1146,7 +1237,10 @@ pub(crate) mod tests {
         let state = app_state(Arc::new(LockedStore));
         let b_before = state.scheduler.lock().await.next_wake(Provider::Anthropic, "b").unwrap();
 
-        state.register_authenticated(Provider::Anthropic, "c", "c@example.invalid").await.unwrap();
+        state
+            .register_authenticated(Provider::Anthropic, "c", "c@example.invalid", None)
+            .await
+            .unwrap();
 
         let sched = state.scheduler.lock().await;
         assert!(
@@ -1174,8 +1268,8 @@ pub(crate) mod tests {
     /// would also produce if the wrong mock happened to answer.
     #[tokio::test]
     async fn a_codex_account_is_polled_against_its_own_url_not_anthropics() {
-        use quota_core::auth::token::TokenSet;
-        use quota_core::provider::token_key;
+        use quota_core::auth::openai::OpenAiTokenSet;
+        use quota_core::auth::stored::save_openai_tokens;
         use wiremock::matchers::method;
         use wiremock::{Mock, MockServer, ResponseTemplate};
 
@@ -1198,19 +1292,20 @@ pub(crate) mod tests {
         state.usage_url = anthropic_server.uri();
         state.openai_usage_url = openai_server.uri();
 
-        let tokens = TokenSet {
+        let tokens = OpenAiTokenSet {
             access_token: "codex-access".into(),
             refresh_token: "codex-refresh".into(),
-            expires_at: Utc::now() + chrono::TimeDelta::hours(1),
-            refresh_token_expires_at: Utc::now() + chrono::TimeDelta::days(30),
-            scopes: vec![],
             client_id: "test".into(),
+            user_id: "codex-a".into(),
+            workspace_id: Some("workspace-a".into()),
+            is_fedramp: None,
         };
+        save_openai_tokens(state.secrets().as_ref(), "codex-a", &tokens).unwrap();
         state
-            .secrets()
-            .put(&token_key(Provider::Openai, "codex-a"), &serde_json::to_vec(&tokens).unwrap())
-            .unwrap();
-        state.scheduler.lock().await.add(Provider::Openai, "codex-a");
+            .scheduler
+            .lock()
+            .await
+            .add(Provider::Openai, "codex-a");
 
         state.poll_one(Provider::Openai, "codex-a").await;
 
@@ -1247,8 +1342,8 @@ pub(crate) mod tests {
     /// would never reach this code path.
     #[tokio::test]
     async fn a_codex_account_is_refreshed_against_its_own_token_endpoint_not_anthropics() {
-        use quota_core::auth::token::TokenSet;
-        use quota_core::provider::token_key;
+        use quota_core::auth::openai::OpenAiTokenSet;
+        use quota_core::auth::stored::save_openai_tokens;
         use wiremock::matchers::method;
         use wiremock::{Mock, MockServer, ResponseTemplate};
 
@@ -1257,9 +1352,7 @@ pub(crate) mod tests {
         Mock::given(method("POST"))
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
                 "access_token": "new-codex-access",
-                "refresh_token": "new-codex-refresh",
-                "expires_in": 27000,
-                "scope": ""
+                "refresh_token": "new-codex-refresh"
             })))
             .mount(&openai_server)
             .await;
@@ -1268,21 +1361,27 @@ pub(crate) mod tests {
 
         let mut state = app_state(Arc::new(quota_core::secrets::MemoryStore::default()));
         state.cfg.token_url = format!("{}/v1/oauth/token", anthropic_server.uri());
-        state.openai_cfg.token_url = format!("{}/api/accounts/oauth/token", openai_server.uri());
+        state.auth_configs.anthropic.token_url =
+            format!("{}/v1/oauth/token", anthropic_server.uri());
+        state.auth_configs.openai.token_url = format!("{}/oauth/token", openai_server.uri());
 
-        let tokens = TokenSet {
-            access_token: "codex-access".into(),
+        let tokens = OpenAiTokenSet {
+            // A valid JWT whose `exp` is one second after the epoch. The ID
+            // token is deliberately not stored: access expiry comes from this
+            // field and no other.
+            access_token: "e30.eyJleHAiOjF9.signature".into(),
             refresh_token: "codex-refresh".into(),
-            expires_at: Utc::now() - chrono::TimeDelta::seconds(1),
-            refresh_token_expires_at: Utc::now() + chrono::TimeDelta::days(30),
-            scopes: vec![],
             client_id: "test".into(),
+            user_id: "codex-a".into(),
+            workspace_id: Some("workspace-a".into()),
+            is_fedramp: None,
         };
+        save_openai_tokens(state.secrets().as_ref(), "codex-a", &tokens).unwrap();
         state
-            .secrets()
-            .put(&token_key(Provider::Openai, "codex-a"), &serde_json::to_vec(&tokens).unwrap())
-            .unwrap();
-        state.scheduler.lock().await.add(Provider::Openai, "codex-a");
+            .scheduler
+            .lock()
+            .await
+            .add(Provider::Openai, "codex-a");
 
         state.poll_one(Provider::Openai, "codex-a").await;
 

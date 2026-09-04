@@ -33,7 +33,7 @@ export interface ResetCredits {
    * Measured 0 while `available` was 1, so the two are **not** interchangeable:
    * an account can hold a credit that does nothing for the limit it is hitting.
    */
-  applicable: number
+  applicable: number | null
 }
 
 /**

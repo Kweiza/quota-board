@@ -1,7 +1,5 @@
 use crate::auth::pkce::PendingAuth;
-use crate::provider::{BodyStyle, Provider, ProviderSpec};
-use crate::usage::http::fetch_usage_body_at;
-use crate::usage::openai::parse_email;
+use crate::provider::{Provider, ProviderSpec};
 use chrono::{DateTime, TimeDelta, Utc};
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
@@ -38,26 +36,53 @@ pub enum AuthError {
     OAuth { status: u16, code: Option<String>, description: Option<String> },
     #[error("failed to parse the response: {0}")]
     Decode(String),
-    /// `account_id_from` walked every OpenAI candidate path and found none
-    /// present, or every one present but empty. **Only the OpenAI path
-    /// through `identity_from` produces this**: Anthropic's branch returns
-    /// `Ok(None)` instead when `account` is absent or does not match the
-    /// measured shape, which `commands::complete_login` turns into its own
-    /// plain-string refusal ("the token response carried no account block"),
-    /// not this error. `exchange_and_identify` reuses this same variant for
-    /// its own "no identity at all" case, but nothing calls it with
-    /// `Provider::Anthropic`.
+    /// OpenAI's ID token carried no `chatgpt_user_id` and no namespaced
+    /// `auth.user_id`. Anthropic returns `Ok(None)` instead when its measured
+    /// `account` block is absent; its caller supplies that provider-specific
+    /// refusal.
     /// **Never carries the body**: the body holds the tokens, and CLAUDE.md
     /// forbids a live credential reaching an error message.
     #[error("the token response carried no account identifier")]
     NoAccountIdentifier,
+    /// A rotated OpenAI grant changed the user or workspace under the stored
+    /// key. Keeping it would make one row act with another identity's token.
+    #[error("the refreshed token belongs to a different account or workspace")]
+    IdentityMismatch,
+    #[error("the device code expired before it was approved")]
+    DeviceCodeExpired,
+    /// The issuer explicitly reported that this public client's device flow is
+    /// unavailable. A host can offer a provider-specific explanation; parsing
+    /// this out of server prose would make localization impossible.
+    #[error("device-code login is not available")]
+    DeviceCodeUnavailable,
 }
 
 impl AuthError {
-    /// Whether the refresh chain is permanently dead. docs/design.md §10.5 —
-    /// the account is quarantined on the first strike, not retried.
-    pub fn is_dead_grant(&self) -> bool {
-        matches!(self, AuthError::OAuth { code, .. } if code.as_deref() == Some("invalid_grant"))
+    /// Whether the refresh chain is permanently dead for this provider.
+    /// docs/design.md §10.5 — the account is quarantined on the first strike,
+    /// not retried.
+    ///
+    /// A bare 401 is terminal at OpenAI's refresh endpoint. Anthropic's
+    /// terminal contract is an explicit invalid-grant code; sharing OpenAI's
+    /// status-only rule would quarantine a Claude account without evidence
+    /// that its rotating chain is dead.
+    pub fn is_dead_grant_for(&self, provider: Provider) -> bool {
+        match self {
+            AuthError::IdentityMismatch => true,
+            AuthError::OAuth { status, code, .. } => {
+                (*status == 401 && provider == Provider::Openai)
+                    || matches!(
+                        code.as_deref().map(str::to_ascii_lowercase).as_deref(),
+                        Some(
+                            "invalid_grant"
+                                | "refresh_token_reused"
+                                | "refresh_token_expired"
+                                | "refresh_token_invalidated"
+                        )
+                    )
+            }
+            _ => false,
+        }
     }
     /// Whether the caller should retry once with the stored scopes sent back
     /// verbatim. docs/design.md §10.5.
@@ -128,13 +153,24 @@ pub trait TokenHttp: Send + Sync {
         body: &serde_json::Value,
     ) -> impl std::future::Future<Output = Result<(T, serde_json::Value), AuthError>> + Send;
 
-    /// `BodyStyle::Form`'s transport: `application/x-www-form-urlencoded`, the
-    /// RFC 6749 shape, as opposed to `post_json`'s Anthropic-measured JSON.
+    /// OpenAI's authorization-code exchange transport:
+    /// `application/x-www-form-urlencoded`, as opposed to Anthropic's JSON.
     fn post_form<T: DeserializeOwned>(
         &self,
         url: &str,
         form: &[(&str, &str)],
     ) -> impl std::future::Future<Output = Result<(T, serde_json::Value), AuthError>> + Send;
+
+    /// A JSON POST whose status is part of the protocol rather than merely an
+    /// error. OpenAI's device poll uses 403 and 404 for "not approved yet",
+    /// and its refresh endpoint has provider-specific terminal error codes, so
+    /// decoding every non-2xx into one generic OAuth error would discard the
+    /// information those callers need.
+    fn post_json_response(
+        &self,
+        url: &str,
+        body: &serde_json::Value,
+    ) -> impl std::future::Future<Output = Result<TokenHttpResponse, AuthError>> + Send;
 
     fn get_json<T: DeserializeOwned>(
         &self,
@@ -143,6 +179,16 @@ pub trait TokenHttp: Send + Sync {
     ) -> impl std::future::Future<Output = Result<T, AuthError>> + Send;
 
     fn user_agent(&self) -> &str;
+}
+
+/// Status and bytes from an auth POST.
+///
+/// Deliberately has no `Debug`: successful OpenAI token responses carry three
+/// live credentials, and deriving it would make a log or assertion print all
+/// of them. Callers parse the bytes immediately and never put them in an error.
+pub struct TokenHttpResponse {
+    pub status: u16,
+    pub body: Vec<u8>,
 }
 
 pub struct ReqwestHttp {
@@ -210,7 +256,15 @@ impl ReqwestHttp {
     pub fn with_roots(roots: TrustRoots) -> Result<Self, AuthError> {
         let builder = reqwest::Client::builder()
             .user_agent(USER_AGENT)
-            .timeout(std::time::Duration::from_secs(30));
+            .timeout(std::time::Duration::from_secs(30))
+            // No endpoint this application calls legitimately redirects.
+            // Following a 307/308 on an auth POST replays its body — an
+            // authorization code, verifier or refresh token — to the target.
+            // On a usage GET it can send the bearer to a different path or
+            // origin depending on the redirect. Refuse at the one client all
+            // provider requests share rather than asking every caller to
+            // remember which status codes preserve a body.
+            .redirect(reqwest::redirect::Policy::none());
 
         if let TrustRoots::Only(ders) = roots {
             // Refused, not honoured. `tls_certs_only(<empty>)` builds happily
@@ -329,6 +383,28 @@ impl TokenHttp for ReqwestHttp {
         decode(resp).await
     }
 
+    async fn post_json_response(
+        &self,
+        url: &str,
+        body: &serde_json::Value,
+    ) -> Result<TokenHttpResponse, AuthError> {
+        let resp = self
+            .client
+            .post(url)
+            .header("Content-Type", "application/json")
+            .json(body)
+            .send()
+            .await
+            .map_err(|e| AuthError::Transport(e.to_string()))?;
+        let status = resp.status().as_u16();
+        let body = resp
+            .bytes()
+            .await
+            .map_err(|e| AuthError::Transport(e.to_string()))?
+            .to_vec();
+        Ok(TokenHttpResponse { status, body })
+    }
+
     async fn get_json<T: DeserializeOwned>(&self, url: &str, bearer: &str) -> Result<T, AuthError> {
         let resp = self
             .client
@@ -350,14 +426,9 @@ impl TokenHttp for ReqwestHttp {
     }
 }
 
-/// The token fields common to every provider. **Deliberately carries no
-/// `account` field.** OpenAI's shape has never been measured (see
-/// `account_id_from`), so an `account` key present but shaped differently from
-/// Anthropic's `AccountBlock` would otherwise fail this whole struct's
-/// deserialization and mask `account_id_from`'s specific error behind a
-/// generic `Decode` one — exactly the failure Step 3 of the Codex login task
-/// exists to fix. `identity_from` reads `account` from the raw `Value`
-/// instead, one path per provider, never as a field here.
+/// Anthropic's measured token fields. OpenAI's response is deliberately a
+/// different type in `auth::openai`: it has an ID token, no `expires_in`, and
+/// different refresh semantics.
 #[derive(Deserialize)]
 struct TokenFields {
     access_token: String,
@@ -376,130 +447,22 @@ struct AccountBlock {
     email_address: Option<String>,
 }
 
-/// The provider's account identifier, from a token response.
-///
-/// **The field name is unmeasured** (docs/research/codex-usage-endpoint.md ran
-/// no OAuth flow), so the candidates are tried in order and absence is an
-/// error. Returning a generated id instead would write a keychain entry under a
-/// key no later lookup can reproduce — the account would appear to be added and
-/// then read as AUTH_DEAD forever.
-///
-/// Anthropic's path does not call this: `identity_from` reads its measured
-/// `account: {uuid, email_address}` shape directly. This exists for OpenAI,
-/// whose shape has never been observed, so the candidates are a guess rather
-/// than a measurement — and a wrong guess must fail loudly rather than
-/// silently key an account under an invented id.
-///
-/// **A present-but-empty candidate does not count.** `{"account_id": ""}`
-/// would otherwise satisfy `as_str()` and be accepted: an empty string is a
-/// keychain key nothing can look up again, the same dead end an invented id
-/// produces. An empty match falls through to the next candidate exactly as a
-/// wrong-typed one already did, rather than being accepted or aborting the
-/// whole walk — a later candidate may still carry a real value.
-pub fn account_id_from(body: &serde_json::Value) -> Result<String, AuthError> {
-    for path in [&["account", "uuid"][..], &["account_id"][..], &["chatgpt_account_id"][..]] {
-        let mut cur = body;
-        let mut ok = true;
-        for key in path {
-            match cur.get(key) {
-                Some(next) => cur = next,
-                None => {
-                    ok = false;
-                    break;
-                }
-            }
-        }
-        if ok {
-            if let Some(s) = cur.as_str() {
-                if !s.is_empty() {
-                    return Ok(s.to_string());
-                }
-            }
-        }
-    }
-    Err(AuthError::NoAccountIdentifier)
-}
-
-/// The account identity, derived from the raw token response body rather than
-/// from a struct field shared across providers — one path per provider (Step 3
-/// of the Codex login task).
-///
-/// **Anthropic's is measured and typed.** `account: {uuid, email_address}`
-/// (§10.3); absence is `None`, and every caller (`commands::complete_login`)
-/// turns that into a loud refusal rather than registering an account with no
-/// key. A present `account` that fails to match `AccountBlock`'s shape is
-/// treated the same as absence: that shape is measured and has never been seen
-/// to vary, so there is no established alternate reading to fall back to.
-///
-/// **OpenAI's is not.** No OAuth flow has ever been run against it, so
-/// `account_id_from`'s candidate walk is the only source of truth, and its
-/// failure — no candidate present, or every one empty — propagates as
-/// `AuthError::NoAccountIdentifier` rather than becoming `None`: `None` would
-/// read as "this account chose not to carry an identity", which is not what an
-/// unrecognised field means for a shape that is a guess.
-fn identity_from(
-    provider: Provider,
-    raw: &serde_json::Value,
-) -> Result<Option<AccountIdentity>, AuthError> {
-    match provider {
-        Provider::Anthropic => Ok(raw
-            .get("account")
-            .and_then(|a| serde_json::from_value::<AccountBlock>(a.clone()).ok())
-            .map(|a| AccountIdentity { uuid: a.uuid, email: a.email_address.unwrap_or_default() })),
-        Provider::Openai => {
-            let uuid = account_id_from(raw)?;
-            // Never carries an email here: OpenAI's token response has never
-            // been observed to carry one at all. `backfill_email` fills it in
-            // from the usage response when this is empty (Step 5).
-            Ok(Some(AccountIdentity { uuid, email: String::new() }))
-        }
-    }
-}
-
-/// Sends a body in whichever shape `style` calls for.
-///
-/// **Every POST this module makes goes through here**, token requests and
-/// revocation alike. `revoke` used to send JSON unconditionally, which was
-/// right for the one provider whose shape is measured and wrong for the other,
-/// and — because `revoke` discards its result — wrong invisibly. One dispatch
-/// means a provider added later cannot get one endpoint right and the other
-/// wrong.
-async fn post_in_body_style<H: TokenHttp, T: DeserializeOwned>(
-    http: &H,
-    style: BodyStyle,
-    url: &str,
-    json_body: &serde_json::Value,
-    form_body: &[(&str, &str)],
-) -> Result<(T, serde_json::Value), AuthError> {
-    match style {
-        BodyStyle::JsonWithState => http.post_json(url, json_body).await,
-        BodyStyle::Form => http.post_form(url, form_body).await,
-    }
-}
-
-/// The token endpoint's half of [`post_in_body_style`]. This is the one place
-/// `exchange_code` and `refresh` differ across providers — PKCE, the loopback
-/// listener, and the manual paste fallback are unaffected and stay shared.
 async fn post_token_request<H: TokenHttp>(
     http: &H,
     cfg: &ProviderSpec,
     json_body: &serde_json::Value,
-    form_body: &[(&str, &str)],
 ) -> Result<(TokenFields, serde_json::Value), AuthError> {
-    post_in_body_style(http, cfg.body_style, &cfg.token_url, json_body, form_body).await
+    http.post_json(&cfg.token_url, json_body).await
 }
 
 /// authorization_code → token exchange. docs/design.md §10.3.
 ///
-/// **Anthropic's body is JSON and carries `state`, which is non-standard for a
-/// token request but is the shape that server expects.** A provider whose
-/// `body_style` is `BodyStyle::Form` instead gets the RFC 6749 shape, with no
-/// `state` field at all — `state` has no counterpart there, since it is
-/// Anthropic's own addition, not part of the standard.
+/// Anthropic's body is JSON and carries `state`, which is non-standard for a
+/// token request but is the measured shape that server expects. OpenAI's
+/// device exchange is form encoded and lives in `auth::openai`.
 pub async fn exchange_code<H: TokenHttp>(
     http: &H,
     cfg: &ProviderSpec,
-    provider: Provider,
     pending: &PendingAuth,
     code: &str,
     returned_state: &str,
@@ -519,15 +482,7 @@ pub async fn exchange_code<H: TokenHttp>(
         "code_verifier": pending.verifier,
         "state": pending.state,
     });
-    let form_body = [
-        ("grant_type", "authorization_code"),
-        ("code", code),
-        ("redirect_uri", pending.redirect_uri.as_str()),
-        ("client_id", cfg.client_id.as_str()),
-        ("code_verifier", pending.verifier.as_str()),
-    ];
-
-    let (r, raw) = post_token_request(http, cfg, &json_body, &form_body).await?;
+    let (r, raw) = post_token_request(http, cfg, &json_body).await?;
 
     let scopes = r
         .scope
@@ -549,7 +504,13 @@ pub async fn exchange_code<H: TokenHttp>(
         client_id: cfg.client_id.clone(),
     };
 
-    let identity = identity_from(provider, &raw)?;
+    let identity = raw
+        .get("account")
+        .and_then(|a| serde_json::from_value::<AccountBlock>(a.clone()).ok())
+        .map(|a| AccountIdentity {
+            uuid: a.uuid,
+            email: a.email_address.unwrap_or_default(),
+        });
 
     Ok((tokens, identity))
 }
@@ -571,23 +532,16 @@ pub async fn refresh<H: TokenHttp>(
         "client_id": cfg.client_id,
         "scope": scope,
     });
-    let form_body = [
-        ("grant_type", "refresh_token"),
-        ("refresh_token", tokens.refresh_token.as_str()),
-        ("client_id", cfg.client_id.as_str()),
-        ("scope", scope.as_str()),
-    ];
-
     // The raw body is discarded here: `refresh` never derives an identity,
     // only `exchange_code`'s initial login does.
-    let (r, _raw) = match post_token_request(http, cfg, &json_body, &form_body).await {
+    let (r, _raw) = match post_token_request(http, cfg, &json_body).await {
         Ok(pair) => pair,
         Err(e) if e.is_invalid_scope() => {
             // Retry exactly once with the identical body. This covers a
             // transient scope rejection from the server, not an attempt to
             // change the scopes — sending anything else here would defeat
             // the verbatim rule above.
-            post_token_request(http, cfg, &json_body, &form_body).await?
+            post_token_request(http, cfg, &json_body).await?
         }
         Err(e) => return Err(e),
     };
@@ -622,115 +576,25 @@ pub async fn refresh<H: TokenHttp>(
 /// blocked by the revocation endpoint being unreachable or slow — the local
 /// deletion proceeds either way. docs/design.md §10.6.
 ///
-/// **Branched on `body_style`, like every other POST here.** §10.6's JSON shape
-/// is Anthropic's and is measured; nothing at all has been measured for
-/// OpenAI, and RFC 7009 §2.1 requires `application/x-www-form-urlencoded` for a
-/// revocation request — which is the same reason `BodyStyle::Form` was chosen
-/// for that provider's token endpoint. Sending JSON regardless was a guess in
-/// the one place a wrong guess cannot be seen: this function swallows every
-/// outcome, so a refused revocation looks exactly like an accepted one and the
-/// user is left with a live refresh token on the server after the account is
-/// gone locally.
+/// Anthropic's measured JSON revoke. OpenAI's JSON sibling endpoint is a
+/// separate function in `auth::openai`; this function never dispatches by
+/// provider.
 pub async fn revoke<H: TokenHttp>(http: &H, cfg: &ProviderSpec, refresh_token: &str) {
     let json_body = serde_json::json!({
         "token": refresh_token,
         "token_type_hint": "refresh_token",
         "client_id": cfg.client_id,
     });
-    let form_body = [
-        ("token", refresh_token),
-        ("token_type_hint", "refresh_token"),
-        ("client_id", cfg.client_id.as_str()),
-    ];
-    let call = post_in_body_style::<H, serde_json::Value>(
-        http,
-        cfg.body_style,
-        &cfg.revoke_url,
-        &json_body,
-        &form_body,
-    );
+    let call = http.post_json::<serde_json::Value>(&cfg.revoke_url, &json_body);
     let _ = tokio::time::timeout(REVOKE_TIMEOUT, call).await;
-}
-
-/// Fills in an identity's email from the usage response, when the token
-/// response carried none.
-///
-/// §9.3: email is display-only, but a row whose label defaults to an empty
-/// string is one the user cannot tell apart from another. Anthropic's token
-/// response always carries one (measured, §10.3), so this is a no-op there.
-/// OpenAI's has never been observed to carry one at all, and the usage
-/// response does (Spike F) — so this is the one extra request the add-account
-/// path makes that an ordinary poll never does: once, at login, on the body a
-/// poll would otherwise throw away.
-///
-/// **A failed backfill must not fail a login that already succeeded.** The
-/// account has a real, working credential either way; the only cost of a
-/// failed usage fetch here is a blank label the user can rename, which is a
-/// far smaller failure than losing the account entirely.
-pub async fn backfill_email(
-    http: &ReqwestHttp,
-    provider: Provider,
-    usage_url: &str,
-    identity: &mut AccountIdentity,
-    access_token: &str,
-) {
-    if !identity.email.is_empty() {
-        return;
-    }
-    if let Ok((_status, body)) = fetch_usage_body_at(http, provider, usage_url, access_token).await {
-        identity.email = parse_email(&body).unwrap_or_default();
-    }
-}
-
-/// Performs the exchange and, when the resulting identity has no email, backs
-/// it with one usage fetch — the combination Step 5 of the Codex login task
-/// describes, bundled here so it can be exercised end to end against a mock,
-/// with no real network and no real loopback.
-///
-/// **Not the path `commands::complete_login` calls.** A real interactive login
-/// must replay the exact `redirect_uri` the authorize request bound and the
-/// exact `state` the server round-tripped through the browser (docs/design.md
-/// §10.3) — both of which this function invents for itself, since a one-shot
-/// helper has no browser round trip to carry them from. `complete_login` keeps
-/// calling `exchange_code` directly with its own real `PendingAuth`, and calls
-/// `backfill_email` itself afterward; the two share that one function rather
-/// than duplicating its logic.
-pub async fn exchange_and_identify(
-    http: &ReqwestHttp,
-    provider: Provider,
-    token_url: &str,
-    usage_url: &str,
-    code: &str,
-    verifier: &str,
-) -> Result<AccountIdentity, AuthError> {
-    let cfg = ProviderSpec { token_url: token_url.to_string(), ..provider.spec() };
-    // This helper owns both ends of the CSRF check — it builds `pending` and
-    // supplies `returned_state` in the same call — so the value itself carries
-    // no meaning beyond "the two must match", and `redirect_uri` is never
-    // replayed against a real authorize request. See the doc comment above for
-    // why a real interactive login cannot go through this function.
-    let state = "exchange-and-identify";
-    let pending = PendingAuth {
-        verifier: verifier.to_string(),
-        state: state.to_string(),
-        redirect_uri: "http://localhost/callback".to_string(),
-    };
-
-    let (tokens, identity) = exchange_code(http, &cfg, provider, &pending, code, state).await?;
-    let mut identity = identity.ok_or(AuthError::NoAccountIdentifier)?;
-
-    backfill_email(http, provider, usage_url, &mut identity, &tokens.access_token).await;
-
-    Ok(identity)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::auth::pkce::PendingAuth;
-    use crate::provider::Provider;
     use std::sync::{Arc, Mutex};
-    use wiremock::matchers::{body_json_string, body_string, header, method, path};
+    use wiremock::matchers::{body_json_string, header, method, path};
     use wiremock::{Mock, MockServer, Request, ResponseTemplate};
 
     fn pending() -> PendingAuth {
@@ -749,7 +613,7 @@ mod tests {
             // endpoint is a sibling of its token endpoint rather than a suffix
             // of it), so the tests exercising `revoke` need this set too.
             revoke_url: format!("{}/v1/oauth/token/revoke", server.uri()),
-            ..Provider::Anthropic.spec()
+            ..ProviderSpec::anthropic()
         }
     }
 
@@ -760,7 +624,7 @@ mod tests {
             "grant_type": "authorization_code",
             "code": "the-code",
             "redirect_uri": "http://localhost:1234/callback",
-            "client_id": Provider::Anthropic.spec().client_id,
+            "client_id": ProviderSpec::anthropic().client_id,
             "code_verifier": "test-verifier",
             "state": "test-state"
         })
@@ -788,7 +652,6 @@ mod tests {
         let (tokens, identity) = exchange_code(
             &http,
             &cfg_for(&server).await,
-            Provider::Anthropic,
             &pending(),
             "the-code",
             "test-state",
@@ -802,95 +665,12 @@ mod tests {
         assert_eq!(identity.unwrap().uuid, "acc-1");
     }
 
-    /// docs/design.md §10.3's counterpart: `BodyStyle::Form` sends the RFC 6749
-    /// shape, `application/x-www-form-urlencoded`, with no `state` field —
-    /// `state` is Anthropic's own non-standard addition to the JSON body, and
-    /// the standard it is contrasted with has no place for it at all.
-    /// `Provider::Openai.spec()` is the one provider currently on this branch.
-    #[tokio::test]
-    async fn a_form_style_provider_sends_url_encoded_body_with_no_state() {
-        let server = MockServer::start().await;
-        let captured: Arc<Mutex<Option<Request>>> = Arc::new(Mutex::new(None));
-        let captured_clone = captured.clone();
-
-        Mock::given(method("POST"))
-            .respond_with(move |req: &Request| {
-                *captured_clone.lock().unwrap() = Some(req.clone());
-                ResponseTemplate::new(200).set_body_json(serde_json::json!({
-                    "access_token": "at", "refresh_token": "rt", "expires_in": 3600,
-                    // Present only so `exchange_code` succeeds now that OpenAI's
-                    // identity is actually derived (Step 3 of the Codex login
-                    // task) — this test's own focus stays on the wire format
-                    // below, not on identity.
-                    "account_id": "user-1"
-                }))
-            })
-            .mount(&server)
-            .await;
-
-        let cfg =
-            ProviderSpec { token_url: format!("{}/oauth/token", server.uri()), ..Provider::Openai.spec() };
-        let http = ReqwestHttp::new().unwrap();
-        exchange_code(&http, &cfg, Provider::Openai, &pending(), "the-code", "test-state")
-            .await
-            .unwrap();
-
-        let req = captured.lock().unwrap().take().expect("exchange_code never reached the mock");
-        let content_type = req.headers.get("content-type").expect("no content-type header");
-        assert_eq!(content_type.to_str().unwrap(), "application/x-www-form-urlencoded");
-
-        let body = String::from_utf8(req.body.clone()).unwrap();
-        assert!(body.contains("grant_type=authorization_code"), "{body}");
-        assert!(body.contains("code=the-code"), "{body}");
-        assert!(
-            !body.contains("state"),
-            "the Form body must not carry Anthropic's non-standard state: {body}"
-        );
-    }
-
-    /// Step 3 of the Codex login task. Before this fix, `account` was a
-    /// field shared by both providers on one struct
-    /// (`Option<AccountBlock>`), so an OpenAI body whose `account` key was
-    /// present but shaped differently from Anthropic's measured
-    /// `{uuid, email_address}` failed the *whole* struct's deserialization —
-    /// the user saw a generic `Decode` error instead of `account_id_from`'s
-    /// specific one. `TokenFields` no longer declares `account` at all, so
-    /// this must succeed and fall through to the next real candidate.
-    #[tokio::test]
-    async fn an_openai_account_key_shaped_unlike_anthropics_does_not_produce_a_generic_decode_error() {
-        let server = MockServer::start().await;
-        Mock::given(method("POST"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-                "access_token": "at", "refresh_token": "rt", "expires_in": 3600,
-                // Not `{uuid, email_address}` — Anthropic's measured shape.
-                // OpenAI's has never been measured, so nothing says it must
-                // agree with it.
-                "account": "not-an-object",
-                "account_id": "user-1"
-            })))
-            .mount(&server)
-            .await;
-
-        let cfg =
-            ProviderSpec { token_url: format!("{}/oauth/token", server.uri()), ..Provider::Openai.spec() };
-        let http = ReqwestHttp::new().unwrap();
-        let (_, identity) =
-            exchange_code(&http, &cfg, Provider::Openai, &pending(), "the-code", "test-state")
-                .await
-                .expect("a differently-shaped `account` key must not fail the whole decode");
-        assert_eq!(
-            identity.unwrap().uuid,
-            "user-1",
-            "account_id_from must still find the real candidate behind it"
-        );
-    }
-
     /// docs/design.md §10.3: validate `state` before accepting the code.
     #[tokio::test]
     async fn mismatched_state_is_rejected_before_any_network_call() {
         let server = MockServer::start().await; // no mock mounted — a call reaching it fails the test
         let http = ReqwestHttp::new().unwrap();
-        let err = exchange_code(&http, &cfg_for(&server).await, Provider::Anthropic, &pending(), "c", "WRONG")
+        let err = exchange_code(&http, &cfg_for(&server).await, &pending(), "c", "WRONG")
             .await
             .unwrap_err();
         assert!(matches!(err, AuthError::StateMismatch));
@@ -909,7 +689,7 @@ mod tests {
             .await;
 
         let http = ReqwestHttp::new().unwrap();
-        let err = exchange_code(&http, &cfg_for(&server).await, Provider::Anthropic, &pending(), "c", "test-state")
+        let err = exchange_code(&http, &cfg_for(&server).await, &pending(), "c", "test-state")
             .await
             .unwrap_err();
         match err {
@@ -936,7 +716,7 @@ mod tests {
 
         let http = ReqwestHttp::new().unwrap();
         let (tokens, _) =
-            exchange_code(&http, &cfg_for(&server).await, Provider::Anthropic, &pending(), "c", "test-state")
+            exchange_code(&http, &cfg_for(&server).await, &pending(), "c", "test-state")
                 .await
                 .unwrap();
         let days = (tokens.refresh_token_expires_at - chrono::Utc::now()).num_days();
@@ -965,6 +745,34 @@ mod tests {
         assert!(debug.contains("client-1"));
     }
 
+    /// The mobile app already has Anthropic blobs under `<uuid>:tokens`.
+    /// Provider support may add a second stored type, but it must not add a tag,
+    /// rename a field or turn one of these values optional in the existing
+    /// blob. A structural round-trip alone would miss all three changes; this
+    /// pins the exact JSON object shape an older build wrote.
+    #[test]
+    fn anthropic_tokens_keep_the_existing_serialized_shape() {
+        let tokens = TokenSet {
+            access_token: "access-secret".into(),
+            refresh_token: "refresh-secret".into(),
+            expires_at: "2026-09-04T08:00:00Z".parse().unwrap(),
+            refresh_token_expires_at: "2026-10-04T00:00:00Z".parse().unwrap(),
+            scopes: vec!["user:profile".into()],
+            client_id: "client-one".into(),
+        };
+        assert_eq!(
+            serde_json::to_value(&tokens).unwrap(),
+            serde_json::json!({
+                "access_token": "access-secret",
+                "refresh_token": "refresh-secret",
+                "expires_at": "2026-09-04T08:00:00Z",
+                "refresh_token_expires_at": "2026-10-04T00:00:00Z",
+                "scopes": ["user:profile"],
+                "client_id": "client-one"
+            })
+        );
+    }
+
     /// `secrets` once had a parse-failure path whose error message embedded
     /// the secret value it failed to read. Guard against the same shape here:
     /// a 2xx response that fails to deserialize must not echo the token it
@@ -982,7 +790,7 @@ mod tests {
             .await;
 
         let http = ReqwestHttp::new().unwrap();
-        let err = exchange_code(&http, &cfg_for(&server).await, Provider::Anthropic, &pending(), "c", "test-state")
+        let err = exchange_code(&http, &cfg_for(&server).await, &pending(), "c", "test-state")
             .await
             .unwrap_err();
         assert!(matches!(err, AuthError::Decode(_)), "expected a Decode error, got {err:?}");
@@ -1054,7 +862,7 @@ mod tests {
             expires_at: Utc::now() - TimeDelta::seconds(1),
             refresh_token_expires_at: Utc::now() + TimeDelta::days(30),
             scopes: scopes.iter().map(|s| s.to_string()).collect(),
-            client_id: Provider::Anthropic.spec().client_id,
+            client_id: ProviderSpec::anthropic().client_id,
         }
     }
 
@@ -1067,7 +875,7 @@ mod tests {
         let expected = serde_json::json!({
             "grant_type": "refresh_token",
             "refresh_token": "old-rt",
-            "client_id": Provider::Anthropic.spec().client_id,
+            "client_id": ProviderSpec::anthropic().client_id,
             "scope": "user:profile user:inference user:mcp_servers"
         })
         .to_string();
@@ -1163,77 +971,23 @@ mod tests {
         let err = refresh(&http, &cfg_for(&server).await, &tokens_with(&["user:profile"]))
             .await
             .unwrap_err();
-        assert!(err.is_dead_grant());
+        assert!(err.is_dead_grant_for(Provider::Anthropic));
     }
 
-    /// The identifier's field name is unmeasured, so the reader tries the
-    /// candidates in order. **It must never invent one**: a fabricated account
-    /// id becomes a keychain entry nobody can find again.
+    /// A bare 401 means different things at the two refresh endpoints. OpenAI
+    /// uses it for a dead rotating grant; Anthropic's observed terminal
+    /// contract is the explicit invalid-grant code. A provider-free helper
+    /// would quarantine Claude accounts on a response that does not establish
+    /// that their refresh chain is dead.
     #[test]
-    fn a_token_response_without_any_known_identifier_is_an_error() {
-        let body = serde_json::json!({ "access_token": "a", "refresh_token": "r" });
-        assert!(account_id_from(&body).is_err());
-    }
-
-    #[test]
-    fn the_identifier_is_read_from_the_first_candidate_present() {
-        let body = serde_json::json!({ "account_id": "user-1" });
-        assert_eq!(account_id_from(&body).unwrap(), "user-1");
-    }
-
-    /// A present-but-empty identifier is not an identifier. It reaches the
-    /// keychain as a key nothing can look up again, which is the same silent
-    /// dead end an invented one produces.
-    #[test]
-    fn an_empty_account_identifier_is_rejected() {
-        let body = serde_json::json!({ "account_id": "" });
-        assert!(account_id_from(&body).is_err());
-    }
-
-    /// An account whose row shows an empty label is one the user cannot tell
-    /// apart from any other. When the token response carries no email, the
-    /// usage response's is used — measured to be present there (Spike F).
-    #[tokio::test]
-    async fn an_account_with_no_email_in_the_token_response_takes_it_from_usage() {
-        let server = MockServer::start().await;
-
-        Mock::given(method("POST"))
-            .and(path("/oauth/token"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-                "access_token": "at-1",
-                "refresh_token": "rt-1",
-                "expires_in": 28799,
-                "account_id": "user-1"
-            })))
-            .mount(&server)
-            .await;
-
-        Mock::given(method("GET"))
-            .and(path("/usage"))
-            .respond_with(
-                ResponseTemplate::new(200)
-                    .set_body_string(include_str!("../usage/fixtures/openai_plus_zero.json"))
-                    .insert_header("x-oai-request-id", "req-1"),
-            )
-            .mount(&server)
-            .await;
-
-        let identity = exchange_and_identify(
-            &ReqwestHttp::new().unwrap(),
-            Provider::Openai,
-            &format!("{}/oauth/token", server.uri()),
-            &format!("{}/usage", server.uri()),
-            "code",
-            "verifier",
-        )
-        .await
-        .expect("the exchange must succeed");
-
-        assert_eq!(identity.uuid, "user-1");
-        assert_eq!(
-            identity.email, "redacted@example.com",
-            "the email was not taken from the usage response"
-        );
+    fn a_bare_401_is_terminal_only_for_openai() {
+        let err = AuthError::OAuth {
+            status: 401,
+            code: None,
+            description: None,
+        };
+        assert!(!err.is_dead_grant_for(Provider::Anthropic));
+        assert!(err.is_dead_grant_for(Provider::Openai));
     }
 
     #[test]
@@ -1256,7 +1010,7 @@ mod tests {
         let expected = serde_json::json!({
             "token": "the-refresh-token",
             "token_type_hint": "refresh_token",
-            "client_id": Provider::Anthropic.spec().client_id,
+            "client_id": ProviderSpec::anthropic().client_id,
         })
         .to_string();
 
@@ -1270,41 +1024,6 @@ mod tests {
 
         let http = ReqwestHttp::new().unwrap();
         revoke(&http, &cfg_for(&server).await, "the-refresh-token").await;
-    }
-
-    /// docs/design.md §10.6: the revocation body goes out in the provider's
-    /// own `body_style`, not unconditionally as JSON.
-    ///
-    /// §10.6's JSON shape is Anthropic's and is measured; nothing has been
-    /// measured for OpenAI, and RFC 7009 §2.1 requires
-    /// `application/x-www-form-urlencoded` for a revocation request — the same
-    /// reason `BodyStyle::Form` was chosen for that provider's token endpoint.
-    /// **This is the outcome nothing else can observe**: `revoke` swallows
-    /// every result, so a server refusing the body would look exactly like a
-    /// success, and the user would be left with a live refresh token on
-    /// OpenAI's side after removing the account, with nothing saying so.
-    #[tokio::test]
-    async fn revoke_sends_the_body_style_the_provider_asked_for() {
-        let server = MockServer::start().await;
-        let cfg = ProviderSpec {
-            revoke_url: format!("{}/api/accounts/oauth/revoke", server.uri()),
-            ..Provider::Openai.spec()
-        };
-
-        Mock::given(method("POST"))
-            .and(path("/api/accounts/oauth/revoke"))
-            .and(header("content-type", "application/x-www-form-urlencoded"))
-            .and(body_string(format!(
-                "token=the-refresh-token&token_type_hint=refresh_token&client_id={}",
-                cfg.client_id
-            )))
-            .respond_with(ResponseTemplate::new(200))
-            .expect(1)
-            .mount(&server)
-            .await;
-
-        let http = ReqwestHttp::new().unwrap();
-        revoke(&http, &cfg, "the-refresh-token").await;
     }
 
     /// docs/design.md §10.6: a failing revoke must not propagate or block

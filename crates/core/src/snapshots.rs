@@ -291,7 +291,7 @@ mod tests {
             expires_at: Utc::now() + TimeDelta::hours(1),
             refresh_token_expires_at: Utc::now() + TimeDelta::days(30),
             scopes: vec!["user:profile".into()],
-            client_id: Provider::Anthropic.spec().client_id,
+            client_id: crate::provider::ProviderSpec::anthropic().client_id,
         };
 
         let path = tmp();

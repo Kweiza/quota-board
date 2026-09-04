@@ -25,6 +25,13 @@ pub struct Account {
     /// field existed, which is exactly what `Provider`'s `Default` covers.
     #[serde(default)]
     pub provider: Provider,
+    /// OpenAI's `chatgpt_account_id`: the workspace whose quota this login
+    /// reads. It is request context, not the account key — two different users
+    /// can hold seats in the same workspace.
+    ///
+    /// Absent for Anthropic and from every file written before Codex support.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workspace_id: Option<String>,
     /// User-editable display name.
     pub display_label: String,
     /// Display only. **Never used as a key.**
@@ -47,6 +54,10 @@ pub enum AccountError {
     /// list and **refuses to write**. Returned by every mutating call.
     #[error("the account file could not be read, so it is not being written: {0}")]
     Unreadable(String),
+    /// The v1 key is `(provider, user_id)`, so it cannot store two workspace
+    /// grants for one OpenAI user without silently overwriting one.
+    #[error("this OpenAI user is already stored for a different workspace")]
+    WorkspaceConflict,
 }
 
 /// A single-owner handle to one account metadata file.
@@ -112,8 +123,31 @@ impl AccountStore {
         &self.accounts
     }
 
+    /// Check whether `account` can be upserted without changing memory or
+    /// disk. Login calls this before it stores a newly issued credential: a
+    /// workspace conflict discovered after the keychain write would already
+    /// have overwritten the existing workspace's only token, while writing
+    /// metadata first would leave a row with no credential if the keychain then
+    /// failed. One preflight, with the same rule `upsert` enforces, closes the
+    /// only expected refusal before either write begins.
+    pub fn validate_upsert(&self, account: &Account) -> Result<(), AccountError> {
+        if let Some(existing) = self
+            .accounts
+            .iter()
+            .find(|a| a.account_id == account.account_id && a.provider == account.provider)
+        {
+            if account.provider == Provider::Openai
+                && existing.workspace_id != account.workspace_id
+            {
+                return Err(AccountError::WorkspaceConflict);
+            }
+        }
+        Ok(())
+    }
+
     /// Update by (provider, account_id), or append if it is new.
     pub fn upsert(&mut self, mut account: Account) -> Result<(), AccountError> {
+        self.validate_upsert(&account)?;
         // The pair, not the id alone: two providers may issue the same string,
         // and collapsing them would make adding the second account silently
         // replace the first.
@@ -250,6 +284,7 @@ mod tests {
         Account {
             account_id: account_id.into(),
             provider: Provider::Anthropic,
+            workspace_id: None,
             display_label: label.into(),
             email: format!("{label}@example.com"),
             created_at: Utc::now(),
@@ -477,9 +512,145 @@ mod tests {
         let mut b = acc("same-id", "codex");
         a.provider = Provider::Anthropic;
         b.provider = Provider::Openai;
+        b.workspace_id = Some("workspace-b".into());
         s.upsert(a).unwrap();
         s.upsert(b).unwrap();
         assert_eq!(s.list().len(), 2, "the provider is part of the key");
+        std::fs::remove_file(&path).ok();
+    }
+
+    /// OpenAI calls the person `user_id` and the quota-bearing workspace
+    /// `account_id`. The first is our key; the second is request context. If
+    /// the workspace is discarded while loading metadata, a later usage GET
+    /// cannot reproduce the account the grant was issued for.
+    #[test]
+    fn an_openai_workspace_survives_the_metadata_round_trip() {
+        let path = tmp();
+        std::fs::write(
+            &path,
+            r#"[{"uuid":"user-one","provider":"openai","workspace_id":"workspace-one",
+                 "display_label":"work","email":"w@example.com",
+                 "created_at":"2026-09-04T00:00:00Z","last_ok_at":null,
+                 "quarantined":false,"sort_order":0}]"#,
+        )
+        .unwrap();
+
+        let mut s = AccountStore::load(&path);
+        assert_eq!(
+            s.list().len(),
+            1,
+            "the workspace field made the file unreadable"
+        );
+        // Force a write through the real serializer rather than inspecting the
+        // input bytes we just planted.
+        let account = s.list()[0].clone();
+        s.upsert(account).unwrap();
+        let written: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(written[0]["workspace_id"], "workspace-one");
+        std::fs::remove_file(&path).ok();
+    }
+
+    /// One Codex user authenticated into two workspaces is not two users. The
+    /// current store key cannot represent both, so silently accepting the
+    /// second login would overwrite the first grant under the same key. Until
+    /// the product supports a workspace dimension in its primary key, refuse
+    /// the replacement and leave the first row intact.
+    #[test]
+    fn the_same_openai_user_in_a_different_workspace_is_refused() {
+        let path = tmp();
+        let first: Account = serde_json::from_value(serde_json::json!({
+            "uuid": "user-one", "provider": "openai", "workspace_id": "workspace-one",
+            "display_label": "one", "email": "one@example.com",
+            "created_at": "2026-09-04T00:00:00Z", "last_ok_at": null,
+            "quarantined": false, "sort_order": 0
+        }))
+        .unwrap();
+        let second: Account = serde_json::from_value(serde_json::json!({
+            "uuid": "user-one", "provider": "openai", "workspace_id": "workspace-two",
+            "display_label": "two", "email": "two@example.com",
+            "created_at": "2026-09-04T00:01:00Z", "last_ok_at": null,
+            "quarantined": false, "sort_order": 0
+        }))
+        .unwrap();
+        let mut s = AccountStore::load(&path);
+        s.upsert(first).unwrap();
+        let before = std::fs::read(&path).unwrap();
+        assert!(
+            s.validate_upsert(&second).is_err(),
+            "the preflight accepted a login that upsert must refuse"
+        );
+        assert_eq!(
+            std::fs::read(&path).unwrap(),
+            before,
+            "validation changed the account file"
+        );
+        assert!(
+            s.upsert(second).is_err(),
+            "the second workspace silently replaced the first"
+        );
+        assert_eq!(s.list().len(), 1);
+        let written = std::fs::read_to_string(&path).unwrap();
+        assert!(
+            written.contains("workspace-one"),
+            "the first workspace was lost: {written}"
+        );
+        assert!(
+            !written.contains("workspace-two"),
+            "the refused workspace reached disk: {written}"
+        );
+        std::fs::remove_file(&path).ok();
+    }
+
+    /// Missing workspace context is not evidence that an existing workspace
+    /// disappeared. Letting a re-login with no workspace id replace a
+    /// workspace-scoped row would keep the same primary key while silently
+    /// changing which quota the bearer reads.
+    #[test]
+    fn a_missing_workspace_cannot_replace_a_known_openai_workspace() {
+        let path = tmp();
+        let mut first = acc("user-one", "one");
+        first.provider = Provider::Openai;
+        first.workspace_id = Some("workspace-one".into());
+        let mut incoming = first.clone();
+        incoming.workspace_id = None;
+
+        let mut store = AccountStore::load(&path);
+        store.upsert(first).unwrap();
+        assert!(matches!(
+            store.validate_upsert(&incoming),
+            Err(AccountError::WorkspaceConflict)
+        ));
+        assert!(matches!(
+            store.upsert(incoming),
+            Err(AccountError::WorkspaceConflict)
+        ));
+        assert_eq!(store.list()[0].workspace_id.as_deref(), Some("workspace-one"));
+        std::fs::remove_file(&path).ok();
+    }
+
+    /// A workspace is not a user. Two seats in one team share the workspace id
+    /// and must remain two rows, keyed by their different user ids.
+    #[test]
+    fn two_openai_users_in_one_workspace_remain_two_accounts() {
+        let path = tmp();
+        let make = |user: &str| -> Account {
+            serde_json::from_value(serde_json::json!({
+                "uuid": user, "provider": "openai", "workspace_id": "workspace-shared",
+                "display_label": user, "email": format!("{user}@example.com"),
+                "created_at": "2026-09-04T00:00:00Z", "last_ok_at": null,
+                "quarantined": false, "sort_order": 0
+            }))
+            .unwrap()
+        };
+        let mut s = AccountStore::load(&path);
+        s.upsert(make("user-one")).unwrap();
+        s.upsert(make("user-two")).unwrap();
+        assert_eq!(
+            s.list().len(),
+            2,
+            "the workspace was mistaken for the account key"
+        );
         std::fs::remove_file(&path).ok();
     }
 
@@ -496,6 +667,7 @@ mod tests {
         let mut b = acc("same-id", "codex");
         a.provider = Provider::Anthropic;
         b.provider = Provider::Openai;
+        b.workspace_id = Some("workspace-b".into());
         s.upsert(a).unwrap();
         s.upsert(b).unwrap();
 
@@ -523,6 +695,7 @@ mod tests {
         let mut b = acc("same-id", "codex");
         a.provider = Provider::Anthropic;
         b.provider = Provider::Openai;
+        b.workspace_id = Some("workspace-b".into());
         s.upsert(a).unwrap();
         s.upsert(b).unwrap();
 

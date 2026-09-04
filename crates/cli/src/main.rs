@@ -8,7 +8,7 @@
 use quota_core::accounts::{Account, AccountStore};
 use quota_core::auth::callback::Callback;
 use quota_core::auth::pkce::{begin, success_redirect};
-use quota_core::auth::stored::{ensure_fresh, RefreshLocks};
+use quota_core::auth::stored::{ensure_fresh, save_anthropic_tokens, AuthConfigs, RefreshLocks};
 use quota_core::auth::token::{exchange_code, refresh, ReqwestHttp, TokenSet};
 use quota_core::paths::accounts_file;
 use quota_core::provider::{token_key, Provider};
@@ -30,7 +30,7 @@ fn open_store() -> Box<dyn SecretStore> {
 }
 
 async fn cmd_login() -> Result<(), Box<dyn std::error::Error>> {
-    let cfg = Provider::Anthropic.spec();
+    let cfg = quota_core::provider::ProviderSpec::anthropic();
     let cb = Callback::bind().await?;
     let (pending, url) = begin(&cfg, &cb.redirect_uri())?;
 
@@ -43,19 +43,19 @@ async fn cmd_login() -> Result<(), Box<dyn std::error::Error>> {
 
     let http = ReqwestHttp::new()?;
     // `Provider::Anthropic`: this CLI has no Codex login flow yet.
-    let (tokens, identity) = exchange_code(&http, &cfg, Provider::Anthropic, &pending, code, state).await?;
+    let (tokens, identity) = exchange_code(&http, &cfg, &pending, code, state).await?;
     let identity = identity.ok_or("the token response carried no account block — there is no uuid to key by")?;
 
     // The token key format belongs to `provider::token_key` — not re-derived
     // here, that is the only place it is built. `Provider::Anthropic` because
     // this CLI has no Codex login flow yet.
-    open_store()
-        .put(&token_key(Provider::Anthropic, &identity.uuid), &serde_json::to_vec(&tokens)?)?;
+    save_anthropic_tokens(open_store().as_ref(), &identity.uuid, &tokens)?;
 
     let mut accounts = AccountStore::load(&accounts_file());
     accounts.upsert(Account {
         account_id: identity.uuid.clone(),
         provider: Provider::Anthropic,
+        workspace_id: None,
         display_label: identity.email.clone(),
         email: identity.email,
         created_at: chrono::Utc::now(),
@@ -81,7 +81,8 @@ async fn cmd_show(only: Option<&str>) -> Result<(), Box<dyn std::error::Error>> 
     let store = open_store();
     let accounts = AccountStore::load(&accounts_file());
     let http = ReqwestHttp::new()?;
-    let cfg = Provider::Anthropic.spec();
+    let cfg = quota_core::provider::ProviderSpec::anthropic();
+    let configs = AuthConfigs { anthropic: cfg, ..AuthConfigs::default() };
 
     // Task 10b owns the read -> refresh -> write sequence. Reimplementing it
     // inline here would produce a second copy with neither the lock nor the CAS.
@@ -93,7 +94,7 @@ async fn cmd_show(only: Option<&str>) -> Result<(), Box<dyn std::error::Error>> 
         }
         let fresh = match ensure_fresh(
             &http,
-            &cfg,
+            &configs,
             store.as_ref(),
             &locks,
             Provider::Anthropic,
@@ -111,7 +112,7 @@ async fn cmd_show(only: Option<&str>) -> Result<(), Box<dyn std::error::Error>> 
             eprintln!("{}: the token was rotated but could not be stored ({e}) — the next run will not see it", a.display_label);
         }
 
-        match fetch_usage(&http, Provider::Anthropic, &fresh.tokens.access_token).await {
+        match fetch_usage(&http, Provider::Anthropic, fresh.tokens.access_token()).await {
             Ok(windows) => {
                 println!("{}:", a.display_label);
                 for w in windows {
@@ -138,7 +139,7 @@ async fn cmd_refresh(uuid: &str) -> Result<(), Box<dyn std::error::Error>> {
         .ok_or("no token is stored for that uuid")?;
     let tokens: TokenSet = serde_json::from_slice(&raw)?;
     let http = ReqwestHttp::new()?;
-    let new = refresh(&http, &Provider::Anthropic.spec(), &tokens).await?;
+    let new = refresh(&http, &quota_core::provider::ProviderSpec::anthropic(), &tokens).await?;
     store.put(&token_key(Provider::Anthropic, uuid), &serde_json::to_vec(&new)?)?;
     println!("refreshed. new expiry: {}", new.expires_at);
     println!("scopes: {}", new.scopes.join(" "));

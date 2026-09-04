@@ -120,7 +120,33 @@ pub async fn fetch_usage_captured_at(
     url: &str,
     access_token: &str,
 ) -> CapturedFetch {
-    let (status, body) = match fetch_usage_body_at(http, provider, url, access_token).await {
+    fetch_usage_captured_for_account_at(http, provider, url, access_token, None, None).await
+}
+
+/// The capturing form with the provider's account context.
+///
+/// `workspace_id` is OpenAI's `chatgpt_account_id`, not the user id this app
+/// keys the row on. The official client sends it as `ChatGPT-Account-Id` so a
+/// bearer belonging to a user with several workspaces asks about the same quota
+/// the login selected. Anthropic ignores it and no provider guesses one.
+pub async fn fetch_usage_captured_for_account_at(
+    http: &ReqwestHttp,
+    provider: Provider,
+    url: &str,
+    access_token: &str,
+    workspace_id: Option<&str>,
+    is_fedramp: Option<bool>,
+) -> CapturedFetch {
+    let (status, body) = match fetch_usage_body_at(
+        http,
+        provider,
+        url,
+        access_token,
+        workspace_id,
+        is_fedramp,
+    )
+    .await
+    {
         Ok(pair) => pair,
         Err(e) => {
             return CapturedFetch { raw: None, extra: None, outcome: Err(e) };
@@ -158,6 +184,8 @@ pub(crate) async fn fetch_usage_body_at(
     provider: Provider,
     url: &str,
     access_token: &str,
+    workspace_id: Option<&str>,
+    is_fedramp: Option<bool>,
 ) -> Result<(u16, serde_json::Value), UsageError> {
     let mut req = http.raw_client().get(url).bearer_auth(access_token);
     req = match provider {
@@ -168,7 +196,17 @@ pub(crate) async fn fetch_usage_body_at(
         // Measured: Bearer alone is enough. `ChatGPT-Account-Id` is not
         // required, `client_version` changes nothing, and no header that
         // identifies Codex CLI is sent — see docs/research/codex-usage-endpoint.md.
-        Provider::Openai => req.header("Accept", "application/json"),
+        Provider::Openai => {
+            let mut req = req.header("Accept", "application/json");
+            req = match workspace_id.filter(|id| !id.is_empty()) {
+                Some(id) => req.header("ChatGPT-Account-Id", id),
+                None => req,
+            };
+            match is_fedramp {
+                Some(true) => req.header("X-OpenAI-Fedramp", "true"),
+                Some(false) | None => req,
+            }
+        }
     };
     let resp = req
         .send()
@@ -176,18 +214,6 @@ pub(crate) async fn fetch_usage_body_at(
         .map_err(|e| UsageError::Transport(e.to_string()))?;
 
     let status = resp.status().as_u16();
-
-    // Before the status ladder, not inside it. Who answered decides whether the
-    // status means anything at all: a Cloudflare challenge and an API 403 share
-    // a status code but need opposite handling, and `x-oai-request-id` is the
-    // one signal measured to distinguish them (docs/research/codex-usage-endpoint.md,
-    // "Path selection, and what the 403s mean").
-    if provider == Provider::Openai
-        && !resp.status().is_success()
-        && resp.headers().get("x-oai-request-id").is_none()
-    {
-        return Err(UsageError::EdgeRefused { status });
-    }
 
     if status == 429 {
         // Absence of Retry-After is interpreted as 0 (budget exhausted) — the
@@ -205,6 +231,20 @@ pub(crate) async fn fetch_usage_body_at(
             .and_then(|s| s.trim().parse::<u64>().ok())
             .unwrap_or(0);
         return Err(UsageError::Throttled { retry_after_secs });
+    }
+
+    // After the actionable throttle case, before the rest of the status
+    // ladder. Who answered decides whether an otherwise ordinary error means
+    // anything at all: a Cloudflare challenge and an API 403 share a status
+    // code but need opposite handling, and `x-oai-request-id` is the one signal
+    // measured to distinguish them. A 429 is deliberately handled first
+    // because Retry-After remains actionable even when that request id is
+    // absent.
+    if provider == Provider::Openai
+        && !resp.status().is_success()
+        && resp.headers().get("x-oai-request-id").is_none()
+    {
+        return Err(UsageError::EdgeRefused { status });
     }
     // A 403 is not always the same thing as a 401, and the difference is
     // permanent versus transient — so this one status needs its body read
@@ -664,6 +704,32 @@ mod tests {
         }
     }
 
+    /// A backend throttle does not need an OpenAI request id to remain a
+    /// throttle. `Retry-After` is actionable protocol data, while classifying
+    /// this as an edge refusal would throw the wait away and poll too soon.
+    #[tokio::test]
+    async fn an_openai_429_without_request_id_keeps_its_retry_after() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .respond_with(ResponseTemplate::new(429).insert_header("retry-after", "37"))
+            .mount(&server)
+            .await;
+
+        let got = fetch_usage_captured_at(
+            &ReqwestHttp::new().unwrap(),
+            Provider::Openai,
+            &server.uri(),
+            "t",
+        )
+        .await;
+        assert!(matches!(
+            got.outcome,
+            Err(UsageError::Throttled {
+                retry_after_secs: 37
+            })
+        ));
+    }
+
     /// The same 403 carrying `x-oai-request-id` *is* the API talking, and must
     /// go down the ordinary status ladder.
     #[tokio::test]
@@ -705,7 +771,15 @@ mod tests {
             .await;
 
         let http = ReqwestHttp::new().unwrap();
-        let got = fetch_usage_captured_at(&http, Provider::Openai, &server.uri(), "t").await;
+        let got = fetch_usage_captured_for_account_at(
+            &http,
+            Provider::Openai,
+            &server.uri(),
+            "t",
+            Some("workspace-one"),
+            Some(true),
+        )
+        .await;
         let windows = got.outcome.expect("the mock only matches an honest UA");
         assert_eq!(windows.len(), 1);
 
@@ -719,6 +793,84 @@ mod tests {
         assert!(
             sent.headers.get("originator").is_none(),
             "an originator header claiming to be Codex CLI was sent"
+        );
+        assert!(
+            sent.headers.get("x-openai-codex-luna-reserve").is_none(),
+            "a Luna-reserve capability header was sent by a read-only monitor"
+        );
+        assert_eq!(
+            sent.headers
+                .get("chatgpt-account-id")
+                .unwrap()
+                .to_str()
+                .unwrap(),
+            "workspace-one",
+            "the user id and workspace id answer different questions"
+        );
+        assert_eq!(
+            sent.headers.get("x-openai-fedramp").unwrap().to_str().unwrap(),
+            "true"
+        );
+    }
+
+    #[tokio::test]
+    async fn bearer_only_openai_context_fabricates_neither_workspace_nor_fedramp() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_string(include_str!("fixtures/openai_plus_zero.json"))
+                    .insert_header("x-oai-request-id", "req-1"),
+            )
+            .mount(&server)
+            .await;
+        let got = fetch_usage_captured_for_account_at(
+            &ReqwestHttp::new().unwrap(),
+            Provider::Openai,
+            &server.uri(),
+            "t",
+            None,
+            None,
+        )
+        .await;
+        got.outcome.unwrap();
+        let sent = &server.received_requests().await.unwrap()[0];
+        assert!(sent.headers.get("chatgpt-account-id").is_none());
+        assert!(sent.headers.get("x-openai-fedramp").is_none());
+    }
+
+    /// A usage bearer is a credential too. A redirect has no legitimate place
+    /// in this endpoint, and following one would let the target answer as the
+    /// account even if reqwest stripped Authorization while crossing hosts.
+    #[tokio::test]
+    async fn a_usage_redirect_is_refused_and_never_reaches_its_target() {
+        let source = MockServer::start().await;
+        let target = MockServer::start().await;
+        Mock::given(method("GET"))
+            .respond_with(
+                ResponseTemplate::new(307)
+                    .insert_header("location", format!("{}/capture", target.uri())),
+            )
+            .expect(1)
+            .mount(&source)
+            .await;
+
+        let got = fetch_usage_captured_for_account_at(
+            &ReqwestHttp::new().unwrap(),
+            Provider::Openai,
+            &source.uri(),
+            "access-secret",
+            Some("workspace-one"),
+            None,
+        )
+        .await;
+        assert!(
+            got.outcome.is_err(),
+            "a redirect became a successful usage response"
+        );
+        assert!(
+            target.received_requests().await.unwrap().is_empty(),
+            "the redirect target received the usage request"
         );
     }
 
@@ -739,7 +891,7 @@ mod tests {
         match got.extra {
             Some(ExtraLine::ResetCredits(r)) => {
                 assert_eq!(r.available, 1);
-                assert_eq!(r.applicable, 0);
+                assert_eq!(r.applicable, Some(0));
             }
             other => panic!("expected reset credits, got {other:?}"),
         }

@@ -8,11 +8,11 @@ mod state;
 mod tray;
 
 use quota_core::accounts::AccountStore;
-use quota_core::auth::stored::RefreshLocks;
-use quota_core::auth::token::{ReqwestHttp, TokenSet};
-use quota_core::provider::{token_key, Provider, ProviderSpec};
+use quota_core::auth::openai::OpenAiAuthConfig;
+use quota_core::auth::stored::{load_tokens, AuthConfigs, RefreshLocks};
+use quota_core::auth::token::ReqwestHttp;
+use quota_core::provider::{Provider, ProviderSpec};
 use quota_core::scheduler::{register_accounts, Scheduler, SystemClock};
-use quota_core::secrets::{keychain::KeychainStore, timeout::TimeoutStore, SecretStore, SERVICE};
 /// Named only inside the `QUOTA_FORCE_FALLBACK` block below, which is itself
 /// `debug_assertions`-only. Imported unconditionally it is an `unused_imports`
 /// warning in every release build — invisible to `cargo clippy --all-targets`,
@@ -20,13 +20,14 @@ use quota_core::secrets::{keychain::KeychainStore, timeout::TimeoutStore, Secret
 /// build the installer step runs.
 #[cfg(debug_assertions)]
 use quota_core::secrets::SecretError;
+use quota_core::secrets::{keychain::KeychainStore, timeout::TimeoutStore, SecretStore, SERVICE};
 use quota_core::settings::SettingsStore;
 use quota_core::snapshots::fingerprint;
 use state::{poll_loop, AppState, LockedStore, SecretsHandle, StoreKind};
-use tauri_plugin_autostart::MacosLauncher;
-use tauri_plugin_global_shortcut::{Code, GlobalShortcutExt, Modifiers, Shortcut, ShortcutState};
 use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
+use tauri_plugin_autostart::MacosLauncher;
+use tauri_plugin_global_shortcut::{Code, GlobalShortcutExt, Modifiers, Shortcut, ShortcutState};
 
 /// §3.3's global toggle. Built on demand rather than stored in a `static`:
 /// `Shortcut::new` is cheap, and the handler and the registration have to agree
@@ -178,11 +179,22 @@ fn main() {
             let mut scheduler = Scheduler::new(settings.poll_policy(), SystemClock);
             let store = Arc::clone(&secrets);
             let current_fp = move |provider: Provider, uuid: &str| -> Option<String> {
-                let raw = store.get(&token_key(provider, uuid)).ok().flatten()?;
-                let tokens: TokenSet = serde_json::from_slice(&raw).ok()?;
-                Some(fingerprint(&tokens.access_token))
+                let tokens = load_tokens(store.as_ref(), provider, uuid).ok()?;
+                Some(fingerprint(tokens.access_token()))
             };
             register_accounts(&mut scheduler, accounts.list(), &mut cache, &current_fp);
+
+            let cfg = ProviderSpec {
+                token_url: token_url(),
+                ..ProviderSpec::anthropic()
+            };
+            let auth_configs = AuthConfigs {
+                anthropic: cfg.clone(),
+                openai: OpenAiAuthConfig {
+                    token_url: openai_token_url(),
+                    ..OpenAiAuthConfig::default()
+                },
+            };
 
             // Managed **before** the loop is spawned: `tokio::time::interval`
             // completes its first tick immediately, so `handle.state::<AppState>()`
@@ -198,8 +210,8 @@ fn main() {
                 last_raw: std::sync::Mutex::new(quota_core::usage::raw::RawLog::default()),
                 pending_manual: std::sync::Mutex::new(None),
                 http: ReqwestHttp::new()?,
-                cfg: ProviderSpec { token_url: token_url(), ..Provider::Anthropic.spec() },
-                openai_cfg: ProviderSpec { token_url: openai_token_url(), ..Provider::Openai.spec() },
+                cfg,
+                auth_configs,
                 refresh_locks: RefreshLocks::default(),
                 poll_permit: tokio::sync::Mutex::new(()),
                 snapshots_path,
@@ -283,7 +295,7 @@ fn main() {
 /// only.** In a release build the environment cannot point this binary at
 /// another host: the token endpoint receives a refresh token, so an
 /// env-settable URL in a shipped binary would be a credential exfiltration
-/// switch. Production values are §5.1's URL and `Provider::Anthropic.spec()`.
+/// switch. Production values are §5.1's URL and `ProviderSpec::anthropic()`.
 #[cfg(debug_assertions)]
 fn usage_url() -> String {
     std::env::var("QUOTA_USAGE_URL")
@@ -310,11 +322,11 @@ fn openai_usage_url() -> String {
 
 #[cfg(debug_assertions)]
 fn token_url() -> String {
-    std::env::var("QUOTA_TOKEN_URL").unwrap_or_else(|_| Provider::Anthropic.spec().token_url)
+    std::env::var("QUOTA_TOKEN_URL").unwrap_or_else(|_| ProviderSpec::anthropic().token_url)
 }
 #[cfg(not(debug_assertions))]
 fn token_url() -> String {
-    Provider::Anthropic.spec().token_url
+    ProviderSpec::anthropic().token_url
 }
 
 /// Codex's half of the same override. Its own env var rather than reusing
@@ -325,9 +337,10 @@ fn token_url() -> String {
 /// in a shipped binary would be a credential exfiltration switch.
 #[cfg(debug_assertions)]
 fn openai_token_url() -> String {
-    std::env::var("QUOTA_OPENAI_TOKEN_URL").unwrap_or_else(|_| Provider::Openai.spec().token_url)
+    std::env::var("QUOTA_OPENAI_TOKEN_URL")
+        .unwrap_or_else(|_| OpenAiAuthConfig::default().token_url)
 }
 #[cfg(not(debug_assertions))]
 fn openai_token_url() -> String {
-    Provider::Openai.spec().token_url
+    OpenAiAuthConfig::default().token_url
 }

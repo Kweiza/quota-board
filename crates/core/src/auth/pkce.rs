@@ -154,7 +154,6 @@ pub fn begin(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::provider::Provider;
 
     /// The official RFC 7636 Appendix B test vector.
     #[test]
@@ -185,7 +184,7 @@ mod tests {
     /// pasteable code#state page.
     #[test]
     fn authorize_url_has_code_true_first_and_all_required_params() {
-        let cfg = Provider::Anthropic.spec();
+        let cfg = ProviderSpec::anthropic();
         let (_pending, url) = begin(&cfg, "http://localhost:54321/callback").unwrap();
 
         let query = url.split_once('?').unwrap().1;
@@ -210,7 +209,7 @@ mod tests {
     /// copies; the same defect has shipped twice in this repository.
     #[test]
     fn debug_redacts_the_verifier_but_keeps_the_rest() {
-        let (pending, _url) = begin(&Provider::Anthropic.spec(), "http://localhost:1/callback").unwrap();
+        let (pending, _url) = begin(&ProviderSpec::anthropic(), "http://localhost:1/callback").unwrap();
         let text = format!("{pending:?}");
         assert!(
             !text.contains(&pending.verifier),
@@ -235,7 +234,7 @@ mod tests {
     /// state, which is precisely the failure the fallback exists to avoid.
     #[test]
     fn the_manual_url_differs_from_the_loopback_url_only_in_redirect_uri() {
-        let cfg = Provider::Anthropic.spec();
+        let cfg = ProviderSpec::anthropic();
         let (pending, loopback) = begin(&cfg, "http://localhost:54321/callback").unwrap();
         let manual = authorize_url_for(&cfg, &pending, manual_redirect_uri()).unwrap();
 
@@ -264,7 +263,7 @@ mod tests {
 
     #[test]
     fn authorize_url_challenge_matches_the_returned_verifier() {
-        let cfg = Provider::Anthropic.spec();
+        let cfg = ProviderSpec::anthropic();
         let (pending, url) = begin(&cfg, "http://localhost:1/callback").unwrap();
         let parsed = url::Url::parse(&url).unwrap();
         let q: std::collections::HashMap<_, _> = parsed.query_pairs().into_owned().collect();
@@ -311,7 +310,7 @@ mod tests {
     /// docs/design.md §10.4: do not ask for scopes this app has no use for.
     #[test]
     fn default_scopes_exclude_everything_we_do_not_need() {
-        let cfg = Provider::Anthropic.spec();
+        let cfg = ProviderSpec::anthropic();
         for forbidden in [
             "org:create_api_key",
             "user:sessions:claude_code",
@@ -319,7 +318,7 @@ mod tests {
             "user:file_upload",
             // Dropped after measurement showed the server does not require it
             // for the read-only usage call — see the comment on
-            // `Provider::Anthropic.spec()`. This is the line that stops a future
+            // `ProviderSpec::anthropic()`. This is the line that stops a future
             // edit from quietly re-adding it.
             "user:inference",
         ] {
@@ -330,7 +329,7 @@ mod tests {
     /// docs/design.md §10.1: authorize lives on claude.com/cai, not claude.ai.
     #[test]
     fn endpoints_are_the_verified_ones() {
-        let cfg = Provider::Anthropic.spec();
+        let cfg = ProviderSpec::anthropic();
         assert_eq!(cfg.authorize_url, "https://claude.com/cai/oauth/authorize");
         assert_eq!(cfg.token_url, "https://platform.claude.com/v1/oauth/token");
         assert_eq!(cfg.client_id, "9d1c250a-e61b-44d9-88ed-5944d1962f5e");
