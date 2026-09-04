@@ -2,6 +2,8 @@ import type { AccountView, Provider } from './types'
 
 export interface WidgetProps {
   accounts: AccountView[]
+  /** False until both the account list and its standing warning have been read. */
+  accountsLoaded: boolean
   /**
    * Set only when the saved accounts could not be read. It replaces the empty
    * state rather than joining it: "Add an account in Settings" is a false
@@ -24,7 +26,7 @@ export interface WidgetProps {
 /**
  * A `$state` proxy, not a plain object. Measured with this repo's own svelte
  * 5.56.8: `mount(Widget, { target, props })` followed by `props.accounts = [...]`
- * plus `flushSync()` leaves the DOM reading "Add an account in Settings" — a
+ * plus `flushSync()` leaves the DOM in its initial loading state — a
  * plain props object is not reactive after mount. The same sequence through a
  * `$state` proxy does re-render.
  *
@@ -44,6 +46,7 @@ export interface WidgetProps {
  */
 export const widgetProps = $state<WidgetProps>({
   accounts: [],
+  accountsLoaded: false,
   warning: null,
   onOpenSettings: () => {},
   onRelogin: () => {},

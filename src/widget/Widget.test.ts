@@ -5,24 +5,37 @@ import type { AccountView } from '../lib/types'
 
 /**
  * docs/design.md §9.1. An unreadable account file produces an empty list, and
- * the empty state's own sentence — "Add an account in Settings" — is then a
+ * the empty state's own invitation to add Claude or Codex — is then a
  * false statement to someone who has accounts the app could not load. It is the
- * confidently-wrong display CLAUDE.md calls this product's worst failure mode,
+ * confidently-wrong display AGENTS.md calls this product's worst failure mode,
  * so the two states are mutually exclusive rather than stacked.
  */
 describe('Widget empty states', () => {
-  it('invites a first account when there simply are none', () => {
-    render(Widget, { accounts: [], warning: null })
-    expect(screen.getByText('Add an account in Settings')).toBeTruthy()
+  it('shows loading until the first account read has completed', () => {
+    render(Widget, { accounts: [], accountsLoaded: false, warning: null })
+    expect(screen.getByRole('status').textContent).toBe('Loading accounts…')
+    expect(screen.queryByText(/Add a Claude or Codex account/)).toBeNull()
   })
 
-  it('says why instead of inviting one when the file could not be read', () => {
+  it('invites either provider after a successful empty read', () => {
+    render(Widget, { accounts: [], accountsLoaded: true, warning: null })
+    expect(screen.getByText('Add a Claude or Codex account in Settings')).toBeTruthy()
+  })
+
+  it('lets a warning outrank both loading and the empty invitation', () => {
     render(Widget, {
       accounts: [],
+      accountsLoaded: false,
       warning: 'your saved accounts could not be read, so it is not valid account JSON',
     })
     expect(screen.getByText(/could not be read/)).toBeTruthy()
-    expect(screen.queryByText('Add an account in Settings')).toBeNull()
+    expect(screen.queryByText(/Loading accounts/)).toBeNull()
+    expect(screen.queryByText(/Add a Claude or Codex account/)).toBeNull()
+  })
+
+  it('gives the glyph-only settings control an accessible name', () => {
+    render(Widget, { accounts: [], accountsLoaded: true, warning: null })
+    expect(screen.getByRole('button', { name: 'Settings' })).toBeTruthy()
   })
 })
 
@@ -50,7 +63,7 @@ const two: AccountView[] = [
 describe('Widget refresh', () => {
   /**
    * The (account_id, provider) pair, never the index and never the label:
-   * CLAUDE.md makes the pair the primary key, and both other candidates are
+   * AGENTS.md makes the pair the primary key, and both other candidates are
    * wrong here — labels are user-editable and may be duplicated, and
    * `usage://updated` replaces the whole array so an index captured at render
    * time goes stale. Asserting on the *second* row is what makes a hard-wired
@@ -69,13 +82,13 @@ describe('Widget refresh', () => {
         refreshed.push([uuid, provider])
       },
     })
-    screen.getAllByRole('button', { name: 'Refresh now' })[1].click()
+    screen.getByRole('button', { name: 'Refresh Codex account home' }).click()
     expect(refreshed).toEqual([['uuid-home', 'openai']])
   })
 
   it('gives every row its own button', () => {
     render(Widget, { accounts: two, warning: null })
-    expect(screen.getAllByRole('button', { name: 'Refresh now' })).toHaveLength(2)
+    expect(screen.getAllByRole('button', { name: /^Refresh (Claude|Codex) account/ })).toHaveLength(2)
   })
 
   /**
@@ -103,6 +116,6 @@ describe('Widget refresh', () => {
       },
     ]
     render(Widget, { accounts: sameId, warning: null })
-    expect(screen.getAllByRole('button', { name: 'Refresh now' })).toHaveLength(2)
+    expect(screen.getAllByRole('button', { name: /^Refresh (Claude|Codex) account/ })).toHaveLength(2)
   })
 })

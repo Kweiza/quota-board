@@ -102,6 +102,19 @@ describe('main.ts widget branch', () => {
     // §6.3's report is registered in this branch and only this branch.
     expect(calls.some((c) => c.cmd === 'set_widget_visible')).toBe(true)
   })
+
+  it('leaves the loading state only after the first account reads complete', async () => {
+    mockBackend()
+    mockWindows('widget')
+    const target = route('widget')
+
+    await import('./main')
+
+    await vi.waitFor(() =>
+      expect(target.textContent).toContain('Add a Claude or Codex account in Settings'),
+    )
+    expect(target.textContent).not.toContain('Loading accounts…')
+  })
 })
 
 describe('main.ts settings branch', () => {

@@ -1,5 +1,6 @@
 <script lang="ts">
   import { untilHhMm } from '../lib/format'
+  import { providerName } from '../lib/provider'
   import { accountKey } from '../lib/types'
   import type { AccountView, Provider } from '../lib/types'
 
@@ -42,9 +43,10 @@
        index: `accounts://changed` replaces this array wholesale, an index key
        would move a half-typed label onto the wrong account, and a bare-id key
        collides — a Svelte `each_key_duplicate` error, not a silent mis-render —
-       the moment two providers share an id. CLAUDE.md: the primary key is the
+       the moment two providers share an id. AGENTS.md: the primary key is the
        pair. -->
   {#each accounts as a, i (accountKey(a.account_id, a.provider))}
+    {@const provider = providerName(a.provider)}
     <li class="row">
       <div class="ident">
         <!-- `value=` rather than `bind:value=`: binding would write through
@@ -53,13 +55,17 @@
         <input
           class="label"
           type="text"
-          aria-label="Display name"
+          aria-label={`Display name for ${provider} account ${a.email}`}
           value={a.label}
           on:blur={(e) => onRename(a.account_id, a.provider, e.currentTarget.value)}
         />
-        <!-- §9.3: the label is user-editable and may be duplicated, so this is
-             the only thing left that tells two accounts apart. -->
-        <span class="email">{a.email}</span>
+        <!-- §9.3: labels and emails are display-only and may be duplicated.
+             Keep the product name visible so a Claude and Codex account never
+             become indistinguishable when both of those strings match. -->
+        <span class="meta">
+          <span class="provider" aria-label={`Provider: ${provider}`}>{provider}</span>
+          <span class="email">{a.email}</span>
+        </span>
         <!-- §6.4's exact wording for a refused manual refresh, in its own
              quiet class rather than the parent's `.warn` banner: it is normal,
              expected behaviour — §6.2's server-ordered wait being obeyed — and
@@ -77,20 +83,33 @@
         {/if}
       </div>
       <div class="actions">
-        <button on:click={() => onRefresh(a.account_id, a.provider)}>Refresh now</button>
+        <button
+          type="button"
+          aria-label={`Refresh ${provider} account ${a.label}`}
+          on:click={() => onRefresh(a.account_id, a.provider)}>Refresh now</button>
         <!-- A direction, not an index: the parent rebuilds the whole (provider,
              account_id) key array for `reorder_accounts`, and an index captured
              at render time goes stale as soon as the list is re-read. -->
-        <button disabled={i === 0} on:click={() => onMove(a.account_id, a.provider, -1)}>
+        <button
+          type="button"
+          aria-label={`Move ${provider} account ${a.label} up`}
+          disabled={i === 0}
+          on:click={() => onMove(a.account_id, a.provider, -1)}>
           Move up
         </button>
         <button
+          type="button"
+          aria-label={`Move ${provider} account ${a.label} down`}
           disabled={i === accounts.length - 1}
           on:click={() => onMove(a.account_id, a.provider, 1)}
         >
           Move down
         </button>
-        <button class="danger" on:click={() => onRemove(a.account_id, a.provider)}>Remove</button>
+        <button
+          class="danger"
+          type="button"
+          aria-label={`Remove ${provider} account ${a.label}`}
+          on:click={() => onRemove(a.account_id, a.provider)}>Remove</button>
       </div>
     </li>
   {/each}
@@ -102,10 +121,16 @@
      `:global(body)` rule here would paint the transparent widget window too
      (src/app.css carries the same warning). */
   .rows { list-style: none; margin: 0; padding: 0; }
-  .row { display: flex; align-items: center; justify-content: space-between;
+  .row { display: flex; align-items: center; justify-content: space-between; flex-wrap: wrap;
          gap: .75em; padding: .5em 0; border-bottom: 1px solid rgba(148, 163, 184, .25); }
-  .ident { display: flex; flex-direction: column; gap: .2em; min-width: 0; }
+  .ident { display: flex; flex: 1 1 14em; flex-direction: column; gap: .2em; min-width: 0; }
   .label { font: inherit; font-weight: 600; padding: .2em .35em; }
+  .meta { display: flex; align-items: baseline; gap: .45em; min-width: 0; }
+  /* Neutral by design: provider is encoded in text, while colour remains
+     reserved for quota severity and warnings. */
+  .provider { flex-shrink: 0; font-size: 10px; font-weight: 700; letter-spacing: .03em;
+              border: 1px solid currentColor; border-radius: 3px;
+              padding: 0 .35em; line-height: 1.4; }
   .email { font-size: 11px; opacity: .7; overflow: hidden; text-overflow: ellipsis;
            white-space: nowrap; }
   /* Deliberately not `.warn`'s amber: a throttle is expected behaviour, not a
@@ -114,8 +139,11 @@
      `min-width: 0`, so clipping this line would cut the clock time off the end
      — the one piece of it the user needs. Wrapping is the safe overflow. */
   .throttle { font-size: 11px; opacity: .85; }
-  .actions { display: flex; gap: .35em; flex-shrink: 0; }
+  .actions { display: flex; flex: 1 1 auto; justify-content: flex-end;
+             flex-wrap: wrap; gap: .35em; }
   .actions button { font: inherit; font-size: 11px; padding: .25em .5em; cursor: pointer; }
   .actions button:disabled { cursor: default; opacity: .5; }
+  .actions button:focus-visible,
+  .label:focus-visible { outline: 2px solid currentColor; outline-offset: 2px; }
   .danger { color: #f87171; }
 </style>

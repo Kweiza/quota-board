@@ -1,4 +1,4 @@
-import { cleanup, fireEvent, render, screen, waitFor } from '@testing-library/svelte'
+import { cleanup, fireEvent, render, screen, waitFor, within } from '@testing-library/svelte'
 import { emit } from '@tauri-apps/api/event'
 import { clearMocks, mockIPC } from '@tauri-apps/api/mocks'
 import { tick } from 'svelte'
@@ -18,7 +18,8 @@ import type {
 type IpcCall = { cmd: string; args: Record<string, unknown> }
 
 interface Backend {
-  accounts?: AccountView[]
+  accounts?: AccountView[] | Promise<AccountView[]>
+  accountsWarning?: string | null
   /**
    * What `refresh_account` answers, one entry per call; the last entry repeats
    * once the list runs out. A list rather than a single value because §6.4's
@@ -98,6 +99,8 @@ function mockBackend(b: Backend = {}): IpcCall[] {
     switch (cmd) {
       case 'list_accounts':
         return b.accounts ?? []
+      case 'accounts_warning':
+        return b.accountsWarning ?? null
       case 'refresh_account': {
         // The real command always answers with a state, never with null.
         const states = b.refreshStates ?? [{ kind: 'loading' } as AccountState]
@@ -270,6 +273,36 @@ describe('Settings error banner', () => {
   })
 })
 
+describe('Settings account loading', () => {
+  it('does not claim there are no accounts before the first read finishes', async () => {
+    let resolveAccounts: (accounts: AccountView[]) => void = () => {}
+    const pending = new Promise<AccountView[]>((resolve) => {
+      resolveAccounts = resolve
+    })
+    const calls = mockBackend({ accounts: pending })
+    render(Settings)
+    await whenSubscribed(calls)
+
+    expect(screen.getByRole('status').textContent).toBe('Loading accounts…')
+    expect(screen.queryByText('No accounts yet.')).toBeNull()
+
+    resolveAccounts([])
+    expect(await screen.findByText('No accounts yet.')).toBeTruthy()
+    expect(screen.queryByText(/Loading accounts/)).toBeNull()
+  })
+
+  it('lets the saved-account warning outrank the loading placeholder', async () => {
+    const pending = new Promise<AccountView[]>(() => {})
+    const calls = mockBackend({ accounts: pending, accountsWarning: 'saved accounts could not be read' })
+    render(Settings)
+    await whenSubscribed(calls)
+
+    expect(await screen.findByText(/saved accounts could not be read/)).toBeTruthy()
+    expect(screen.queryByText(/Loading accounts/)).toBeNull()
+    expect(screen.queryByText('No accounts yet.')).toBeNull()
+  })
+})
+
 /**
  * Two buttons rather than a picker (Task 8): the whole flow is two clicks and
  * a browser round trip, and a select that must be set before the button is one
@@ -278,6 +311,23 @@ describe('Settings error banner', () => {
  * covered by the tests above and in `crates/core`.
  */
 describe('Settings add account buttons', () => {
+  it('presents Claude and Codex as equal peer choices and scopes the caveat to Claude', async () => {
+    const calls = mockBackend()
+    render(Settings)
+    await whenSubscribed(calls)
+
+    const choices = await screen.findByRole('group', { name: 'Add account' })
+    const claude = within(choices).getByRole('group', { name: 'Claude' })
+    const codex = within(choices).getByRole('group', { name: 'Codex' })
+
+    expect(claude.className).toContain('provider-card')
+    expect(codex.className).toContain('provider-card')
+    expect(within(claude).getByRole('button', { name: 'Add Claude account' })).toBeTruthy()
+    expect(within(codex).getByRole('button', { name: 'Add Codex account' })).toBeTruthy()
+    expect(within(claude).getByText(/consent screen.*Claude Code/i)).toBeTruthy()
+    expect(within(codex).queryByText(/Claude Code/i)).toBeNull()
+  })
+
   it('asks the core which provider is being added', async () => {
     const calls = mockBackend({ loginUrls: { loopback: null, manual: 'x' } })
 
@@ -320,9 +370,9 @@ describe('Settings manual refresh', () => {
   const refreshButtons = async (): Promise<HTMLElement[]> => {
     // The rows only exist after the awaited `list_accounts` resolves.
     await waitFor(() =>
-      expect(screen.getAllByRole('button', { name: 'Refresh now' })).toHaveLength(two.length),
+      expect(screen.getAllByRole('button', { name: /^Refresh Claude account/ })).toHaveLength(two.length),
     )
-    return screen.getAllByRole('button', { name: 'Refresh now' })
+    return screen.getAllByRole('button', { name: /^Refresh Claude account/ })
   }
 
   it('says when a refused Refresh now becomes available, on the row that was refused', async () => {
@@ -405,12 +455,12 @@ describe('Settings manual refresh', () => {
     const removed = two.shift() as AccountView
     try {
       await whenSubscribed(calls)
-      await waitFor(() => expect(screen.getAllByRole('button', { name: 'Refresh now' }))
+      await waitFor(() => expect(screen.getAllByRole('button', { name: /^Refresh Claude account/ }))
         .toHaveLength(1))
 
       two.unshift(removed)
       await whenSubscribed(calls)
-      await waitFor(() => expect(screen.getAllByRole('button', { name: 'Refresh now' }))
+      await waitFor(() => expect(screen.getAllByRole('button', { name: /^Refresh Claude account/ }))
         .toHaveLength(2))
       expect(screen.queryByText(/throttled, available after/)).toBeNull()
     } finally {
@@ -486,7 +536,7 @@ describe('Settings token store', () => {
   })
 
   it('names a store kind it does not recognize instead of rendering an empty section', async () => {
-    // CLAUDE.md's never-degrade-silently rule applies to UI state: a `StoreKind`
+    // AGENTS.md's never-degrade-silently rule applies to UI state: a `StoreKind`
     // variant added later must not make this section render nothing at all,
     // which would read as "the token store is fine".
     mockBackend({ status: store('vault_of_the_future' as StoreStatus['kind'], false) })
@@ -523,6 +573,50 @@ describe('Settings debug panel', () => {
     expect(select.value).toBe(key)
   }
 
+  const panel = (): HTMLElement => {
+    const section = screen.getByRole('heading', { name: 'Debug' }).closest('section')
+    if (section === null) throw new Error('the Debug heading is not inside its section')
+    return section
+  }
+
+  it('does not call a pending account read an empty account list', async () => {
+    const pending = new Promise<AccountView[]>(() => {})
+    const calls = mockBackend({ accounts: pending })
+    render(Settings)
+    await whenSubscribed(calls)
+
+    const debug = within(panel())
+    expect(debug.getByText('Loading accounts…')).toBeTruthy()
+    expect(debug.queryByText('No accounts yet, so there is nothing to inspect.')).toBeNull()
+    expect(debug.queryByText('Select an account and press Reload.')).toBeNull()
+  })
+
+  it('does not duplicate an empty claim when the saved-account warning explains the list', async () => {
+    const pending = new Promise<AccountView[]>(() => {})
+    const calls = mockBackend({
+      accounts: pending,
+      accountsWarning: 'saved accounts could not be read',
+    })
+    render(Settings)
+    await whenSubscribed(calls)
+    expect(await screen.findByText(/saved accounts could not be read/)).toBeTruthy()
+
+    const debug = within(panel())
+    expect(debug.queryByText(/Loading accounts/)).toBeNull()
+    expect(debug.queryByText('No accounts yet, so there is nothing to inspect.')).toBeNull()
+    expect(debug.queryByText('Select an account and press Reload.')).toBeNull()
+  })
+
+  it('uses the empty Debug message only after a successful empty read', async () => {
+    const calls = mockBackend()
+    render(Settings)
+    await whenSubscribed(calls)
+
+    expect(
+      within(panel()).getByText('No accounts yet, so there is nothing to inspect.'),
+    ).toBeTruthy()
+  })
+
   it('an account with no retained body says so instead of rendering empty', async () => {
     mockBackend({ accounts: two, raw: null })
     render(Settings)
@@ -540,7 +634,7 @@ describe('Settings debug panel', () => {
     // "not loaded yet" and "loaded, and the answer was null" are different
     // facts. Collapsing them into one `captured === null` tells the user their
     // account has never polled before they have pressed anything — the
-    // confidently-wrong display CLAUDE.md calls this product's worst failure.
+    // confidently-wrong display AGENTS.md calls this product's worst failure.
     mockBackend({ accounts: two, raw: null })
     render(Settings)
     await selectAccount('uuid-home')
@@ -595,7 +689,7 @@ describe('Settings debug panel', () => {
     // `loadedFor` has to go with it. Left set, it would match the moment the
     // same key is chosen again, so `loaded` turns true with `captured` still
     // null and the panel claims the account has never polled — before the user
-    // has pressed anything, which is the confidently-wrong display CLAUDE.md
+    // has pressed anything, which is the confidently-wrong display AGENTS.md
     // calls this product's worst failure mode.
     await selectAccount('uuid-home')
     expect(screen.getByText('Select an account and press Reload.')).toBeTruthy()
@@ -632,15 +726,15 @@ describe('Settings debug panel', () => {
     const claude: AccountView = {
       account_id: 'same-id',
       provider: 'anthropic',
-      label: 'Claude',
-      email: 'claude@example.com',
+      label: 'Work',
+      email: 'same@example.com',
       state: { kind: 'loading' },
     }
     const codex: AccountView = {
       account_id: 'same-id',
       provider: 'openai',
-      label: 'Codex',
-      email: 'codex@example.com',
+      label: 'Work',
+      email: 'same@example.com',
       state: { kind: 'loading' },
     }
     const calls = mockBackend({ accounts: [claude, codex], raw: null })
@@ -650,6 +744,11 @@ describe('Settings debug panel', () => {
     await waitFor(() => expect(select.options.length).toBe(3))
     const values = Array.from(select.options, (o) => o.value)
     expect(new Set(values).size).toBe(3)
+    expect(Array.from(select.options, (o) => o.textContent)).toEqual([
+      '—',
+      'Claude — Work (same@example.com)',
+      'Codex — Work (same@example.com)',
+    ])
 
     await fireEvent.change(select, { target: { value: accountKey('same-id', 'openai') } })
     await fireEvent.click(screen.getByRole('button', { name: 'Reload' }))
@@ -716,8 +815,21 @@ describe('Settings manual login fallback', () => {
     await fireEvent.click(screen.getByText('Add Claude account'))
     await settle()
 
+    expect(screen.getByRole('heading', { name: 'Finish adding Claude' })).toBeTruthy()
     expect(screen.getByText(MANUAL)).toBeTruthy()
     expect(screen.getByText(/no local port/)).toBeTruthy()
+  })
+
+  it('keeps the selected provider visible throughout a Codex fallback', async () => {
+    mockBackend({ loginUrls: { loopback: null, manual: MANUAL } })
+    render(Settings)
+    await settle()
+
+    await fireEvent.click(screen.getByText('Add Codex account'))
+    await settle()
+
+    expect(screen.getByRole('heading', { name: 'Finish adding Codex' })).toBeTruthy()
+    expect(screen.queryByRole('heading', { name: 'Finish adding Claude' })).toBeNull()
   })
 
   it('sends the pasted line to the backend verbatim', async () => {
@@ -805,7 +917,7 @@ describe('Settings start at login', () => {
    * §11.3's command answers with what the OS reports *afterwards*, which is not
    * always what was asked for. The window has to render that answer — showing
    * the click instead would tell the user autostart is on when the OS declined
-   * it, which is the confidently-wrong display CLAUDE.md forbids.
+   * it, which is the confidently-wrong display AGENTS.md forbids.
    *
    * The mock deliberately disagrees with the request: a test where the answer
    * matches the click cannot tell the two apart, and an earlier version of this
@@ -842,7 +954,7 @@ describe('Settings start at login', () => {
   /**
    * The click already moved the DOM checkbox. Re-rendering from an unchanged
    * object would not move it back, so a refused change would sit there looking
-   * applied — the confidently-wrong display CLAUDE.md forbids, in miniature.
+   * applied — the confidently-wrong display AGENTS.md forbids, in miniature.
    */
   it('puts the box back when the backend refuses', async () => {
     mockBackend({
