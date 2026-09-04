@@ -3302,6 +3302,7 @@ dependencies = [
  "quota-core",
  "serde_json",
  "tokio",
+ "wiremock",
 ]
 
 [[package]]
