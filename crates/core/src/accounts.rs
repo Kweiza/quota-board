@@ -158,14 +158,22 @@ impl AccountStore {
         match existing {
             Some(i) => {
                 account.sort_order = self.accounts[i].sort_order;
-                self.accounts[i] = account;
+                let previous = std::mem::replace(&mut self.accounts[i], account);
+                if let Err(error) = self.flush() {
+                    self.accounts[i] = previous;
+                    return Err(error);
+                }
             }
             None => {
                 account.sort_order = self.accounts.len() as u32;
                 self.accounts.push(account);
+                if let Err(error) = self.flush() {
+                    self.accounts.pop();
+                    return Err(error);
+                }
             }
         }
-        self.flush()
+        Ok(())
     }
 
     pub fn remove(&mut self, provider: Provider, account_id: &str) -> Result<bool, AccountError> {
@@ -399,6 +407,10 @@ mod tests {
             std::fs::read(&path).unwrap(),
             original,
             "the refused write still changed the file on disk"
+        );
+        assert!(
+            s.list().is_empty(),
+            "the refused write still changed the in-memory account list"
         );
         std::fs::remove_file(&path).ok();
     }
