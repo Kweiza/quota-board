@@ -164,6 +164,25 @@ pub fn token_key(provider: Provider, account_id: &str) -> String {
     }
 }
 
+/// The raw OpenAI access-token entry. Derived from [`token_key`] so the
+/// provider namespace has exactly one implementation.
+pub fn openai_access_token_key(account_id: &str) -> String {
+    format!("{}:access", token_key(Provider::Openai, account_id))
+}
+
+/// The raw OpenAI refresh-token entry. Kept separate from the access token so
+/// neither approaches Windows Credential Manager's per-entry limit.
+pub fn openai_refresh_token_key(account_id: &str) -> String {
+    format!("{}:refresh", token_key(Provider::Openai, account_id))
+}
+
+/// The non-secret OpenAI token metadata entry. It still lives in
+/// [`SecretStore`](crate::secrets::SecretStore): splitting storage must never
+/// turn into permission to put token-adjacent state in a plaintext store.
+pub fn openai_token_meta_key(account_id: &str) -> String {
+    format!("{}:meta", token_key(Provider::Openai, account_id))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -181,6 +200,23 @@ mod tests {
     #[test]
     fn a_new_provider_is_namespaced_from_the_start() {
         assert_eq!(token_key(Provider::Openai, "user-1"), "openai:user-1:tokens");
+    }
+
+    /// OpenAI's tokens are deliberately split across three credential entries
+    /// to stay below Windows Credential Manager's per-entry byte limit. These
+    /// names are storage ABI: changing any suffix silently loses that piece of
+    /// every Codex login already on disk.
+    #[test]
+    fn the_openai_split_key_formats_are_frozen() {
+        assert_eq!(
+            openai_access_token_key("user-1"),
+            "openai:user-1:tokens:access"
+        );
+        assert_eq!(
+            openai_refresh_token_key("user-1"),
+            "openai:user-1:tokens:refresh"
+        );
+        assert_eq!(openai_token_meta_key("user-1"), "openai:user-1:tokens:meta");
     }
 
     /// Anthropic's floor is derived from a measurement (Spikes B and D: a
