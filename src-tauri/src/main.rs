@@ -6,6 +6,7 @@ use tauri_plugin_window_state::StateFlags;
 mod commands;
 mod state;
 mod tray;
+mod window_recovery;
 
 use quota_core::accounts::AccountStore;
 use quota_core::auth::openai::{OpenAiAuthConfig, OPENAI_ISSUER};
@@ -277,9 +278,12 @@ fn main() {
 
             // No restore_state() call here on purpose. "settings" is the only
             // label passed to skip_initial_state, so the plugin restores the
-            // widget itself before setup() runs. Measured on macOS 15.6 with
-            // plugin 2.4.1: widget moved to (300,700), quit, relaunched, and it
-            // came back at (300,700) with no explicit restore in this closure.
+            // widget itself before setup() runs. `center: true` establishes a
+            // primary-display fallback first; a valid saved position replaces
+            // it, while an invalid one leaves the centered fallback intact.
+            // Measured on macOS 15.6 with plugin 2.4.1: widget moved to
+            // (300,700), quit, relaunched, and it came back at (300,700) with
+            // no explicit restore in this closure.
             if let Some(widget) = app.get_webview_window("widget") {
                 widget.show()?;
             }

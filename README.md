@@ -148,6 +148,24 @@ to admit it unaided.
   unnotarized-app refusal and both routes above clear it. If you instead see
   **"…is damaged and can't be opened"**, you have a 0.1.0 or 0.2.0 build; see
   the note below.
+
+  If the widget briefly paints and then becomes completely transparent while
+  its invisible area is still draggable, check CoreAudio before deleting app
+  data or credentials:
+
+  ```bash
+  /usr/sbin/system_profiler -timeout 5 -detailLevel mini SPAudioDataType
+  ```
+
+  No Audio output from that bounded probe means macOS device enumeration is
+  wedged. Save any recording or call first, quit audio/video apps, and restart
+  the Mac. The narrower recovery is `sudo killall coreaudiod`; launchd starts it
+  again, but all current audio streams are interrupted. If it recurs, disconnect
+  external audio/display devices and disable aggregate or multi-output devices
+  before troubleshooting third-party HAL drivers in Audio MIDI Setup. This is
+  a system-wide WKWebView failure: reinstalling Quota Board or deleting its
+  accounts does not repair it. See Apple's
+  [Audio MIDI Setup troubleshooting](https://support.apple.com/guide/audio-midi-setup/if-your-audio-apps-stop-working-amsfa3961363/mac).
 - **Windows** — SmartScreen will warn; the bypass is *More info* →
   *Run anyway*.
 
@@ -206,7 +224,8 @@ its own; **everything that is not a usage row lives in two places.**
 - **The gear on the widget** opens Settings — add and remove accounts, rename
   them, set the polling interval, unlock the encrypted token store, and inspect
   the last raw response.
-- **The tray icon** shows or hides the widget and quits the app. `Ctrl+Alt+Q`
+- **The tray icon** shows or hides the widget, moves it back to the primary
+  display if a monitor change strands it, and quits the app. `Ctrl+Alt+Q`
   toggles the widget too, where the OS allows it.
 
 To add an account, choose the equally weighted **Claude** or **Codex** card in
