@@ -47,7 +47,7 @@ export function relativeAge(fetchedAt: Date, now: Date): string {
  * `<input type="number">` sets the bound variable to `null` when the field is
  * cleared (`to_number` returns `null` for `''`), and
  * `Math.round((86400 / null) * 2)` is `Infinity`. Rendering "roughly Infinity
- * queries per day" is CLAUDE.md's confidently-wrong-number failure in
+ * queries per day" is AGENTS.md's confidently-wrong-number failure in
  * miniature.
  */
 export function queriesPerDay(intervalSecs: number | null, accountCount: number): number {

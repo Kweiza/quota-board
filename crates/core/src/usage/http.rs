@@ -99,7 +99,7 @@ pub async fn fetch_usage_at(
 /// `Result<(windows, raw), UsageError>` drops it on exactly that path.
 pub struct CapturedFetch {
     /// `None` when no body was read at all — a transport failure, a 429, or a
-    /// non-2xx status. **Never a fabricated empty body** (CLAUDE.md: never
+    /// non-2xx status. **Never a fabricated empty body** (AGENTS.md: never
     /// demote a missing value).
     pub raw: Option<RawResponse>,
     /// The optional line under the bars, when this account has one.
@@ -264,7 +264,7 @@ fn is_oauth_not_allowed(body: &serde_json::Value) -> bool {
 /// Shared by both providers: `anthropic::parse_usage` and `openai::parse_usage`
 /// return the same `ParseError`, and a window present but unreadable must be
 /// surfaced as an error rather than demoted to a fabricated empty success
-/// (CLAUDE.md: never demote a missing value to 0%) whichever provider produced
+/// (AGENTS.md: never demote a missing value to 0%) whichever provider produced
 /// it.
 ///
 /// Written as an exhaustive match, not `.map_err(|_| UsageError::UnknownShape)`:
@@ -447,7 +447,7 @@ mod tests {
         );
     }
 
-    /// CLAUDE.md: never demote a missing value to a fabricated one. A 429 is
+    /// AGENTS.md: never demote a missing value to a fabricated one. A 429 is
     /// answered before any body is read, so there is nothing to show — and
     /// "nothing" must not be rendered as an empty response.
     #[tokio::test]
@@ -687,7 +687,7 @@ mod tests {
         );
     }
 
-    /// CLAUDE.md: `anthropic-beta` identifies our Anthropic integration and has
+    /// AGENTS.md: `anthropic-beta` identifies our Anthropic integration and has
     /// no meaning at OpenAI. Sending it there is at best noise and at worst a
     /// fingerprint.
     #[tokio::test]

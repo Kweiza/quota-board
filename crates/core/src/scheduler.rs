@@ -217,7 +217,7 @@ impl PollPolicy {
     /// a value stale only past `interval * 2`: at a one-day interval a
     /// two-day-old percentage still renders as `Ok`, long after the 5-hour
     /// window it describes has rotated — the confidently-wrong-number failure
-    /// CLAUDE.md names as the worst one. At one hour the staleness boundary is
+    /// AGENTS.md names as the worst one. At one hour the staleness boundary is
     /// two hours, comfortably inside that window.
     ///
     /// Both bounds are reachable from a file a user can hand-edit, which is
@@ -816,7 +816,7 @@ impl<C: Clock> Scheduler<C> {
         // in the past (its `secs <= 0` early return in src/lib/format.ts) and
         // `Bar.svelte` renders the percentage beside it unconditionally, so a
         // weekend-old snapshot would show a rotated window's old percentage as
-        // if it were current — the confidently-wrong-number failure CLAUDE.md
+        // if it were current — the confidently-wrong-number failure AGENTS.md
         // names as the worst one.
         let live: Vec<UsageWindow> =
             snap.windows.into_iter().filter(|w| w.resets_at > now).collect();

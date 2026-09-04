@@ -331,7 +331,7 @@ mod tests {
     /// request. Without a real await point, `tokio::join!` on the default
     /// current-thread runtime runs the first future to completion before
     /// polling the second, and the test would pass with the lock removed —
-    /// the "test that cannot fail" CLAUDE.md forbids. For the same reason the
+    /// the "test that cannot fail" AGENTS.md forbids. For the same reason the
     /// assertion is a request count, never a non-overlapping-interval check.
     /// A `Barrier(2)` rendezvous does not work either: when the lock does its
     /// job the second caller never reaches the barrier and the test deadlocks.

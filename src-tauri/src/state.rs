@@ -122,7 +122,7 @@ pub struct AppState {
     /// `QUOTA_OPENAI_USAGE_URL` already gave the usage endpoint. That left the
     /// whole login path — `begin_login` → `complete_login` →
     /// `register_authenticated` — for Codex with no test able to reach it
-    /// without touching the real network, which CLAUDE.md forbids. `main.rs`'s
+    /// without touching the real network, which AGENTS.md forbids. `main.rs`'s
     /// `openai_token_url()` is the same override, one endpoint over.
     pub openai_cfg: ProviderSpec,
     /// Per-account refresh locks (Task 10b). **Exactly one instance may exist
@@ -152,7 +152,7 @@ pub struct AppState {
     /// this path can ever be exercised against a mock, because `fetch_usage`
     /// hardcodes §5.1's production URL (`USAGE_URL` in usage/http.rs). This is
     /// what makes Step 11 executable at all. **Do not add a trait to `usage`**
-    /// — CLAUDE.md and design.md §4.3 forbid it; the URL is the seam.
+    /// — AGENTS.md and design.md §4.3 forbid it; the URL is the seam.
     ///
     /// Anthropic's half of the pair. A single field here — before this task —
     /// sent every account through the same URL regardless of its provider, so

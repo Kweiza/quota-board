@@ -26,7 +26,7 @@ pub struct PendingAuth {
 /// for.
 ///
 /// Hand-written, never derived — the same shape as `TokenSet` in
-/// `auth/token.rs`. CLAUDE.md names this because the defect has shipped twice.
+/// `auth/token.rs`. AGENTS.md names this because the defect has shipped twice.
 impl std::fmt::Debug for PendingAuth {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("PendingAuth")
@@ -202,7 +202,7 @@ mod tests {
         assert!(q.contains_key("state"));
     }
 
-    /// CLAUDE.md: a live credential must never reach `Debug` output, and the
+    /// AGENTS.md: a live credential must never reach `Debug` output, and the
     /// PKCE verifier is one — combined with an authorization code it is
     /// exchanged for tokens. Task 23 keeps a `PendingAuth` in the application
     /// state for the whole manual-paste window, which widens every path that

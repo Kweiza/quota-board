@@ -9,7 +9,7 @@
 #
 # Manual research script only. The application never reads ~/.codex/auth.json;
 # only this script does, and only when a human runs it. That is the same
-# exemption CLAUDE.md grants scripts/ for ~/.claude/.credentials.json, and it
+# exemption AGENTS.md grants scripts/ for ~/.claude/.credentials.json, and it
 # does not widen: nothing here writes the file, and no application code may copy
 # this access.
 #
@@ -89,7 +89,7 @@ if [ -d "$OUT" ] && [ -n "$(ls -A "$OUT" 2>/dev/null)" ]; then
 fi
 mkdir -p "$OUT"
 # Bodies land under .local/ rather than /tmp because they carry account
-# identifiers and plan details, and CLAUDE.md designates .local/ for raw
+# identifiers and plan details, and AGENTS.md designates .local/ for raw
 # research logs. It is git-ignored, so nothing here can reach the public repo by
 # accident.
 echo "output directory: $OUT"

@@ -47,7 +47,7 @@ pub enum AuthError {
     /// not this error. `exchange_and_identify` reuses this same variant for
     /// its own "no identity at all" case, but nothing calls it with
     /// `Provider::Anthropic`.
-    /// **Never carries the body**: the body holds the tokens, and CLAUDE.md
+    /// **Never carries the body**: the body holds the tokens, and AGENTS.md
     /// forbids a live credential reaching an error message.
     #[error("the token response carried no account identifier")]
     NoAccountIdentifier,
