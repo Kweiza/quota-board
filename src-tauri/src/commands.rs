@@ -328,7 +328,7 @@ enum LoginTaskFailure {
 }
 
 fn codex_device_start_error(error: AuthError) -> String {
-    if matches!(error, AuthError::OAuth { status: 404, .. }) {
+    if matches!(error, AuthError::DeviceCodeUnavailable) {
         return "Codex device sign-in is unavailable; enable it in ChatGPT security/workspace settings or free localhost ports 1455/1457 and try again".into();
     }
     error.to_string()
@@ -457,9 +457,13 @@ async fn prepare_codex_login(
             })
         }
         Err(_) => {
-            let device = openai::request_device_code(&state.http, &state.auth_configs.openai)
-                .await
-                .map_err(codex_device_start_error)?;
+            let device = openai::request_device_code(
+                &state.http,
+                &state.auth_configs.openai,
+                chrono::Utc::now(),
+            )
+            .await
+            .map_err(codex_device_start_error)?;
             let start = LoginStart::CodexDevice {
                 attempt_id: generation,
                 verification_url: device.verification_url.clone(),
@@ -1772,11 +1776,7 @@ mod tests {
 
     #[test]
     fn device_404_explains_both_available_remedies() {
-        let message = codex_device_start_error(AuthError::OAuth {
-            status: 404,
-            code: None,
-            description: None,
-        });
+        let message = codex_device_start_error(AuthError::DeviceCodeUnavailable);
         assert!(message.contains("enable it in ChatGPT"), "{message}");
         assert!(message.contains("1455/1457"), "{message}");
         assert!(!message.contains("OAuth error"), "{message}");

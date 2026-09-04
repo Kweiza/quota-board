@@ -75,6 +75,13 @@ pub enum AuthError {
     /// context cannot turn it into a terminal failure for another provider.
     #[error("the refreshed token belongs to a different account or workspace")]
     IdentityMismatch { provider: Provider },
+    #[error("the device code expired before it was approved")]
+    DeviceCodeExpired,
+    /// The issuer explicitly reported that this public client's device flow is
+    /// unavailable. Hosts can show a provider-specific remedy without parsing
+    /// untrusted server prose.
+    #[error("device-code login is not available")]
+    DeviceCodeUnavailable,
 }
 
 impl AuthError {
