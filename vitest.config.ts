@@ -21,12 +21,13 @@ export default defineConfig({
     // **Spread the defaults, never replace them** — a bare `exclude` drops
     // `node_modules` and `dist` and the run slows to a crawl on vendored specs.
     //
-    // `.local/` and `.superpowers/` are git-ignored working directories, so a
-    // clone does not have them and CI cannot run what they contain. Without
+    // `.local/`, `.superpowers/` and `.claude/` are git-ignored working
+    // directories, so a clone does not have them and CI cannot run what they
+    // contain. Without
     // this the local totals and the CI totals silently disagree: measured, a
     // scratch probe in `.local/` added 4 tests and one file to every number
     // this project quoted as a gate result, none of which any checkout could
     // reproduce.
-    exclude: [...configDefaults.exclude, '.local/**', '.superpowers/**'],
+    exclude: [...configDefaults.exclude, '.local/**', '.superpowers/**', '.claude/**'],
   },
 })

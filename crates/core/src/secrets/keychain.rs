@@ -11,7 +11,8 @@ pub struct KeychainStore {
 }
 
 impl KeychainStore {
-    /// **Must be called exactly once at application startup.**
+    /// **Must be called at most once at application startup.** An application
+    /// that has already selected another persistent backend need not call it.
     ///
     /// The v1 wrapper in keyring 4.1.5 has a confirmed bug: `Entry::new` flips
     /// an internal AtomicBool to true *before* attempting to register the store,

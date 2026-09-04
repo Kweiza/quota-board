@@ -19,7 +19,10 @@
   export let onRemove: (accountId: string, provider: Provider) => void = () => {}
   export let onRename: (accountId: string, provider: Provider, label: string) => void = () => {}
   export let onMove: (accountId: string, provider: Provider, delta: number) => void = () => {}
-  export let onRefresh: (accountId: string, provider: Provider) => void = () => {}
+  export let onRefresh: (
+    accountId: string,
+    provider: Provider,
+  ) => void | Promise<void> = () => {}
   /**
    * §6.4's refusal, keyed by `accountKey(account_id, provider)`: the instant a
    * manual refresh may next fire, for each account whose last "Refresh now"
@@ -36,6 +39,22 @@
    * hands it down separately.
    */
   export let throttledUntil: Record<string, string> = {}
+
+  /** Per-row single-flight for §6.4's network-bearing manual refresh. */
+  let refreshing: Record<string, boolean> = {}
+
+  async function refresh(account: AccountView): Promise<void> {
+    const key = accountKey(account.account_id, account.provider)
+    if (account.state.kind === 'auth_dead' || refreshing[key]) return
+    refreshing = { ...refreshing, [key]: true }
+    try {
+      await onRefresh(account.account_id, account.provider)
+    } finally {
+      const next = { ...refreshing }
+      delete next[key]
+      refreshing = next
+    }
+  }
 </script>
 
 <ul class="rows">
@@ -47,6 +66,9 @@
        pair. -->
   {#each accounts as a, i (accountKey(a.account_id, a.provider))}
     {@const provider = providerName(a.provider)}
+    {@const busy = refreshing[accountKey(a.account_id, a.provider)] ?? false}
+    {@const refreshBlocked = a.state.kind === 'auth_dead'}
+    {@const remedyId = `refresh-remedy-${i}`}
     <li class="row">
       <div class="ident">
         <!-- `value=` rather than `bind:value=`: binding would write through
@@ -76,17 +98,28 @@
              `role="status"` because this is the only answer a press gets: a
              refused button is otherwise inert until `Retry-After` runs out,
              which is the defect this note exists to fix. -->
-        {#if throttledUntil[accountKey(a.account_id, a.provider)]}
+        <!-- AUTH_DEAD outranks a remembered refusal: re-login is now the only
+             remedy, and this row can no longer make the later press that would
+             otherwise retire the old note. -->
+        {#if !refreshBlocked && throttledUntil[accountKey(a.account_id, a.provider)]}
           <span class="throttle" role="status">
             throttled, available after {untilHhMm(throttledUntil[accountKey(a.account_id, a.provider)])}
+          </span>
+        {/if}
+        {#if refreshBlocked}
+          <span class="remedy" id={remedyId}>
+            Re-login with Add {provider} account below.
           </span>
         {/if}
       </div>
       <div class="actions">
         <button
           type="button"
-          aria-label={`Refresh ${provider} account ${a.label}`}
-          on:click={() => onRefresh(a.account_id, a.provider)}>Refresh now</button>
+          aria-label={`${busy ? 'Refreshing' : 'Refresh'} ${provider} account ${a.label}`}
+          aria-describedby={refreshBlocked ? remedyId : undefined}
+          aria-busy={busy}
+          disabled={busy || refreshBlocked}
+          on:click={() => refresh(a)}>{busy ? 'Refreshing…' : 'Refresh now'}</button>
         <!-- A direction, not an index: the parent rebuilds the whole (provider,
              account_id) key array for `reorder_accounts`, and an index captured
              at render time goes stale as soon as the list is re-read. -->
@@ -139,6 +172,7 @@
      `min-width: 0`, so clipping this line would cut the clock time off the end
      — the one piece of it the user needs. Wrapping is the safe overflow. */
   .throttle { font-size: 11px; opacity: .85; }
+  .remedy { font-size: 11px; color: #f87171; }
   .actions { display: flex; flex: 1 1 auto; justify-content: flex-end;
              flex-wrap: wrap; gap: .35em; }
   .actions button { font: inherit; font-size: 11px; padding: .25em .5em; cursor: pointer; }

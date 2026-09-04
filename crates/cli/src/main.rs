@@ -12,7 +12,7 @@ use quota_core::auth::stored::{
     ensure_fresh, load_tokens, refresh_after_unauthorized, AuthConfigs, Fresh, RefreshLocks,
     StoredTokenError, StoredTokens,
 };
-use quota_core::auth::token::{exchange_code, ReqwestHttp};
+use quota_core::auth::token::{exchange_code, AnthropicAuthConfig, ReqwestHttp};
 use quota_core::paths::accounts_file;
 use quota_core::provider::{token_key, Provider};
 use quota_core::secrets::{keychain::KeychainStore, SecretStore, SERVICE};
@@ -35,7 +35,7 @@ fn open_store() -> Box<dyn SecretStore> {
 }
 
 async fn cmd_login() -> Result<(), Box<dyn std::error::Error>> {
-    let cfg = Provider::Anthropic.spec();
+    let cfg = AnthropicAuthConfig::production();
     let cb = Callback::bind().await?;
     let (pending, url) = begin(&cfg, &cb.redirect_uri())?;
 
@@ -183,6 +183,7 @@ async fn show_accounts_at(
             http,
             account.provider,
             endpoints.for_provider(account.provider),
+            &account.account_id,
             fresh.tokens.access_token(),
             fresh.tokens.workspace_id(),
             fresh.tokens.is_fedramp(),
@@ -311,7 +312,10 @@ async fn cmd_refresh(raw_selector: &str) -> Result<(), Box<dyn std::error::Error
         }
         StoredTokens::Openai(tokens) => {
             println!("refreshed. new expiry: {}", tokens.expires_at);
-            println!("workspace: {}", tokens.workspace_id);
+            println!(
+                "workspace: {}",
+                tokens.workspace_id.as_deref().unwrap_or("not reported")
+            );
         }
     }
     Ok(())
@@ -376,7 +380,7 @@ mod tests {
             expires_at: Utc::now() + TimeDelta::hours(1),
             refresh_token_expires_at: Utc::now() + TimeDelta::days(30),
             scopes: vec!["user:profile".into()],
-            client_id: Provider::Anthropic.spec().client_id,
+            client_id: AnthropicAuthConfig::production().client_id,
         }
     }
 
@@ -387,8 +391,8 @@ mod tests {
             expires_at: Utc::now() + TimeDelta::hours(1),
             client_id: "openai-client".into(),
             account_id: SAME_ID.into(),
-            workspace_id: "workspace-openai".into(),
-            is_fedramp: true,
+            workspace_id: Some("workspace-openai".into()),
+            is_fedramp: Some(true),
         }
     }
 
@@ -418,6 +422,8 @@ mod tests {
 
     fn openai_usage() -> serde_json::Value {
         serde_json::json!({
+            "account_id": "workspace-openai",
+            "user_id": SAME_ID,
             "rate_limit": {
                 "primary_window": {
                     "used_percent": 34,
@@ -444,8 +450,8 @@ mod tests {
     }
 
     /// Two providers deliberately share the same id here. Passing this test
-    /// requires all four dispatches to agree: account selection, credential
-    /// key, usage URL, and OpenAI-only workspace headers.
+    /// requires all five dispatches to agree: account selection, credential
+    /// key, usage URL, OpenAI-only workspace headers, and response identity.
     #[tokio::test]
     async fn show_keeps_same_id_accounts_on_their_own_endpoint_key_and_context() {
         let anthropic_server = MockServer::start().await;
@@ -488,6 +494,8 @@ mod tests {
         assert_eq!(output.matched, 2);
         assert!(output.lines.iter().any(|line| line.contains("anthropic account [anthropic]")));
         assert!(output.lines.iter().any(|line| line.contains("openai account [openai]")));
+        assert!(output.lines.iter().any(|line| line.contains("12.0%")), "Claude values were not parsed: {:?}", output.lines);
+        assert!(output.lines.iter().any(|line| line.contains("34.0%")), "Codex values were not parsed: {:?}", output.lines);
         assert!(store.get(&token_key(Provider::Anthropic, SAME_ID)).unwrap().is_some());
         assert!(store.get(&token_key(Provider::Openai, SAME_ID)).unwrap().is_none());
 
@@ -544,7 +552,7 @@ mod tests {
             .and(body_json(serde_json::json!({
                 "grant_type": "refresh_token",
                 "refresh_token": "claude-rt",
-                "client_id": Provider::Anthropic.spec().client_id,
+                "client_id": AnthropicAuthConfig::production().client_id,
                 "scope": "user:profile"
             })))
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
@@ -573,9 +581,9 @@ mod tests {
         let store = MemoryStore::default();
         seed_same_id(&store);
         let cfg = AuthConfigs {
-            anthropic: quota_core::provider::ProviderSpec {
+            anthropic: AnthropicAuthConfig {
                 token_url: format!("{}/anthropic-token", server.uri()),
-                ..Provider::Anthropic.spec()
+                ..AnthropicAuthConfig::production()
             },
             openai: OpenAiAuthConfig {
                 issuer: server.uri(),
@@ -611,6 +619,6 @@ mod tests {
         assert_eq!(openai.access_token(), FUTURE_OPENAI_JWT);
         assert_eq!(openai.refresh_token(), "new-codex-rt");
         assert_eq!(openai.workspace_id(), Some("workspace-openai"));
-        assert!(openai.is_fedramp());
+        assert_eq!(openai.is_fedramp(), Some(true));
     }
 }

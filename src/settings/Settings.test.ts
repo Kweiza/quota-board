@@ -9,7 +9,7 @@ import type {
   AccountState,
   AccountView,
   AutostartView,
-  LoginUrls,
+  LoginStart,
   RawResponse,
   SettingsView,
   StoreStatus,
@@ -36,10 +36,12 @@ interface Backend {
   unlocked?: StoreStatus
   /** Rejects `begin_login` with this message, as the Rust single-flight does. */
   loginError?: string
-  /** What `begin_login` answers with. §10.3 returns both URLs. */
-  loginUrls?: LoginUrls
+  /** What the provider-specific `begin_login` path answers with. */
+  loginStart?: LoginStart | Promise<LoginStart>
   /** Rejects `submit_manual_code` with this message. */
   submitError?: string
+  /** Controls the opener call so auth-event/open completion can be reordered. */
+  openUrl?: Promise<void>
   /** What `get_autostart` answers with. §11.3. */
   autostart?: AutostartView
   /** Rejects `set_autostart` with this message, as a debug build does. */
@@ -87,7 +89,7 @@ const store = (kind: StoreStatus['kind'], exists: boolean): StoreStatus => ({
  *
  * `shouldMockEvents` makes `listen`/`emit` round-trip inside the mock
  * (src/lib/ipc.test.ts:283-291 uses it for the same reason), so a test can
- * deliver `accounts://changed` and `auth://failed` the way the backend does.
+ * deliver account/auth events the way the backend does.
  * It also means the event plugin's own invokes bypass this callback and are
  * therefore absent from the recorded calls — no assertion here names them.
  */
@@ -119,7 +121,9 @@ function mockBackend(b: Backend = {}): IpcCall[] {
         // `Error`; the window renders it with `String(e)`.
         if (b.loginError !== undefined) return Promise.reject(b.loginError)
         return (
-          b.loginUrls ?? {
+          b.loginStart ?? {
+            attempt_id: 1,
+            kind: 'claude_browser',
             loopback: 'https://claude.com/cai/oauth/authorize?redirect_uri=loopback',
             manual: 'https://claude.com/cai/oauth/authorize?redirect_uri=manual',
           }
@@ -127,6 +131,8 @@ function mockBackend(b: Backend = {}): IpcCall[] {
       case 'submit_manual_code':
         if (b.submitError !== undefined) return Promise.reject(b.submitError)
         return null
+      case 'plugin:opener|open_url':
+        return b.openUrl ?? null
       case 'get_autostart':
         return b.autostart ?? { enabled: false, writable: true }
       case 'set_autostart':
@@ -144,6 +150,58 @@ function mockBackend(b: Backend = {}): IpcCall[] {
     }
   }, { shouldMockEvents: true })
   return calls
+}
+
+/**
+ * Holds each event-listener registration at the IPC boundary so readiness and
+ * partial failure can be observed independently. Tauri's event mock normally
+ * consumes these calls before `mockIPC` sees them, which is useful for delivery
+ * tests but cannot represent a listener that never registered.
+ */
+function mockBackendWithControlledListeners(): {
+  listeners: Map<string, { resolve: () => void; reject: (reason: unknown) => void }>
+  unlistened: string[]
+} {
+  const listeners = new Map<
+    string,
+    { resolve: () => void; reject: (reason: unknown) => void }
+  >()
+  const unlistened: string[] = []
+
+  mockIPC((cmd, args) => {
+    if (cmd === 'plugin:event|listen') {
+      const payload = args as { event: string; handler: number }
+      const event = payload.event
+      const handler = payload.handler
+      return new Promise<number>((resolve, reject) => {
+        listeners.set(event, {
+          resolve: () => resolve(handler),
+          reject,
+        })
+      })
+    }
+    if (cmd === 'plugin:event|unlisten') {
+      unlistened.push((args as { event: string }).event)
+      return null
+    }
+
+    switch (cmd) {
+      case 'list_accounts':
+        return []
+      case 'accounts_warning':
+        return null
+      case 'get_settings':
+        return settings(300)
+      case 'store_status':
+        return store('keychain', false)
+      case 'get_autostart':
+        return { enabled: false, writable: true }
+      default:
+        return null
+    }
+  })
+
+  return { listeners, unlistened }
 }
 
 /**
@@ -262,13 +320,18 @@ describe('Settings error banner', () => {
     const calls = mockBackend()
     render(Settings)
     await whenSubscribed(calls)
-
-    // Delivered back to back, as a login that emitted both would deliver them:
-    // the mock runs each listener synchronously inside `emit`.
-    await Promise.all([emit('accounts://changed'), emit('auth://failed', 'the login timed out')])
+    await fireEvent.click(screen.getByText('Add Claude account'))
     await settle()
 
-    expect(screen.getByText('the login timed out')).toBeTruthy()
+    await emit('accounts://changed')
+    await waitFor(async () => {
+      await emit('auth://failed', {
+        attempt_id: 1,
+        provider: 'anthropic',
+        message: 'the login timed out',
+      })
+      expect(screen.getByText('the login timed out')).toBeTruthy()
+    })
     expect(screen.getByRole('alert')).toBeTruthy()
   })
 })
@@ -311,6 +374,55 @@ describe('Settings account loading', () => {
  * covered by the tests above and in `crates/core`.
  */
 describe('Settings add account buttons', () => {
+  it('keeps both providers disabled until every auth event listener is live', async () => {
+    const { listeners } = mockBackendWithControlledListeners()
+    render(Settings)
+
+    const claude = screen.getByRole('button', { name: 'Add Claude account' }) as HTMLButtonElement
+    const codex = screen.getByRole('button', { name: 'Add Codex account' }) as HTMLButtonElement
+    expect(claude.disabled).toBe(true)
+    expect(codex.disabled).toBe(true)
+
+    await waitFor(() => expect(listeners.size).toBe(4))
+    listeners.get('accounts://changed')!.resolve()
+    listeners.get('auth://completed')!.resolve()
+    listeners.get('auth://manual-fallback')!.resolve()
+    await settle()
+    expect(claude.disabled).toBe(true)
+    expect(codex.disabled).toBe(true)
+
+    listeners.get('auth://failed')!.resolve()
+    await waitFor(() => expect(claude.disabled).toBe(false))
+    expect(codex.disabled).toBe(false)
+  })
+
+  it('keeps login disabled and releases partial listeners when registration fails', async () => {
+    const { listeners, unlistened } = mockBackendWithControlledListeners()
+    render(Settings)
+
+    await waitFor(() => expect(listeners.size).toBe(4))
+    listeners.get('accounts://changed')!.resolve()
+    listeners.get('auth://completed')!.resolve()
+    listeners.get('auth://manual-fallback')!.resolve()
+    listeners.get('auth://failed')!.reject('the event bridge is unavailable')
+
+    expect(
+      await screen.findByText(/restart quota board before adding an account/i),
+    ).toBeTruthy()
+    expect(screen.getByText(/event bridge is unavailable/i)).toBeTruthy()
+    expect(
+      (screen.getByRole('button', { name: 'Add Claude account' }) as HTMLButtonElement).disabled,
+    ).toBe(true)
+    expect(
+      (screen.getByRole('button', { name: 'Add Codex account' }) as HTMLButtonElement).disabled,
+    ).toBe(true)
+    await waitFor(() =>
+      expect([...unlistened].sort()).toEqual(
+        ['accounts://changed', 'auth://completed', 'auth://manual-fallback'].sort(),
+      ),
+    )
+  })
+
   it('presents Claude and Codex as equal peer choices and scopes the caveat to Claude', async () => {
     const calls = mockBackend()
     render(Settings)
@@ -326,10 +438,18 @@ describe('Settings add account buttons', () => {
     expect(within(codex).getByRole('button', { name: 'Add Codex account' })).toBeTruthy()
     expect(within(claude).getByText(/consent screen.*Claude Code/i)).toBeTruthy()
     expect(within(codex).queryByText(/Claude Code/i)).toBeNull()
+    expect(within(codex).getByText(/Codex and ChatGPT Work share/i)).toBeTruthy()
+    expect(within(claude).queryByText(/ChatGPT Work/i)).toBeNull()
   })
 
   it('asks the core which provider is being added', async () => {
-    const calls = mockBackend({ loginUrls: { loopback: null, manual: 'x' } })
+    const calls = mockBackend({
+      loginStart: {
+        attempt_id: 1,
+        kind: 'codex_browser',
+        authorize_url: 'https://auth.openai.com/oauth/authorize',
+      },
+    })
 
     render(Settings)
     await fireEvent.click(await screen.findByRole('button', { name: /add codex account/i }))
@@ -338,7 +458,9 @@ describe('Settings add account buttons', () => {
   })
 
   it('asks the core for the Claude provider when that button is pressed', async () => {
-    const calls = mockBackend({ loginUrls: { loopback: null, manual: 'x' } })
+    const calls = mockBackend({
+      loginStart: { attempt_id: 1, kind: 'claude_browser', loopback: null, manual: 'x' },
+    })
 
     render(Settings)
     await fireEvent.click(await screen.findByRole('button', { name: /add claude account/i }))
@@ -486,11 +608,37 @@ describe('Settings manual refresh', () => {
     const buttons = await refreshButtons()
     await fireEvent.click(buttons[0])
     expect(await screen.findByText(`throttled, available after ${first.hhmm}`)).toBeTruthy()
+    await waitFor(() => expect((buttons[0] as HTMLButtonElement).disabled).toBe(false))
 
     await fireEvent.click(buttons[0])
     await waitFor(() => expect(screen.queryByText(/throttled, available after/)).toBeNull())
     // A press that fired is not a failure either.
     expect(screen.queryByRole('alert')).toBeNull()
+  })
+
+  it('retires an old throttle note when auth_dead makes re-login the only remedy', async () => {
+    const row = account('dead-after-throttle', 'Work', 'work@example.com')
+    const until = untilIn(30)
+    const backend: Backend = {
+      accounts: [row],
+      refreshStates: [{ kind: 'throttled', until: until.iso }],
+    }
+    const calls = mockBackend(backend)
+    render(Settings)
+
+    const button = await screen.findByRole('button', {
+      name: 'Refresh Claude account Work',
+    })
+    await fireEvent.click(button)
+    expect(await screen.findByText(/throttled, available after/)).toBeTruthy()
+
+    backend.accounts = [{ ...row, state: { kind: 'auth_dead' } }]
+    await whenSubscribed(calls)
+    expect(screen.queryByText(/throttled, available after/)).toBeNull()
+
+    backend.accounts = [{ ...row, state: { kind: 'loading' } }]
+    await whenSubscribed(calls)
+    expect(screen.queryByText(/throttled, available after/)).toBeNull()
   })
 })
 
@@ -501,16 +649,20 @@ describe('Settings token store', () => {
     // halves are `no_backend` — the wording is keyed on the file, but whether
     // the form is offered at all is keyed on the kind.
     const first = mockBackend({ status: store('no_backend', false) })
-    const view = render(Settings)
+    render(Settings)
     expect(await screen.findByRole('button', { name: 'Set a passphrase' })).toBeTruthy()
     expect(screen.queryByRole('button', { name: 'Unlock' })).toBeNull()
     expect(first.some((c) => c.cmd === 'store_status')).toBe(true)
-    view.unmount()
+  })
 
-    mockBackend({ status: store('no_backend', true) })
+  it('offers Unlock for the existing encrypted store selected at startup', async () => {
+    mockBackend({ status: store('encrypted_file_locked', true) })
     render(Settings)
+
     expect(await screen.findByRole('button', { name: 'Unlock' })).toBeTruthy()
     expect(screen.queryByRole('button', { name: 'Set a passphrase' })).toBeNull()
+    expect(screen.getByText(/existing encrypted store/i)).toBeTruthy()
+    expect(screen.queryByText(/different, empty store/i)).toBeNull()
   })
 
   it('an unlocked encrypted store stops offering the form and stops claiming values are stale', async () => {
@@ -773,9 +925,14 @@ describe('Settings manual login fallback', () => {
    * unsubscribed at that point. Re-emitting until the block appears is the same
    * shape `whenSubscribed` itself uses, for the same reason.
    */
-  async function whenFallbackDelivered(reason: string): Promise<void> {
+  async function whenFallbackDelivered(reason: string, attemptId = 1): Promise<void> {
     await waitFor(async () => {
-      await emit('auth://manual-fallback', { url: MANUAL, reason })
+      await emit('auth://manual-fallback', {
+        attempt_id: attemptId,
+        provider: 'anthropic',
+        url: MANUAL,
+        reason,
+      })
       expect(screen.getByText(new RegExp(reason))).toBeTruthy()
     })
   }
@@ -796,6 +953,7 @@ describe('Settings manual login fallback', () => {
     const calls = mockBackend()
     render(Settings)
     await whenSubscribed(calls)
+    await fireEvent.click(screen.getByText('Add Claude account'))
 
     await whenFallbackDelivered('no reply arrived')
 
@@ -808,7 +966,14 @@ describe('Settings manual login fallback', () => {
    * in its own answer — so this must not wait for an event that will not come.
    */
   it('offers the paste path immediately when no loopback port could be bound', async () => {
-    mockBackend({ loginUrls: { loopback: null, manual: MANUAL } })
+    mockBackend({
+      loginStart: {
+        attempt_id: 1,
+        kind: 'claude_browser',
+        loopback: null,
+        manual: MANUAL,
+      },
+    })
     render(Settings)
     await settle()
 
@@ -820,8 +985,61 @@ describe('Settings manual login fallback', () => {
     expect(screen.getByText(/no local port/)).toBeTruthy()
   })
 
-  it('keeps the selected provider visible throughout a Codex fallback', async () => {
-    mockBackend({ loginUrls: { loopback: null, manual: MANUAL } })
+  it('reports when reopening the Claude fallback link fails', async () => {
+    let rejectOpen: (error: Error) => void = () => {}
+    const openUrl = new Promise<void>((_resolve, reject) => {
+      rejectOpen = reject
+    })
+    mockBackend({
+      loginStart: {
+        attempt_id: 1,
+        kind: 'claude_browser',
+        loopback: null,
+        manual: MANUAL,
+      },
+      openUrl,
+    })
+    render(Settings)
+    await settle()
+
+    await fireEvent.click(screen.getByText('Add Claude account'))
+    await fireEvent.click(await screen.findByRole('button', { name: 'Open in browser' }))
+    rejectOpen(new Error('no browser handler'))
+
+    expect((await screen.findByRole('alert')).textContent).toMatch(/no browser handler/)
+    expect(screen.getByLabelText('Code from the page')).toBeTruthy()
+  })
+
+  it('drops an old Claude paste form when a fresh loopback login starts', async () => {
+    const backend: Backend = {}
+    const calls = mockBackend(backend)
+    render(Settings)
+    await whenSubscribed(calls)
+    await fireEvent.click(screen.getByText('Add Claude account'))
+    await whenFallbackDelivered('no reply arrived')
+    await fireEvent.input(screen.getByLabelText('Code from the page'), {
+      target: { value: 'old-code#old-state' },
+    })
+
+    backend.loginStart = {
+      attempt_id: 2,
+      kind: 'claude_browser',
+      loopback: 'https://claude.example/new-loopback',
+      manual: 'https://claude.example/new-manual',
+    }
+    await fireEvent.click(screen.getByText('Add Claude account'))
+    await settle()
+
+    expect(screen.queryByLabelText('Code from the page')).toBeNull()
+    expect(screen.queryByText(MANUAL)).toBeNull()
+    expect(screen.queryByDisplayValue('old-code#old-state')).toBeNull()
+  })
+
+  it('shows a Codex browser login without Claude paste instructions', async () => {
+    const authorizeUrl = 'https://auth.openai.com/oauth/authorize?state=codex'
+    mockBackend({
+      loginStart: { attempt_id: 1, kind: 'codex_browser', authorize_url: authorizeUrl },
+    })
     render(Settings)
     await settle()
 
@@ -829,11 +1047,46 @@ describe('Settings manual login fallback', () => {
     await settle()
 
     expect(screen.getByRole('heading', { name: 'Finish adding Codex' })).toBeTruthy()
-    expect(screen.queryByRole('heading', { name: 'Finish adding Claude' })).toBeNull()
+    expect(screen.getByText(authorizeUrl)).toBeTruthy()
+    expect(screen.getByText(/complete sign-in in your browser/i)).toBeTruthy()
+    expect(screen.queryByLabelText('Code from the page')).toBeNull()
+    expect(screen.queryByText(/code#state/)).toBeNull()
+  })
+
+  it('shows the one-time code and expiry for the Codex device fallback', async () => {
+    const verificationUrl = 'https://auth.openai.com/codex/device'
+    mockBackend({
+      loginStart: {
+        attempt_id: 1,
+        kind: 'codex_device',
+        verification_url: verificationUrl,
+        user_code: 'ABCD-EFGH',
+        expires_at: '2026-09-04T13:15:00Z',
+      },
+    })
+    render(Settings)
+    await settle()
+
+    await fireEvent.click(screen.getByText('Add Codex account'))
+    await settle()
+
+    expect(screen.getByRole('heading', { name: 'Finish adding Codex' })).toBeTruthy()
+    expect(screen.getByLabelText('Codex device code').textContent).toBe('ABCD-EFGH')
+    expect(screen.getByText(verificationUrl)).toBeTruthy()
+    expect(screen.getByText(/device sign-in is a beta OpenAI feature/i)).toBeTruthy()
+    expect(screen.getByText(/expires at \d{2}:\d{2}/i)).toBeTruthy()
+    expect(screen.queryByLabelText('Code from the page')).toBeNull()
   })
 
   it('sends the pasted line to the backend verbatim', async () => {
-    const calls = mockBackend({ loginUrls: { loopback: null, manual: MANUAL } })
+    const calls = mockBackend({
+      loginStart: {
+        attempt_id: 1,
+        kind: 'claude_browser',
+        loopback: null,
+        manual: MANUAL,
+      },
+    })
     render(Settings)
     await settle()
     await fireEvent.click(screen.getByText('Add Claude account'))
@@ -858,13 +1111,191 @@ describe('Settings manual login fallback', () => {
     const calls = mockBackend()
     render(Settings)
     await whenSubscribed(calls)
+    await fireEvent.click(screen.getByText('Add Claude account'))
 
     await whenFallbackDelivered('no reply arrived')
     expect(screen.getByLabelText('Code from the page')).toBeTruthy()
 
+    await waitFor(async () => {
+      await emit('auth://completed', { attempt_id: 1, provider: 'anthropic' })
+      expect(screen.queryByLabelText('Code from the page')).toBeNull()
+    })
+  })
+
+  it('does not hide a live Codex login for an unrelated account mutation', async () => {
+    const calls = mockBackend({
+      loginStart: {
+        attempt_id: 1,
+        kind: 'codex_device',
+        verification_url: 'https://auth.openai.com/codex/device',
+        user_code: 'ABCD-EFGH',
+        expires_at: '2026-09-04T13:15:00Z',
+      },
+    })
+    render(Settings)
+    await whenSubscribed(calls)
+    await fireEvent.click(screen.getByText('Add Codex account'))
+    expect(await screen.findByLabelText('Codex device code')).toBeTruthy()
+
     await emit('accounts://changed')
     await settle()
+    expect(screen.getByLabelText('Codex device code')).toBeTruthy()
+
+    await waitFor(async () => {
+      await emit('auth://completed', { attempt_id: 1, provider: 'openai' })
+      expect(screen.queryByLabelText('Codex device code')).toBeNull()
+    })
+  })
+
+  it('does not resurrect a login whose failure arrived before begin_login resolved', async () => {
+    let resolveStart: (start: LoginStart) => void = () => {}
+    const pending = new Promise<LoginStart>((resolve) => {
+      resolveStart = resolve
+    })
+    const calls = mockBackend({ loginStart: pending })
+    render(Settings)
+    await whenSubscribed(calls)
+
+    await fireEvent.click(screen.getByText('Add Codex account'))
+    await emit('auth://failed', {
+      attempt_id: 41,
+      provider: 'openai',
+      message: 'the device poll failed immediately',
+    })
+    resolveStart({
+      attempt_id: 41,
+      kind: 'codex_device',
+      verification_url: 'https://auth.openai.com/codex/device',
+      user_code: 'DEAD-CODE',
+      expires_at: '2026-09-04T13:15:00Z',
+    })
+    await settle()
+
+    expect(screen.getByText('the device poll failed immediately')).toBeTruthy()
+    expect(screen.queryByLabelText('Codex device code')).toBeNull()
+    expect(screen.queryByRole('heading', { name: 'Finish adding Codex' })).toBeNull()
+  })
+
+  it('keeps a new login visible when a delayed event belongs to the old attempt', async () => {
+    const backend: Backend = {
+      loginStart: {
+        attempt_id: 50,
+        kind: 'claude_browser',
+        loopback: null,
+        manual: MANUAL,
+      },
+    }
+    const calls = mockBackend(backend)
+    render(Settings)
+    await whenSubscribed(calls)
+
+    await fireEvent.click(screen.getByText('Add Claude account'))
+    expect(await screen.findByLabelText('Code from the page')).toBeTruthy()
+
+    backend.loginStart = {
+      attempt_id: 51,
+      kind: 'codex_device',
+      verification_url: 'https://auth.openai.com/codex/device',
+      user_code: 'LIVE-CODE',
+      expires_at: '2026-09-04T13:15:00Z',
+    }
+    await fireEvent.click(screen.getByText('Add Codex account'))
+    expect(await screen.findByText('LIVE-CODE')).toBeTruthy()
+
+    await emit('auth://completed', { attempt_id: 50, provider: 'anthropic' })
+    await settle()
+
+    expect(screen.getByLabelText('Codex device code').textContent).toBe('LIVE-CODE')
+    expect(screen.getByRole('heading', { name: 'Finish adding Codex' })).toBeTruthy()
+  })
+
+  it('keeps a new login visible when the old command result arrives late', async () => {
+    let resolveOld: (start: LoginStart) => void = () => {}
+    const old = new Promise<LoginStart>((resolve) => {
+      resolveOld = resolve
+    })
+    const backend: Backend = { loginStart: old }
+    const calls = mockBackend(backend)
+    render(Settings)
+    await whenSubscribed(calls)
+
+    await fireEvent.click(screen.getByText('Add Claude account'))
+    backend.loginStart = {
+      attempt_id: 71,
+      kind: 'codex_device',
+      verification_url: 'https://auth.openai.com/codex/device',
+      user_code: 'NEW-CODE',
+      expires_at: '2026-09-04T13:15:00Z',
+    }
+    await fireEvent.click(screen.getByText('Add Codex account'))
+    expect(await screen.findByText('NEW-CODE')).toBeTruthy()
+
+    resolveOld({
+      attempt_id: 70,
+      kind: 'claude_browser',
+      loopback: null,
+      manual: MANUAL,
+    })
+    await settle()
+
+    expect(screen.getByLabelText('Codex device code').textContent).toBe('NEW-CODE')
     expect(screen.queryByLabelText('Code from the page')).toBeNull()
+  })
+
+  it('keeps an early manual fallback when it arrives before begin_login resolves', async () => {
+    let resolveStart: (start: LoginStart) => void = () => {}
+    const pending = new Promise<LoginStart>((resolve) => {
+      resolveStart = resolve
+    })
+    const calls = mockBackend({ loginStart: pending })
+    render(Settings)
+    await whenSubscribed(calls)
+
+    await fireEvent.click(screen.getByText('Add Claude account'))
+    await emit('auth://manual-fallback', {
+      attempt_id: 61,
+      provider: 'anthropic',
+      url: MANUAL,
+      reason: 'the loopback listener failed immediately',
+    })
+    resolveStart({
+      attempt_id: 61,
+      kind: 'claude_browser',
+      loopback: 'https://claude.example/dead-loopback',
+      manual: MANUAL,
+    })
+
+    expect(await screen.findByText(/loopback listener failed immediately/)).toBeTruthy()
+    expect(screen.getByLabelText('Code from the page')).toBeTruthy()
+  })
+
+  it('does not resurrect Claude fallback when an old opener call rejects after completion', async () => {
+    let rejectOpen: (error: Error) => void = () => {}
+    const openUrl = new Promise<void>((_resolve, reject) => {
+      rejectOpen = reject
+    })
+    const calls = mockBackend({
+      loginStart: {
+        attempt_id: 81,
+        kind: 'claude_browser',
+        loopback: 'https://claude.example/loopback',
+        manual: MANUAL,
+      },
+      openUrl,
+    })
+    render(Settings)
+    await whenSubscribed(calls)
+
+    await fireEvent.click(screen.getByText('Add Claude account'))
+    await waitFor(() =>
+      expect(calls.some((call) => call.cmd === 'plugin:opener|open_url')).toBe(true),
+    )
+    await emit('auth://completed', { attempt_id: 81, provider: 'anthropic' })
+    rejectOpen(new Error('late opener failure'))
+    await settle()
+
+    expect(screen.queryByLabelText('Code from the page')).toBeNull()
+    expect(screen.queryByText(/late opener failure/)).toBeNull()
   })
 
   /**
@@ -874,7 +1305,12 @@ describe('Settings manual login fallback', () => {
    */
   it('keeps the form up when the backend refuses the code', async () => {
     mockBackend({
-      loginUrls: { loopback: null, manual: MANUAL },
+      loginStart: {
+        attempt_id: 1,
+        kind: 'claude_browser',
+        loopback: null,
+        manual: MANUAL,
+      },
       submitError: 'that code belongs to an older login attempt',
     })
     render(Settings)

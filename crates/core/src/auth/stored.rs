@@ -35,11 +35,11 @@
 
 use crate::auth::openai::{self, OpenAiAuthConfig, OpenAiTokenSet};
 use crate::auth::token::{
-    refresh as refresh_anthropic, revoke as revoke_anthropic, AuthError, TokenHttp, TokenSet,
+    refresh as refresh_anthropic, revoke as revoke_anthropic, AnthropicAuthConfig, AuthError,
+    TokenHttp, TokenSet,
 };
 use crate::provider::{
     openai_access_token_key, openai_refresh_token_key, openai_token_meta_key, token_key, Provider,
-    ProviderSpec,
 };
 use crate::secrets::{SecretError, SecretStore};
 use chrono::{DateTime, Utc};
@@ -69,8 +69,12 @@ pub enum StoredTokenError {
     Corrupt,
     #[error(transparent)]
     Secrets(#[from] SecretError),
-    #[error(transparent)]
-    Auth(#[from] AuthError),
+    #[error("{source}")]
+    Auth {
+        provider: Provider,
+        #[source]
+        source: AuthError,
+    },
 }
 
 /// The credential shape belonging to one provider.
@@ -119,15 +123,15 @@ impl StoredTokens {
     pub fn workspace_id(&self) -> Option<&str> {
         match self {
             Self::Anthropic(_) => None,
-            Self::Openai(tokens) => Some(&tokens.workspace_id),
+            Self::Openai(tokens) => tokens.workspace_id.as_deref(),
         }
     }
 
-    /// Whether OpenAI requires the FedRAMP workspace header. Always false for
-    /// Anthropic, where the concept does not exist.
-    pub fn is_fedramp(&self) -> bool {
+    /// Whether OpenAI reported FedRAMP workspace routing. `None` for Anthropic
+    /// and when the OpenAI claim was absent; only `Some(true)` emits a header.
+    pub fn is_fedramp(&self) -> Option<bool> {
         match self {
-            Self::Anthropic(_) => false,
+            Self::Anthropic(_) => None,
             Self::Openai(tokens) => tokens.is_fedramp,
         }
     }
@@ -146,14 +150,14 @@ impl StoredTokens {
 /// standalone config.
 #[derive(Debug, Clone)]
 pub struct AuthConfigs {
-    pub anthropic: ProviderSpec,
+    pub anthropic: AnthropicAuthConfig,
     pub openai: OpenAiAuthConfig,
 }
 
 impl Default for AuthConfigs {
     fn default() -> Self {
         Self {
-            anthropic: Provider::Anthropic.spec(),
+            anthropic: AnthropicAuthConfig::production(),
             openai: OpenAiAuthConfig::default(),
         }
     }
@@ -167,8 +171,10 @@ struct OpenAiTokenMeta {
     expires_at: DateTime<Utc>,
     client_id: String,
     account_id: String,
-    workspace_id: String,
-    is_fedramp: bool,
+    #[serde(default)]
+    workspace_id: Option<String>,
+    #[serde(default)]
+    is_fedramp: Option<bool>,
 }
 
 /// One lock per account, identified by provider and id together — see
@@ -271,7 +277,10 @@ fn valid_openai_tokens(tokens: &OpenAiTokenSet, account_id: &str) -> bool {
         && !tokens.client_id.trim().is_empty()
         && !tokens.account_id.trim().is_empty()
         && tokens.account_id == account_id
-        && !tokens.workspace_id.trim().is_empty()
+        && tokens
+            .workspace_id
+            .as_deref()
+            .is_none_or(|workspace| !workspace.trim().is_empty())
 }
 
 fn load_openai(
@@ -415,6 +424,92 @@ pub fn save_tokens(
     }
 }
 
+/// Opaque before-image of every secret entry owned by one account.
+///
+/// This captures raw bytes rather than a parsed [`StoredTokens`] value so a
+/// repair login can still restore an older partial or unrecognized credential
+/// exactly if a later metadata write fails. The entry keys and values stay
+/// private: hosts must not reproduce OpenAI's split-key layout.
+pub struct CredentialSnapshot {
+    provider: Provider,
+    account_id: String,
+    entries: Vec<(String, Option<Vec<u8>>)>,
+}
+
+impl std::fmt::Debug for CredentialSnapshot {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("CredentialSnapshot")
+            .field("provider", &self.provider)
+            .field("account_id", &self.account_id)
+            .field("entry_count", &self.entries.len())
+            .field("values", &"<redacted>")
+            .finish()
+    }
+}
+
+fn credential_keys(provider: Provider, account_id: &str) -> Vec<String> {
+    match provider {
+        Provider::Anthropic => vec![token_key(provider, account_id)],
+        Provider::Openai => vec![
+            openai_refresh_token_key(account_id),
+            openai_access_token_key(account_id),
+            openai_token_meta_key(account_id),
+        ],
+    }
+}
+
+/// Snapshots every raw credential entry for `(provider, account_id)`.
+///
+/// A host calls this immediately before [`save_tokens`], then passes the
+/// opaque result to [`restore_tokens`] if either that split write or its later
+/// account-metadata commit fails. No provider-specific key may be built by the
+/// host.
+pub fn snapshot_tokens(
+    store: &dyn SecretStore,
+    provider: Provider,
+    account_id: &str,
+) -> Result<CredentialSnapshot, SecretError> {
+    if account_id.trim().is_empty() {
+        return Err(SecretError::Backend("the account id is empty".into()));
+    }
+    let mut entries = Vec::new();
+    for key in credential_keys(provider, account_id) {
+        entries.push((key.clone(), store.get(&key)?));
+    }
+    Ok(CredentialSnapshot {
+        provider,
+        account_id: account_id.to_string(),
+        entries,
+    })
+}
+
+/// Restores a credential snapshot exactly, including entries that were absent.
+///
+/// Every entry is attempted even after one backend error. This gives callers
+/// the best possible restoration and a single error signal; if it returns an
+/// error, they can call provider-aware [`delete_tokens`] as final cleanup.
+pub fn restore_tokens(
+    store: &dyn SecretStore,
+    snapshot: &CredentialSnapshot,
+) -> Result<(), SecretError> {
+    let mut first_error = None;
+    for (key, value) in &snapshot.entries {
+        let result = match value {
+            Some(value) => store.put(key, value),
+            None => store.delete(key).map(|_| ()),
+        };
+        match result {
+            Ok(()) => {}
+            Err(error) if first_error.is_none() => first_error = Some(error),
+            Err(_) => {}
+        }
+    }
+    match first_error {
+        Some(error) => Err(error),
+        None => Ok(()),
+    }
+}
+
 /// Deletes every credential entry owned by one `(provider, account_id)` pair.
 /// OpenAI attempts all three deletes even if one backend call fails, then
 /// reports the first error so the caller cannot mistake partial cleanup for
@@ -431,14 +526,9 @@ pub fn delete_tokens(
         return store.delete(&token_key(provider, account_id));
     }
 
-    let keys = [
-        openai_refresh_token_key(account_id),
-        openai_access_token_key(account_id),
-        openai_token_meta_key(account_id),
-    ];
     let mut removed = false;
     let mut first_error = None;
-    for key in keys {
+    for key in credential_keys(provider, account_id) {
         match store.delete(&key) {
             Ok(found) => removed |= found,
             Err(error) if first_error.is_none() => first_error = Some(error),
@@ -569,7 +659,9 @@ async fn refresh_if_needed<H: TokenHttp>(
 
         let refresh_witness = current.refresh_token().to_owned();
         let access_witness = current.access_token().to_owned();
-        let new = refresh_tokens(http, cfg, &current).await?;
+        let new = refresh_tokens(http, cfg, &current)
+            .await
+            .map_err(|source| StoredTokenError::Auth { provider, source })?;
 
         // Compare-and-swap (§10.5). Every arm is explicit on purpose: a
         // catch-all that falls through to the write is wrong in two distinct
@@ -637,9 +729,9 @@ mod tests {
 
     async fn cfg_for(server: &MockServer) -> AuthConfigs {
         AuthConfigs {
-            anthropic: ProviderSpec {
+            anthropic: AnthropicAuthConfig {
                 token_url: format!("{}/v1/oauth/token", server.uri()),
-                ..Provider::Anthropic.spec()
+                ..AnthropicAuthConfig::production()
             },
             openai: OpenAiAuthConfig::default(),
         }
@@ -652,7 +744,7 @@ mod tests {
             expires_at: Utc::now() - TimeDelta::seconds(1),
             refresh_token_expires_at: Utc::now() + TimeDelta::days(30),
             scopes: vec!["user:profile".into()],
-            client_id: Provider::Anthropic.spec().client_id,
+            client_id: AnthropicAuthConfig::production().client_id,
         }
     }
 
@@ -979,6 +1071,56 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn an_openai_identity_change_keeps_typed_provider_context_through_storage() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "access_token": jwt_with_exp((Utc::now() + TimeDelta::hours(1)).timestamp()),
+                "id_token": jwt_with_payload(serde_json::json!({
+                    "https://api.openai.com/auth": {
+                        "chatgpt_user_id": "different-user",
+                        "chatgpt_account_id": "workspace-1"
+                    }
+                }))
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let store = MemoryStore::default();
+        let mut tokens = openai_tokens("old-at", "old-rt");
+        tokens.expires_at = Utc::now() - TimeDelta::seconds(1);
+        save_tokens(
+            &store,
+            Provider::Openai,
+            UUID,
+            &StoredTokens::Openai(tokens),
+        )
+        .unwrap();
+
+        let error = ensure_fresh(
+            &ReqwestHttp::new().unwrap(),
+            &openai_cfg_for(&server),
+            &store,
+            &RefreshLocks::default(),
+            Provider::Openai,
+            UUID,
+        )
+        .await
+        .unwrap_err();
+
+        assert!(matches!(
+            error,
+            StoredTokenError::Auth {
+                provider: Provider::Openai,
+                source: AuthError::IdentityMismatch {
+                    provider: Provider::Openai
+                }
+            }
+        ));
+    }
+
     /// docs/design.md §10.5: "if the value changed underneath us, adopt the new
     /// value rather than overwriting it." The responder simulates a re-login
     /// landing mid-refresh by storing a different chain before our request
@@ -1233,7 +1375,11 @@ mod tests {
         .unwrap_err();
 
         assert!(
-            matches!(err, StoredTokenError::Auth(ref e) if e.is_dead_grant()),
+            matches!(
+                err,
+                StoredTokenError::Auth { provider, ref source }
+                    if source.is_dead_grant_for(provider)
+            ),
             "the dead-grant flag did not survive the wrapper, got {err:?}"
         );
     }
@@ -1269,7 +1415,11 @@ mod tests {
         .unwrap_err();
 
         assert!(
-            matches!(err, StoredTokenError::Auth(ref e) if !e.is_dead_grant()),
+            matches!(
+                err,
+                StoredTokenError::Auth { provider, ref source }
+                    if !source.is_dead_grant_for(provider)
+            ),
             "a non-invalid_grant Anthropic response became terminal: {err:?}"
         );
     }
@@ -1307,19 +1457,23 @@ mod tests {
             expires_at: Utc::now() + TimeDelta::hours(2),
             client_id: "openai-client".into(),
             account_id: UUID.into(),
-            workspace_id: "workspace-1".into(),
-            is_fedramp: false,
+            workspace_id: Some("workspace-1".into()),
+            is_fedramp: Some(false),
         }
     }
 
-    fn jwt_with_exp(exp: i64) -> String {
-        let payload = URL_SAFE_NO_PAD.encode(serde_json::json!({ "exp": exp }).to_string());
+    fn jwt_with_payload(payload: serde_json::Value) -> String {
+        let payload = URL_SAFE_NO_PAD.encode(payload.to_string());
         format!("e30.{payload}.signature")
+    }
+
+    fn jwt_with_exp(exp: i64) -> String {
+        jwt_with_payload(serde_json::json!({ "exp": exp }))
     }
 
     fn openai_cfg_for(server: &MockServer) -> AuthConfigs {
         AuthConfigs {
-            anthropic: Provider::Anthropic.spec(),
+            anthropic: AnthropicAuthConfig::production(),
             openai: OpenAiAuthConfig {
                 issuer: server.uri(),
                 client_id: "openai-client".into(),
@@ -1359,6 +1513,107 @@ mod tests {
         assert_eq!(loaded.refresh_token(), "rt-SENTINEL");
     }
 
+    #[test]
+    fn absent_openai_routing_claims_round_trip_without_being_invented() {
+        let store = MemoryStore::default();
+        let mut tokens = openai_tokens("at", "rt");
+        tokens.workspace_id = None;
+        tokens.is_fedramp = None;
+
+        save_tokens(
+            &store,
+            Provider::Openai,
+            UUID,
+            &StoredTokens::Openai(tokens),
+        )
+        .unwrap();
+        let loaded = load_tokens(&store, Provider::Openai, UUID).unwrap();
+        assert_eq!(loaded.workspace_id(), None);
+        assert_eq!(loaded.is_fedramp(), None);
+    }
+
+    #[test]
+    fn an_openai_snapshot_restores_all_three_raw_entries_exactly() {
+        let store = MemoryStore::default();
+        let refresh_key = openai_refresh_token_key(UUID);
+        let access_key = openai_access_token_key(UUID);
+        let meta_key = openai_token_meta_key(UUID);
+        store.put(&refresh_key, b"old-refresh-SENTINEL").unwrap();
+        // An absent access entry and unparseable metadata deliberately model a
+        // partial credential that `load_tokens` cannot represent.
+        store.put(&meta_key, b"old-meta-SENTINEL").unwrap();
+        let snapshot = snapshot_tokens(&store, Provider::Openai, UUID).unwrap();
+
+        store.put(&refresh_key, b"new-refresh").unwrap();
+        store.put(&access_key, b"new-access").unwrap();
+        store.put(&meta_key, b"new-meta").unwrap();
+        restore_tokens(&store, &snapshot).unwrap();
+
+        assert_eq!(
+            store.get(&refresh_key).unwrap().as_deref(),
+            Some(&b"old-refresh-SENTINEL"[..])
+        );
+        assert_eq!(store.get(&access_key).unwrap(), None);
+        assert_eq!(
+            store.get(&meta_key).unwrap().as_deref(),
+            Some(&b"old-meta-SENTINEL"[..])
+        );
+        let debug = format!("{snapshot:?}");
+        assert!(!debug.contains("SENTINEL"), "snapshot leaked credentials: {debug}");
+        assert!(debug.contains("<redacted>"));
+    }
+
+    #[test]
+    fn an_anthropic_snapshot_does_not_touch_an_openai_twin() {
+        let store = MemoryStore::default();
+        store
+            .put(&token_key(Provider::Anthropic, UUID), b"old-claude")
+            .unwrap();
+        store
+            .put(&openai_access_token_key(UUID), b"codex-access")
+            .unwrap();
+        let snapshot = snapshot_tokens(&store, Provider::Anthropic, UUID).unwrap();
+
+        store
+            .put(&token_key(Provider::Anthropic, UUID), b"new-claude")
+            .unwrap();
+        restore_tokens(&store, &snapshot).unwrap();
+
+        assert_eq!(
+            store
+                .get(&token_key(Provider::Anthropic, UUID))
+                .unwrap()
+                .as_deref(),
+            Some(&b"old-claude"[..])
+        );
+        assert_eq!(
+            store.get(&openai_access_token_key(UUID)).unwrap().as_deref(),
+            Some(&b"codex-access"[..])
+        );
+    }
+
+    #[test]
+    fn openai_metadata_without_optional_routing_claims_remains_loadable() {
+        let store = MemoryStore::default();
+        store.put(&openai_access_token_key(UUID), b"at").unwrap();
+        store.put(&openai_refresh_token_key(UUID), b"rt").unwrap();
+        let meta = serde_json::json!({
+            "expires_at": Utc::now() + TimeDelta::hours(1),
+            "client_id": "openai-client",
+            "account_id": UUID
+        });
+        store
+            .put(
+                &openai_token_meta_key(UUID),
+                &serde_json::to_vec(&meta).unwrap(),
+            )
+            .unwrap();
+
+        let loaded = load_tokens(&store, Provider::Openai, UUID).unwrap();
+        assert_eq!(loaded.workspace_id(), None);
+        assert_eq!(loaded.is_fedramp(), None);
+    }
+
     /// All three sizes are checked before any write. Checking lazily would
     /// rotate the refresh entry and only then discover oversized metadata,
     /// leaving the credential half-written.
@@ -1371,7 +1626,7 @@ mod tests {
             openai_tokens(&"é".repeat(OPENAI_ENTRY_LIMIT / 2 + 1), "rt"),
             {
                 let mut tokens = openai_tokens("at", "rt");
-                tokens.workspace_id = "w".repeat(OPENAI_ENTRY_LIMIT + 1);
+                tokens.workspace_id = Some("w".repeat(OPENAI_ENTRY_LIMIT + 1));
                 tokens
             },
         ];
@@ -1573,8 +1828,8 @@ mod tests {
             expires_at: Utc::now() + TimeDelta::hours(1),
             client_id: "client".into(),
             account_id: "different-SENTINEL".into(),
-            workspace_id: "workspace".into(),
-            is_fedramp: false,
+            workspace_id: Some("workspace".into()),
+            is_fedramp: Some(false),
         };
         store
             .put(
@@ -1602,13 +1857,13 @@ mod tests {
                 expires_at: Utc::now() + TimeDelta::hours(1),
                 client_id: "client".into(),
                 account_id: UUID.into(),
-                workspace_id: "workspace".into(),
-                is_fedramp: false,
+                workspace_id: Some("workspace".into()),
+                is_fedramp: Some(false),
             };
             match field {
                 "client_id" => meta.client_id = "  ".into(),
                 "account_id" => meta.account_id = "  ".into(),
-                "workspace_id" => meta.workspace_id = "  ".into(),
+                "workspace_id" => meta.workspace_id = Some("  ".into()),
                 _ => unreachable!(),
             }
             store
@@ -1710,9 +1965,9 @@ mod tests {
             .mount(&openai_server)
             .await;
         let cfg = AuthConfigs {
-            anthropic: ProviderSpec {
+            anthropic: AnthropicAuthConfig {
                 revoke_url: format!("{}/anthropic/revoke", anthropic_server.uri()),
-                ..Provider::Anthropic.spec()
+                ..AnthropicAuthConfig::production()
             },
             openai: OpenAiAuthConfig {
                 issuer: openai_server.uri(),
@@ -1739,7 +1994,7 @@ mod tests {
     fn provider_wrappers_redact_both_openai_tokens() {
         let tokens = StoredTokens::Openai(openai_tokens("at-SENTINEL", "rt-SENTINEL"));
         assert_eq!(tokens.workspace_id(), Some("workspace-1"));
-        assert!(!tokens.is_fedramp());
+        assert_eq!(tokens.is_fedramp(), Some(false));
         let printed = format!("{tokens:?}");
         assert!(
             !printed.contains("SENTINEL"),

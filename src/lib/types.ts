@@ -32,8 +32,9 @@ export interface ResetCredits {
   /**
    * Measured 0 while `available` was 1, so the two are **not** interchangeable:
    * an account can hold a credit that does nothing for the limit it is hitting.
+   * Null means the response omitted applicability; it is unknown, never zero.
    */
-  applicable: number
+  applicable: number | null
 }
 
 /**
@@ -122,13 +123,18 @@ export function accountKey(accountId: string, provider: Provider): string {
 
 /**
  * Mirrors `StoreKind` in `src-tauri/src/state.rs`, which serializes with
- * `#[serde(rename_all = "snake_case")]`. docs/design.md §9.2 gives
- * `keychain_locked` and `no_backend` the same account state (`SECRETS_LOCKED`)
- * but **different remedies** — a passphrase opens a different, empty store on a
- * merely locked keychain — which is why this is a discriminant and not a
- * boolean. Change both sides together.
+ * `#[serde(rename_all = "snake_case")]`. docs/design.md §9.2 maps three
+ * startup conditions to the same account state (`SECRETS_LOCKED`) but gives
+ * them different remedies: unlock the OS keychain, unlock the selected
+ * encrypted file, or create the first encrypted file. That is why this is a
+ * discriminant and not a boolean. Change both sides together.
  */
-export type StoreKind = 'keychain' | 'encrypted_file' | 'no_backend' | 'keychain_locked'
+export type StoreKind =
+  | 'keychain'
+  | 'encrypted_file'
+  | 'encrypted_file_locked'
+  | 'no_backend'
+  | 'keychain_locked'
 
 /** Mirrors `StoreStatus` in `src-tauri/src/commands.rs`. Change both together. */
 export interface StoreStatus {
@@ -173,21 +179,48 @@ export interface RawResponse {
   body: string
 }
 
-/**
- * Mirrors `LoginUrls` in `src-tauri/src/commands.rs`. Change both together.
- *
- * docs/design.md §10.3 builds both URLs for one login; they share the PKCE pair
- * and differ only in `redirect_uri`, so a code issued for either can be
- * exchanged. `loopback` is null when no local socket could be bound — not a
- * failure, just the automatic half being unavailable.
- */
-export interface LoginUrls {
-  loopback: string | null
-  manual: string
+/** Mirrors tagged `LoginStart` in `src-tauri/src/commands.rs`. Change both together. */
+export type LoginStart =
+  | {
+      /** Correlates this command result with the background auth events it starts. */
+      attempt_id: number
+      kind: 'claude_browser'
+      /** Null when Claude's manual-paste route is the only available path. */
+      loopback: string | null
+      manual: string
+    }
+  | {
+      attempt_id: number
+      kind: 'codex_browser'
+      authorize_url: string
+    }
+  | {
+      attempt_id: number
+      kind: 'codex_device'
+      verification_url: string
+      /** Intentionally displayed, but still a short-lived credential. */
+      user_code: string
+      expires_at: string
+    }
+
+/** Correlated payload of `auth://completed`. Mirrors Rust; change both together. */
+export interface AuthCompleted {
+  attempt_id: number
+  provider: Provider
+}
+
+/** Correlated payload of `auth://failed`. Mirrors Rust; change both together. */
+export interface AuthFailed {
+  attempt_id: number
+  provider: Provider
+  /** Shown verbatim: it is written for the user, not for a log. */
+  message: string
 }
 
 /** Mirrors `ManualFallback` in `src-tauri/src/commands.rs`. Change both together. */
 export interface ManualFallback {
+  attempt_id: number
+  provider: 'anthropic'
   url: string
   /** Shown verbatim: it is written for the user, not for a log. */
   reason: string

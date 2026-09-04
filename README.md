@@ -1,42 +1,50 @@
 # quota-board
 
-A desktop widget showing the 5-hour and 7-day usage limits of several Claude
-accounts at once.
+A desktop widget showing the subscription usage limits of several Claude and
+Codex accounts at once.
 
-> **Status: complete but unreleased. Build it yourself — see [Installing](#installing).**
->
-> The widget, the settings window, the tray, start-at-login and both login
-> routes are implemented, and the whole thing has been run against real
-> accounts. What is missing is distribution: nothing is code-signed and no
-> version has been tagged, so there is no download.
+> Installers are available from [GitHub Releases](https://github.com/Kweiza/quota-board/releases),
+> or you can build the application yourself. The bundles are not notarized or
+> signed by a trusted publisher; read [Installing](#installing) before running
+> one.
 >
 > `crates/core` is deliberately Tauri-unaware, so the core builds and tests with
 > no GTK or WebKit present.
 
 ## Why it exists
 
-If you use more than one Claude subscription, there is no single place to see
-how much of each one's limits you have left. `claude /usage` reports the
-currently active account only.
+If you use more than one Claude or Codex subscription, there is no single place
+to see how much of each account's limits you have left. Each first-party client
+shows only its currently active account or workspace.
 
-The design turns on one observation: **the 5-hour and 7-day limits belong to the
-account, not to the machine.** So even when an account is being used on several
-remote machines, a single token held locally reports the same numbers. That
+The design turns on one observation: **usage belongs to the authenticated
+subscription context, not to the machine running the work.** A local,
+read-only query can therefore monitor accounts used on several machines. That
 collapses what could have been a distributed system — remote agents, snapshot
 sync, a central server — into one desktop app.
 
 ## How it reads usage
 
-It calls `GET https://api.anthropic.com/api/oauth/usage`, the same endpoint
-behind Claude Code's `/usage` command, which costs no inference. It never sends
-an inference request, so it never consumes the limits it reports. The OAuth
-token it holds backs that up structurally, not just by convention: it is
-requested with the `user:profile` scope only, so it never carries
-`user:inference`.
+Each provider has one read-only data source:
+
+- **Claude** — `GET https://api.anthropic.com/api/oauth/usage`, the endpoint
+  behind Claude Code's `/usage`. Its OAuth grant requests `user:profile` only,
+  without `user:inference`.
+- **Codex** — `GET https://chatgpt.com/backend-api/wham/usage`, carrying the
+  ChatGPT workspace selected during sign-in. The first-party page states that
+  Codex and ChatGPT Work share this allowance. OpenAI exposes no separate
+  non-inference scope for the grant, so the token is not proven incapable of
+  inference; quota-board enforces the boundary by never calling an inference
+  endpoint.
+
+Both calls send `User-Agent: quota-board/<version>`. The OpenAI request sends no
+`originator` or other header claiming to be Codex CLI. Neither provider's CLI
+credential file is read or written.
 
 Full architecture and rationale: [`docs/design.md`](docs/design.md).
-Measured behavior of that endpoint, including its throttling:
-[`docs/research/usage-endpoint.md`](docs/research/usage-endpoint.md).
+Measured behavior of the endpoints, including the different limits of the
+throttling evidence: [`docs/research/usage-endpoint.md`](docs/research/usage-endpoint.md)
+and [`docs/research/codex-usage-endpoint.md`](docs/research/codex-usage-endpoint.md).
 
 ## Read this before you use it
 
@@ -62,33 +70,46 @@ central or remote server, no credential sharing between users, no reading or
 writing another tool's credentials, no User-Agent or header spoofing, no
 rate-limit circumvention.
 
-### The consent screen will say "Claude Code"
+The Codex usage endpoint is undocumented too. It has been observed to agree
+with the account's own usage page, but OpenAI does not publish it as a stable
+third-party API. It may change or disappear without notice.
+
+### Provider sign-in
 
 Anthropic has no third-party OAuth client registration program, so this app has
 to reuse Claude Code's public client_id. **The OAuth consent screen therefore
 displays "Claude Code" rather than this application's name.** It is a single
 constant in one file, so if third-party registration ever becomes available,
-switching is a one-line change and a rebuild — there is no setting for it
-today.
+it can be replaced in one place.
+
+Codex sign-in follows OpenAI's public-client flow. The normal desktop path opens
+`auth.openai.com` and returns to a loopback callback on this machine. If neither
+registered callback port is available, quota-board offers OpenAI's device-code
+flow instead. Device-code sign-in is a beta OpenAI feature and may need to be
+enabled in ChatGPT security or workspace settings.
 
 ### One machine will hold all your tokens
 
-The app performs its own OAuth login per account and stores those tokens on the
-machine it runs on — it never copies credentials from anywhere else, and it
-neither reads nor writes Claude Code's credential file. The consequence is that
-one machine ends up holding valid tokens for every account you add. If it is
-compromised, all of them are exposed together.
+The app performs its own login per account and stores those tokens on the
+machine it runs on. It never copies credentials from anywhere else, and it
+neither reads nor writes Claude Code's `~/.claude/.credentials.json` or Codex
+CLI's `~/.codex/auth.json`. The consequence is that one machine ends up holding
+valid tokens for every account you add. If it is compromised, all of them are
+exposed together.
 
-Tokens go into the OS keychain when one is available, and into a file encrypted
-with a passphrase you choose (Argon2id + XChaCha20-Poly1305) when it is not —
-which is the common case on headless Linux, over SSH, and under minimal window
-managers.
+On first setup, tokens go into the OS keychain when one is available, and into
+a file encrypted with a passphrase you choose (Argon2id +
+XChaCha20-Poly1305) when it is not — which is the common case on headless Linux,
+over SSH, and under minimal window managers. Once that encrypted store exists,
+the app keeps using it on later launches rather than silently switching to an
+empty keychain; unlock it once per boot in Settings.
 
 ## Installing
 
-There is no signed release yet, so building it is the only way to install it.
-You need [Rust](https://rustup.rs) and Node 24; the pinned toolchain installs
-itself from `rust-toolchain.toml`.
+Download the bundle for your platform from
+[GitHub Releases](https://github.com/Kweiza/quota-board/releases), or build it
+locally. A source build needs [Rust](https://rustup.rs) and Node 24; the pinned
+toolchain installs itself from `rust-toolchain.toml`.
 
 ```bash
 npm ci
@@ -99,6 +120,10 @@ The installers land in `target/release/bundle/` — `.dmg` on macOS, `.msi` on
 Windows, `.deb`/`.rpm`/`.AppImage` on Linux. Prefer the `.deb` or `.rpm` on
 Linux: they are a few megabytes, while the AppImage carries its own copy of
 WebKitGTK and is an order of magnitude larger.
+
+**The published macOS `.dmg` is Apple Silicon (`aarch64`) only.** Intel Mac
+users need to build from source; the current release workflow does not produce
+an `x86_64` macOS artifact.
 
 **Nothing is notarized and there is no Developer ID.** The macOS bundle is
 ad-hoc signed, which is enough for the app to run but not enough for Gatekeeper
@@ -131,15 +156,10 @@ Approving each one restores every account. Dismissing instead is expected to
 leave that account reading as locked until the next launch you do approve; that
 branch has not been measured.
 
-**Codex (ChatGPT) accounts read a subscription usage endpoint too.**
-`GET https://chatgpt.com/backend-api/wham/usage` reports a Codex account's
-limits the same way `/api/oauth/usage` does for Claude, and it is held to the
-same rule: an honest `quota-board/<version>` User-Agent is sent, and nothing
-here impersonates the Codex CLI. Its 180-second polling floor is **borrowed**,
-not measured the way Claude's is — no run against this endpoint has ever
-produced a 429, so there is no boundary to derive a floor from, only a point
-(60-second polling for 89 minutes) known to be safe. See
-[`docs/research/codex-usage-endpoint.md`](docs/research/codex-usage-endpoint.md).
+Codex uses the same conservative 180-second polling floor as Claude, but for a
+different evidentiary reason. One Codex account returned 90 successful reads at
+roughly 60-second intervals over 89 minutes without a 429. That establishes a
+safe point, not a throttle boundary, a multi-account budget, or a daily cap.
 
 ### Linux
 
@@ -159,10 +179,11 @@ produced a 429, so there is no boundary to derive a floor from, only a point
   `libappindicator-gtk3` on Fedora), but **the `.rpm` has never been
   install-tested**, so treat a failed install there as a name to correct rather
   than as a missing library.
-- **A Secret Service provider** (GNOME Keyring, KWallet) holds your tokens if
-  one is running. Without one — headless boxes, bare window managers — the app
-  falls back to a passphrase-encrypted file that has to be unlocked once per
-  boot, in Settings.
+- **A Secret Service provider** (GNOME Keyring, KWallet) holds tokens when it
+  is available at the first backend selection. Without one — headless boxes,
+  bare window managers — the app selects a passphrase-encrypted file that has
+  to be unlocked once per boot in Settings. Once that file exists it stays the
+  selected backend, even if a Secret Service provider appears later.
 - **Do not expect a 30MB tray app.** That figure is quoted for Tauri often and
   is not true on Linux, where the webview is a separate WebKitGTK process tree.
   Published measurements of a *default* Tauri app on Ubuntu put it around 185MB
@@ -180,20 +201,22 @@ its own; **everything that is not a usage row lives in two places.**
 - **The tray icon** shows or hides the widget and quits the app. `Ctrl+Alt+Q`
   toggles the widget too, where the OS allows it.
 
-To add an account, press **Add account** in Settings and approve in the browser
-that opens. If the browser cannot be opened, or is on another machine, the
-window falls back to a link you can copy anywhere and a box to paste the
-resulting code into.
+To add an account, choose the equally weighted **Claude** or **Codex** card in
+Settings. Claude opens its browser flow and retains a copy/paste fallback.
+Codex normally returns through a local browser callback and offers a device code
+when the registered callback ports are unavailable. The widget, account list,
+controls, and Debug selector always show the full provider name.
 
 ## Uninstalling
 
 Removing the application leaves three things behind, and none of them are
 removed for you:
 
-- **Your tokens**, in the OS keychain under the service name `quota-board`, one
-  entry per account. Delete them in Keychain Access on macOS, `seahorse` or
+- **Your tokens**, in the OS keychain under the service name `quota-board`.
+  Delete them in Keychain Access on macOS, `seahorse` or
   `secret-tool` on Linux, or Credential Manager on Windows. Removing an account
-  in Settings first also revokes it server-side, which is the tidier route.
+  in Settings first attempts best-effort server-side revocation, then removes
+  the local credential even when revocation is unavailable.
 - **Account metadata and settings**, in `quota-board/` under your platform's
   config directory — no tokens are in there.
 - **A login item**, if you enabled start-at-login: `Quota Board.plist` in
@@ -231,4 +254,5 @@ For anything involving credentials, report it privately: see
 
 MIT. See [LICENSE](LICENSE).
 
-This project is not affiliated with, endorsed by, or sponsored by Anthropic.
+This project is not affiliated with, endorsed by, or sponsored by Anthropic or
+OpenAI.

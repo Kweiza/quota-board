@@ -16,8 +16,10 @@ The constraints that follow from them are §3. Everything after that is detail.
 
 ### 2.1 Limits are per-account
 
-**The 5-hour and 7-day limits belong to the account (the subscription) and are
-independent of the machine.**
+**Provider-reported limits belong to the authenticated subscription context
+and are independent of the machine doing the work.** Claude reports an account;
+Codex additionally distinguishes the signed-in user from the selected ChatGPT
+workspace whose quota is queried.
 
 An earlier draft of this project assumed that because actual usage happens on
 remote machines, usage had to be collected from those remote machines. But
@@ -33,7 +35,7 @@ As a consequence, all of the following disappear from the design:
 
 The entire system shrinks to **a single desktop application**.
 
-### 2.2 A free query endpoint exists
+### 2.2 Read-only query endpoints exist
 
 `GET https://api.anthropic.com/api/oauth/usage` returns usage at **zero
 inference cost**. It is the endpoint behind Claude Code's `/usage` command.
@@ -46,11 +48,18 @@ response headers — can only be obtained by actually sending a
 `POST /v1/messages` inference request, which consumes the very limit being
 measured. **We do not adopt that path.** See §12.6.
 
+Codex's counterpart is
+`GET https://chatgpt.com/backend-api/wham/usage`. It agrees with the account's
+own usage page and accepts an honest third-party User-Agent. Repeated reads did
+not move its figures, but the measured accounts were at a 0% floor, so the
+evidence for zero consumption is weaker than it is for Claude. Neither path is
+an inference endpoint.
+
 ## 3. The constraints that follow
 
 ### 3.1 Cost is not the constraint; throttling is
 
-Free does not mean unlimited. This endpoint is subject to 429 throttling, and
+Free does not mean unlimited. Anthropic's endpoint is subject to 429 throttling, and
 **the budget is allocated per access token and per User-Agent tier.**
 
 Sending `User-Agent: claude-code/<version>` places a client in the generous
@@ -58,14 +67,17 @@ first-party bucket. **We do not do this** (§5.2). We therefore remain in the
 narrow bucket. Measurement puts the sustainable rate at roughly one request per
 120 seconds per token; see docs/research/usage-endpoint.md and §6.2.1.
 
-**Consequence: the polling floor is 3 minutes per account.** That value is set
-by throttling, not by cost. The default interval is 5 minutes.
+**Consequence: the polling floor is 3 minutes per account.** For Claude that
+value is set by the measured throttle boundary, not by cost. For Codex it is a
+conservative policy: one account sustained roughly 60-second reads for 89
+minutes without a 429, so 60 seconds is a known-safe point rather than a
+measured boundary. The default interval is 5 minutes for both.
 
 ### 3.2 The app holds its own tokens, and that concentrates risk
 
 The app performs its own OAuth login per account and stores the issued tokens
 on the machine it runs on. It does not copy tokens from anywhere else, and it
-neither reads nor writes Claude Code's credential file (§9.3).
+neither reads nor writes Claude Code's or Codex CLI's credential file (§9.3).
 
 The consequence is that **one machine ends up holding valid tokens for every
 account you add**. If that machine is compromised, all of those accounts are
@@ -98,6 +110,12 @@ This project's response to that last point is §5.2 and §16.1. Because this
 ships as open source, the risk transfers to third parties who install it, so it
 is disclosed in the README as well as here.
 
+OpenAI documents ChatGPT subscription sign-in for Codex clients, but it does
+not document `wham/usage` as a stable third-party API or describe this polling
+use case. The project therefore makes no claim of endorsement or durability on
+that side either. The same concrete policy applies: an honest client identity,
+no credential import, no inference, and no rate-limit circumvention.
+
 ## 4. Architecture
 
 A single Tauri v2 application. No remote machines, no central server, no agents
@@ -112,10 +130,11 @@ webview pushes).
 
 | Module | Responsibility | Depends on |
 |---|---|---|
-| `provider` | `Provider`, and every constant that differs between the two: endpoint URLs, scopes, token body style, polling floor, token-key format | — |
+| `provider` | `Provider`, polling floors, and provider/account key formats | — |
 | `accounts` | Account metadata CRUD. JSON file. **Contains no tokens** | `provider`, filesystem |
-| `secrets` | Token store abstraction. Keychain first, encrypted file as fallback | `keyring`, filesystem |
-| `auth` | PKCE OAuth flow, token refresh and revocation | `secrets`, HTTP |
+| `secrets` | Token store abstraction. Keychain on first selection; existing encrypted fallback thereafter | `keyring`, filesystem |
+| `auth::pkce`, `auth::token` | Claude browser PKCE, token refresh and revocation | `secrets`, HTTP |
+| `auth::openai` | Codex browser/device authorization, ID-token claim parsing, refresh and revocation | `secrets`, HTTP |
 | `usage` | One valid token → a list of usage windows. **The only module that knows either provider's usage API** | `auth` (for its HTTP client), HTTP |
 | `scheduler` | Polling, manual refresh, visibility gating, throttle management, snapshot retention, failure classification | the four above |
 | webview | Widget rendering, settings forms | Tauri IPC |
@@ -157,11 +176,11 @@ the production entry point is the same function with §5.1's URL. `usage`
 therefore takes `auth`'s concrete HTTP client — the dependency edge in §4.1 and
 §4.2 — rather than a trait of its own.
 
-The reason is `Retry-After`. `auth`'s HTTP trait (`TokenHttp::get_json`) returns
-only a deserialized body and discards the response headers, so it cannot carry
-that header at all — and §6.2 makes `Retry-After` the input to the entire
-throttle policy. A second HTTP trait, shaped to carry headers and used by
-exactly one caller, would buy nothing that injecting the URL does not.
+The reason is `Retry-After`. `auth`'s HTTP trait is shaped around typed token
+POSTs and returns only a deserialized body, so it cannot carry response headers
+at all — and §6.2 makes `Retry-After` the input to the entire throttle policy.
+A second HTTP trait, shaped to carry headers and used by exactly one caller,
+would buy nothing that injecting the URL does not.
 
 **The property the trait was there for is unchanged**: every `usage` test runs
 against a loopback mock, and no test touches the network or consumes throttle
@@ -193,18 +212,14 @@ The following two paths are **explicitly out of scope**:
   account, making it unsuitable for a multi-account monitor, and it requires
   Claude Code to be installed and running.
 
-**Losing this endpoint ends the product.** Not degraded performance —
-termination.
-
-> This claim, and its restatement at §12.6, predate Codex existing as an
-> independent second data source (§5.6). Whether losing this one endpoint still
-> ends *the product* — as opposed to ending its Claude side while Codex
-> accounts keep working — is unresolved and is not decided here.
+**Losing this endpoint ends Claude support.** It is not a degraded Claude mode:
+the only confirmed alternative consumes inference. Codex accounts can continue
+through their independent source in §5.6.
 
 ### 5.2 User-Agent policy (a non-goal)
 
-**We send an honest `quota-board/<version>`. We never impersonate
-`claude-code/<version>`.**
+**We send an honest `quota-board/<version>` to both providers. We never
+impersonate Claude Code or Codex CLI.**
 
 The community's standard workaround for the 429 problem is User-Agent
 impersonation, but that falls squarely inside the one unambiguous prohibition
@@ -212,8 +227,11 @@ quoted in §3.3. There is precedent: in March 2026 OpenCode received a legal
 request and removed the `claude-code-20250219` beta header and its Anthropic
 auth plugin.
 
-For `anthropic-beta` we send only `oauth-2025-04-20`. We send no other header
-that identifies Claude Code.
+For `anthropic-beta` we send only `oauth-2025-04-20`, and only to Anthropic. We
+send no other header that identifies Claude Code. OpenAI receives no
+`originator` or Codex capability header. `ChatGPT-Account-ID` and the
+conditional FedRAMP routing flag are account context derived from the grant,
+not claims that this client is Codex CLI.
 
 **The price is stated explicitly: we chose to remain in the narrow throttle
 bucket, and that is why the polling floor is 3 minutes rather than seconds.**
@@ -264,10 +282,10 @@ struct UsageWindow {
     percent: f64,              // always 0-100
     resets_at: DateTime<Utc>,
     scope: Option<String>,     // model name for per-model weekly windows
-    source: Source,
-    fetched_at: DateTime<Utc>,
 }
 ```
+
+Fetch time belongs to the surrounding account state, not to each window.
 
 ### 5.5 Schema tolerance
 
@@ -287,6 +305,8 @@ fields observed: `seven_day_cowork`, `seven_day_omelette`, `spend{}`,
 ```
 GET https://chatgpt.com/backend-api/wham/usage
 Authorization: Bearer <access_token for the account>
+ChatGPT-Account-ID: <workspace_id>      # only when the grant supplies one
+X-OpenAI-Fedramp: true                  # only when the grant explicitly says true
 User-Agent: quota-board/<version>
 Accept: application/json
 ```
@@ -303,14 +323,39 @@ Spike G for what was and was not found about its throttling —
 floor chosen as a margin, not derived from a measured boundary, because none was
 found).
 
-`rate_limit_reset_credits` arrives in the same response, so the widget's
-reset-credit line needs no second request to populate.
+The earlier bearer-only measurement covered two personal accounts whose user
+and workspace-shaped identifiers coincided. It did not establish how to select
+one of several workspaces. Codex's ID-token type makes
+`chatgpt_account_id` optional; quota-board reproduces the official behavior by
+sending the header when that claim is present and leaving it absent otherwise.
 
-**Every account measured read 0% throughout.** `secondary_window`,
-`additional_rate_limits`, and `code_review_rate_limit` were `null` in every
-capture, so the shape a populated window takes is not measured — §5.5's schema
-tolerance and the never-demote-to-0% rule carry the design across that gap, but
-the gap itself stays open until an account with usage in flight is observed.
+Every successful Codex response is accepted only when its `user_id` equals the
+requested row's `account_id`. When the grant supplied a workspace, the response
+`account_id` must also equal that `workspace_id`. A missing or mismatched value
+that was available to verify becomes `UNKNOWN_SHAPE`, including the reset-credit
+line: a readable 200 is not evidence that its quota belongs to the row when a
+known requested context was ignored or misrouted. With no workspace claim,
+the user match is the strongest identity proof available; the app does not
+invent a workspace from the user id or response.
+
+`rate_limit_reset_credits` arrives in the same response, so the widget's
+reset-credit line needs no second request to populate. Only `available_count`
+is guaranteed by the current official contract; the older
+`applicable_available_count` is optional and absence remains unknown, never 0.
+The first-party usage page states that Codex and ChatGPT Work share this
+allowance, so the Settings card says so rather than implying that only Codex
+activity can move the number.
+
+A later sanitized paid-account capture measured both populated slots:
+`primary_window` was 5h at 31% and `secondary_window` was 7d at 6%. Free-plan
+captures also measured a 30d primary window. `additional_rate_limits` is still
+not live-measured by this project, but its populated wire shape and multi-bucket
+semantics are evidenced by the current
+[official app-server contract](https://learn.chatgpt.com/docs/app-server)
+and the open-source Codex client. The parser therefore normalizes every
+readable bucket dynamically rather than assuming exactly two windows.
+`code_review_rate_limit` remains unmeasured and unused. Full chronology and
+evidence grades are in the research document.
 
 ## 6. Polling policy
 
@@ -335,6 +380,10 @@ the gap itself stays open until an account with usage in flight is observed.
 > jitter starts earning its cost.
 
 ### 6.2 Interpreting Retry-After (two meanings)
+
+The table below is measured for Anthropic. Codex uses the same conservative
+scheduler behavior if a 429 arrives, but no Codex 429 or `Retry-After` value has
+yet been observed; that is an implementation fallback, not Codex evidence.
 
 | Value | Meaning | Response |
 |---|---|---|
@@ -415,12 +464,21 @@ becomes visible again.** Burning budget while nobody is looking means taking a
 ### 6.4 Manual refresh
 
 **Manual refresh fires immediately. It is not rate-limited client-side, and it
-waits for the global permit rather than giving up on it.** Every account row —
-in the widget and in the settings window — carries its own refresh control.
+waits for the global permit rather than giving up on it.** Every account row
+whose grant can still be retried carries its own refresh control, in the widget
+and in the settings window.
 
-The one thing that still refuses a press is §6.2's server-ordered wait. When a
-429's `Retry-After` has not run out, do not fire; display **"throttled,
-available after HH:MM"** instead.
+The one scheduling rule that still refuses a press is §6.2's server-ordered
+wait. Check it again after acquiring the global permit: a second press may have
+queued while the first request was still running, and that first request can
+establish `Retry-After` before the second acquires the permit. When the wait has
+not run out, do not fire; display **"throttled, available after HH:MM"**
+instead.
+
+`AUTH_DEAD` is not a scheduling refusal: it is a quarantined grant for which
+§7.2 says there must be no retry. The backend command returns the existing state
+without touching the network, and both views omit or disable the generic
+refresh control; re-login remains its only remedy.
 
 > **This reverses an earlier draft, which applied §6.1's 180-second floor to the
 > manual path as well.** Three things were wrong with it.
@@ -463,7 +521,8 @@ affect another account's display.
 | `STALE(last_good, age)` | Automatic poll failed, last value retained | value + "n minutes ago", dimmed |
 | `THROTTLED(retry_after)` | 429 | "throttled, after HH:MM" |
 | `AUTH_EXPIRED` | Access token expired, refresh in progress | loading |
-| `AUTH_DEAD` | `invalid_grant`, refresh chain permanently dead | "re-login required" (click starts OAuth) |
+| `AUTH_DEAD` | Refresh chain permanently dead | "re-login required" (click starts OAuth) |
+| `OAUTH_NOT_ALLOWED` | Provider temporarily refuses OAuth for this subscription context | "access not available" |
 | `SECRETS_LOCKED` | Token store locked — OS keychain locked, or fallback passphrase not entered | "unlock" (click prompts for input) |
 | `UNKNOWN_SHAPE` | Response parsing failed | "unknown" (not 0%) |
 | `NETWORK` | Network error | treated the same as `STALE` |
@@ -488,7 +547,10 @@ rows that are decisions rather than mechanics:
   to the encrypted file (§9.2) and is not meant to reach an account state at
   all; a backend failure is usually transient; `TooLong` is permanent but has no
   state of its own. All three render as the last value with its age.
-- `invalid_grant` → `AUTH_DEAD` on one strike (§10.5).
+- `invalid_grant` → `AUTH_DEAD` on one strike (§10.5). OpenAI's terminal 401,
+  identity mismatch, and `refresh_token_reused`, `refresh_token_expired`, or
+  `refresh_token_invalidated` responses map there too. An arbitrary Anthropic
+  401 does not inherit OpenAI's rule.
 - A transport failure while refreshing → `NETWORK`. A failed connection is not
   an auth failure, and treating it as one eventually quarantines an account
   over a flaky link.
@@ -572,11 +634,18 @@ follows content.
 **The fact that the number of bars can differ per account is the central
 constraint of this layout** (§5.3).
 
-**Every account row carries its own `↻`, on every state** — including the ones
-with no numbers to show, which are the rows most worth retrying. It fires
-immediately (§6.4). It stays at full strength on a dimmed stale row: staleness
-is when the user most wants to press it, so dimming the one remedy the row
-offers would point the affordance the wrong way.
+Every row starts with a visible, neutral text badge spelling **Claude** or
+**Codex** in full. Provider identity does not use the green/teal/yellow/red
+channel, because that channel already means utilization severity. The same
+full names appear in Settings controls and the Debug selector.
+
+**Every retryable account row carries its own `↻`**, including the states with
+no numbers to show, which are often the rows most worth retrying. `AUTH_DEAD` is
+the one exception: the backend cannot retry a quarantined grant, so that row
+offers re-login instead of a generic refresh. The refresh fires immediately
+(§6.4) and stays at full strength on a dimmed stale row: staleness is when the
+user most wants to press it, so dimming the one remedy the row offers would
+point the affordance the wrong way.
 
 ### 8.2 Color warning steps
 
@@ -611,13 +680,13 @@ Requires the `core:window:allow-start-dragging` capability.
 
 A separate, ordinary (decorated) window, entered via the widget's gear icon.
 
-- **Account list**: add / remove / edit display name / reorder
-- **Add account**: browser OAuth → added automatically on completion. No limit
-  on account count
+- **Account list**: provider name / add / remove / edit display name / reorder
+- **Add account**: equal Claude and Codex cards. Claude uses browser OAuth with
+  its manual-paste fallback; Codex uses its browser callback with device code
+  as the port-unavailable fallback. No limit on account count
 - **Polling interval** (floor 180 seconds) plus a "roughly N queries per day"
   readout
 - **Launch at login** toggle
-- **Opacity**
 - **Store status**: whether the current tokens live in the OS keychain or in
   the encrypted file (§9.2)
 - **Debug**: view the last raw JSON response (§5.5)
@@ -636,8 +705,8 @@ For the tray to appear on Linux, `libayatana-appindicator3-1` must be
 installed. Without it the icon **silently** fails to appear, so it is declared
 as a package dependency.
 
-The global hotkey is bound to toggling widget visibility and is reconfigurable
-in settings. Per §11.1, however, registration fails under pure Wayland.
+The global hotkey is fixed at Ctrl+Alt+Q and toggles widget visibility. Per
+§11.1, however, it requires X11.
 
 ## 9. Storage
 
@@ -655,11 +724,15 @@ username is hardcoded anywhere.**
 
 ### 9.2 Token store (the `secrets` module)
 
-**OS keychain first, encrypted file as fallback.**
+**OS keychain on first selection; an existing encrypted fallback thereafter.**
 
-When a keychain is available, use it — it unlocks automatically at login, which
-suits launch-at-login. Otherwise fall back to a file encrypted with a user
-passphrase.
+On the first backend selection, when a keychain is available, use it — it
+unlocks automatically at login, which suits launch-at-login. Otherwise fall
+back to a file encrypted with a user passphrase. **Once that encrypted file
+exists, it remains the selected backend on later launches and is unlocked with
+its passphrase before any keychain probe.** A Secret Service daemon can appear
+later; selecting its empty keychain would make every valid fallback credential
+look missing and persist `AUTH_DEAD` for all of those accounts.
 
 The need for this fallback is not hypothetical. **The Linux Secret Service
 requires *both* a D-Bus session bus and a daemon owning
@@ -676,7 +749,7 @@ How those map onto account states (§7.1):
 - `NO_BACKEND` → switch to the fallback store. Not surfaced as an account
   state. Prompt once to set a passphrase, then prompt for it on every
   subsequent run.
-- `LOCKED` (keychain locked) or fallback passphrase not entered →
+- `LOCKED` (keychain locked), or the selected fallback's passphrase not entered →
   `SECRETS_LOCKED`.
 - `NOT_FOUND` → treat that account as `AUTH_DEAD` (re-login required).
 
@@ -700,12 +773,20 @@ vanishes on reboot.
 
 ### 9.3 Key structure and isolation
 
-- **The account primary key is `account.uuid` from the OAuth token response.**
-  Email is for display and is user-editable. Neither email nor a user label is
-  ever used as a key.
-- Store entries are keyed **uniquely by `account.uuid` under our own service
-  name**. Lookups must be exact-key lookups, never "the first entry whose
-  service matches."
+- **The account primary key is `(provider, account_id)`.** The Rust field is
+  serialized under the legacy name `uuid`, but it is not necessarily a UUID:
+  Codex issues `user-…` identifiers. Email and the user label are display-only
+  and are never keys.
+- Codex additionally stores the optional `workspace_id` claim as request
+  context. It is not the row key: two users can belong to one workspace. Once a
+  row has a known workspace, an update cannot erase or change it. The current
+  schema cannot represent two known workspace grants for one OpenAI user, so it
+  refuses the second rather than silently overwriting the first. If the issuer
+  supplies no workspace claim, the limitation cannot be resolved by guessing;
+  that grant remains bearer-only and keyed by the user id.
+- Store entries are keyed **uniquely by the provider/account pair under our own
+  service name**. Lookups must be exact, never "the first entry whose service
+  matches."
 - **The key format is deliberately asymmetric between providers**, not for lack
   of taste. Anthropic entries stay unprefixed (`<uuid>:tokens`) because changing
   that format orphans every existing keychain entry — the lookup falls to
@@ -714,8 +795,24 @@ vanishes on reboot.
   the start (`openai:<id>:tokens`): the token store is the one place a bug
   means credential loss, so it carries no migration to get wrong. See
   `provider::token_key`.
-- Per-entry JSON blob:
+- Anthropic's existing per-account JSON blob is frozen for compatibility:
   `{ access_token, refresh_token, expires_at, refresh_token_expires_at, scopes[], client_id }`
+
+- Codex starts namespaced and splits its credential into
+  `openai:<id>:tokens:{access,refresh,meta}`. Access and refresh tokens are raw
+  secret bytes; `meta` holds only the client, user, workspace, expiry and
+  FedRAMP context needed to interpret them. Each entry is bounded below the
+  Windows credential limit. Refresh is written first, access second and
+  metadata last: a crash after the first write leaves a recoverable new refresh
+  chain rather than a new access token paired with a dead old refresh token.
+
+  A login host never snapshots one of those keys by name. `snapshot_tokens`
+  captures an opaque, redacted raw before-image of all provider-owned entries;
+  `restore_tokens` restores both present and absent entries when either the
+  split save or the later account-metadata commit fails. If restoration itself
+  fails, provider-aware `delete_tokens` is the final cleanup so no partial new
+  grant is intentionally left behind. The same API covers Anthropic's single
+  legacy entry and Codex's three entries.
 
   > **Windows Credential Manager has a hard 2560-byte limit per credential
   > blob** (`CRED_MAX_CREDENTIAL_BLOB_SIZE`). Packing the access token and
@@ -725,7 +822,8 @@ vanishes on reboot.
   > before checking, giving an effective limit of about 1280 ASCII characters —
   > **use the byte API (`set_secret`).**
 - Metadata file:
-  `{ uuid, display_label, email, created_at, last_ok_at, quarantined }` —
+  `{ uuid, provider, workspace_id?, is_fedramp, display_label, email,
+  created_at, last_ok_at, quarantined }` —
   **no tokens**
 - **Every cache is fingerprinted with a one-way hash of the current access
   token.** Re-logging in invalidates the cache immediately.
@@ -737,14 +835,16 @@ vanishes on reboot.
 > until the TTL. #486: a prefetch lock was never released, producing spurious
 > `[Timeout]` after an account switch.
 
-- **`~/.claude/.credentials.json` is neither read nor written.** This app does
-  not depend on, interoperate with, or interfere with another tool's credential
-  storage.
+- **`~/.claude/.credentials.json` and `~/.codex/auth.json` are neither read nor
+  written.** This app does not depend on, interoperate with, or interfere with
+  another tool's credential storage.
 
 ## 10. OAuth (the `auth` module)
 
-authorization_code + PKCE (S256), public client, no client_secret. No
-device-code alternative exists.
+Both providers use public clients with no client secret, but their protocols
+are not one generic OAuth flow. Claude uses authorization_code + PKCE with a
+manual-paste alternative. Codex uses authorization_code + PKCE at fixed
+loopback callbacks, with device authorization as a fallback.
 
 ### 10.1 Endpoints
 
@@ -761,26 +861,24 @@ Note that authorize is **not** `claude.ai/oauth/authorize`. Many older
 integration clients still use that address. `claude.ai` itself is not used for
 token or usage traffic at all.
 
-**OpenAI (Codex)**, from `auth.openai.com`'s discovery document
-(`/.well-known/openid-configuration`) and cross-checked against the codex
-binary's own request log — docs/research/codex-usage-endpoint.md, "OAuth
-endpoints":
+**OpenAI (Codex)**, from the official Codex 0.153.2 source. Discovery advertises
+different `/api/accounts/oauth/*` endpoints, but they are not the endpoints the
+official client executes:
 
 | Purpose | URL |
 |---|---|
-| authorize | `https://auth.openai.com/api/accounts/authorize` |
-| token (discovery-advertised) | `https://auth.openai.com/api/accounts/oauth/token` |
-| token (CLI-observed) | `https://auth.openai.com/oauth/token` |
-| revoke | `https://auth.openai.com/api/accounts/oauth/revoke` |
+| browser authorize | `https://auth.openai.com/oauth/authorize` |
+| token exchange / refresh | `POST https://auth.openai.com/oauth/token` |
+| revoke | `POST https://auth.openai.com/oauth/revoke` |
+| browser callback | `http://localhost:1455/auth/callback` (fallback port 1457) |
+| device start | `POST https://auth.openai.com/api/accounts/deviceauth/usercode` |
+| device poll | `POST https://auth.openai.com/api/accounts/deviceauth/token` |
+| device verification | `https://auth.openai.com/codex/device` |
+| device exchange redirect | `https://auth.openai.com/deviceauth/callback` |
 
-**The CLI does not use the token endpoint its own issuer advertises** — its
-request log records the second URL above instead. `Provider::spec` uses the
-discovery-advertised one, because it is the documented contract; the
-CLI-observed one is recorded rather than adopted, so it is one grep away
-(`crates/core/src/provider.rs`) the day a refresh starts failing against it.
-**No OAuth flow has ever been run against either** — every row in this table
-comes from discovery or from reading the binary, not from a completed
-authorize/token exchange.
+These are source-derived until §13 records a live quota-board lifecycle. The
+distinction matters: source establishes what the official client does; it does
+not turn a third-party implementation into a measured success.
 
 ### 10.2 client_id
 
@@ -794,16 +892,26 @@ registration program, so reusing it is unavoidable.**
 **Visible consequence: the OAuth consent screen displays "Claude Code" rather
 than this application's name.** This is stated in the README.
 
-It is **overridable** via settings or an environment variable, so that if
-Anthropic ever issues third-party client_ids we can switch immediately.
+It is centralized so that if Anthropic ever issues a third-party client ID it
+can be replaced without rewriting the flow. There is no production setting for
+it today.
+
+Codex uses OpenAI's public client:
+
+```
+app_EMoamEEZ73f0CkXaXp7hrann
+```
+
+Reuse of either public client is disclosed. It never changes the identity sent
+on the wire: HTTP requests still identify this application as quota-board.
 
 ### 10.3 Flow
 
-**PKCE**: verifier = base64url(32 random bytes), with `+`→`-`, `/`→`_`, and `=`
+**Claude PKCE**: verifier = base64url(32 random bytes), with `+`→`-`, `/`→`_`, and `=`
 stripped. challenge = base64url(sha256(verifier)). `state` is an independent
 base64url(32 random bytes).
 
-**authorize query** (in this exact order): `code=true`, `client_id`,
+**Claude authorize query** (in this exact order): `code=true`, `client_id`,
 `response_type=code`, `redirect_uri`, `scope` (space-joined), `code_challenge`,
 `code_challenge_method=S256`, `state`.
 
@@ -811,17 +919,17 @@ The leading non-standard `code=true` makes the server render a pasteable
 `code#state` page — it is what makes the manual fallback possible, so it is
 retained.
 
-**Redirect**: bind an HTTP server to an OS-assigned port (port 0) on
+**Claude redirect**: bind an HTTP server to an OS-assigned port (port 0) on
 `127.0.0.1` with the path `/callback`. **The redirect_uri string is literally
 `http://localhost:<port>/callback` even though the socket binds to 127.0.0.1.**
 Validate `state` before accepting the code (on mismatch, 400 "Invalid state
 parameter"). Then 302-redirect the browser to the success URL.
 
-**Always construct both URLs.** Open the browser with the loopback URL and
+**For Claude, always construct both URLs.** Open the browser with the loopback URL and
 display the manual URL as a fallback. The manual-paste format is
 `<code>#<state>`, split on `#`, with both parts required.
 
-**Token exchange**: POST, `Content-Type: application/json`, with a **JSON body,
+**Claude token exchange**: POST, `Content-Type: application/json`, with a **JSON body,
 not form-encoded**:
 
 ```json
@@ -832,9 +940,46 @@ not form-encoded**:
 Including `state` in the token body is non-standard, but it is the shape this
 server expects. Timeout 30 seconds; 401 means "Invalid authorization code".
 
-**Token response**: `access_token`, `refresh_token`, `expires_in`,
+**Claude token response**: `access_token`, `refresh_token`, `expires_in`,
 `refresh_token_expires_in` (non-standard), `scope` (space-separated string),
 and optionally `account:{uuid, email_address}` and `organization:{uuid}`.
+
+**Codex browser flow.** Bind `127.0.0.1:1455`, then the allowlisted fallback
+1457, before building the URL. The redirect string uses literal `localhost` and
+path `/auth/callback`. Its authorize query contains `response_type=code`, the
+public client ID, redirect, minimal scopes, S256 challenge,
+`id_token_add_organizations=true`, and independent state. It deliberately omits
+the official client's `originator=codex_cli_rs` and CLI-simplified flag. If the
+minimal honest request is refused, that is a policy blocker, not permission to
+impersonate the CLI.
+
+The browser code is exchanged as `application/x-www-form-urlencoded`, with
+`grant_type`, code, exact redirect, client ID and verifier. `state` is validated
+at the callback and is not put in the token body. The response's ID token is
+decoded immediately for identity and then discarded; it is not persisted.
+
+**Codex device fallback.** If both registered callback ports are unavailable,
+request a user code with JSON, display the verification URL and code, and poll
+in Rust at the bounded server interval for no more than 15 minutes. A missing or
+zero interval uses the OAuth device-flow default of five seconds; hostile or
+malformed values are capped at the same 15-minute deadline. A 404 from the
+initial request means device authorization is unavailable, not a reason to
+invent a redirect. The successful device poll yields an authorization code and
+verifier which use the same form exchange as the browser flow.
+
+Codex identity comes from namespaced ID-token claims: `chatgpt_user_id`, then
+the nested auth `user_id`, is the row's `account_id`; an optional
+`chatgpt_account_id` is workspace routing context. Email falls back from the
+top-level claim to the profile claim. `chatgpt_account_is_fedramp` is retained
+only to reproduce the account's routing context; absence stays distinct from
+an explicit false during refresh even though neither sends a header.
+
+Every login start and every completion, failure, or manual-fallback event
+carries the same monotonically increasing attempt id and its provider. The
+webview applies an event only to the attempt it is currently presenting. This
+is load-bearing for Claude's manual path: an abandoned manual attempt can be
+replaced while an event from it is already queued, and a provider-only event
+would otherwise retire the newer Codex or Claude login UI.
 
 ### 10.4 Scopes
 
@@ -864,18 +1009,18 @@ and the server issued it.
 We do not request `org:create_api_key`, `user:sessions:claude_code`,
 `user:mcp_servers`, or `user:file_upload` — they are not needed.
 
-**OpenAI's counterpart.** Discovery's advertised scope list for OpenAI
-(`openid`, `profile`, `email`, `offline_access` — §10.1) contains nothing
+**OpenAI's counterpart.** Codex requests `openid`, `profile`, `email`, and
+`offline_access`. The list contains nothing
 resembling `user:inference`, so there is no inference scope to decline the way
 Anthropic's is declined above. **That is not evidence the resulting token
 cannot run inference** — access there is likely account-based rather than
 scope-gated. Establishing otherwise would mean sending an inference request,
 which this project forbids outright, so it stays unmeasured and is stated that
-way (docs/research/codex-usage-endpoint.md, "OAuth endpoints").
+way (docs/research/codex-usage-endpoint.md, the 2026-09-04 addendum).
 
 ### 10.5 Expiry and refresh
 
-Store `expires_at = now + expires_in * 1000` (absolute epoch ms). Treat as
+For Claude, store `expires_at = now + expires_in * 1000` (absolute epoch ms). Treat as
 expired when `now + 300_000 >= expires_at` (a 5-minute skew).
 
 Compute `refresh_token_expires_at` from `refresh_token_expires_in` when it is
@@ -885,7 +1030,7 @@ keep the previous value with no fallback.
 > Observed access-token lifetime is on the order of hours. **Refresh is
 > routine, not exceptional.**
 
-**Refresh request**: POST to the same token URL, JSON
+**Claude refresh request**: POST to the same token URL, JSON
 `{ grant_type: "refresh_token", refresh_token, client_id, scope: "<space-joined>" }`,
 timeout 30 seconds, anything other than 200 is a failure.
 
@@ -897,7 +1042,19 @@ an observable phenomenon, not a theoretical one.
 `code === "invalid_scope"`, retry **exactly once** using the stored scopes
 verbatim.
 
-**Concurrency**: serialize refreshes per account. Even in a single process, a
+**Codex refresh request**: JSON to the root `/oauth/token`, containing only
+`client_id`, `grant_type: "refresh_token"`, and `refresh_token`. It sends no
+scope. A returned ID token is used only to reject a user change or a change
+between two known workspaces. An omitted claim does not erase stored context,
+and refresh does not enrich an unknown workspace in token metadata alone:
+login is the operation that can update credentials and account metadata under
+one commit. An explicit FedRAMP value can update its own routing flag. The ID
+token itself is not stored. A new non-empty access token and its `exp` claim are
+required, while an omitted refresh token retains the current one. OpenAI's
+terminal 401 and named reused/expired/invalidated refresh errors quarantine on
+one strike; that rule is never applied to an arbitrary Anthropic 401.
+
+**Concurrency**: serialize refreshes per provider/account pair. Even in a single process, a
 scheduler poll and a user's manual refresh can overlap. Take a lock, and
 compare-and-swap against the stored refresh token before writing (if the value
 changed underneath us, adopt the new value rather than overwriting it).
@@ -923,42 +1080,28 @@ is rediscovered as a surprise.
   re-reads from disk inside the critical section — but not on the keychain,
   which exposes no such primitive and is the primary store (§9.2). One uniform
   implementation above the store abstraction was chosen over two divergent ones.
-- **A crash between the token endpoint's 200 and the store write loses the
+- **A crash between the token endpoint's 200 and the first store write loses the
   rotation permanently.** The store keeps the pre-rotation token, the server has
   moved past it, and the next launch gets `invalid_grant` — so the visible
   outcome is `AUTH_DEAD` and a forced re-login. Neither the lock nor the
   compare-and-swap addresses this.
+- **Codex has three store writes rather than one.** After the irreducible window
+  above, it writes refresh first, access second and metadata last. A crash after
+  the refresh write is recoverable; reversing the first two would leave a new
+  access token with the dead old refresh chain.
 - **Nothing structurally prevents a future caller from refreshing directly**
   and bypassing the lock. The compare-and-swap narrows that window; it does not
   close it.
 
 ### 10.6 Revocation
 
-On account deletion, POST
-`{ token, token_type_hint: "refresh_token", client_id }` to the provider's own
-`revoke_url` (§10.1 — a field, not a suffix of the token URL, because OpenAI's
-is a sibling of its token endpoint). Timeout 5 seconds, best-effort — swallow
-failures and proceed with local deletion.
+On account deletion, revocation is best-effort and bounded; local deletion still
+proceeds when the network fails. Claude sends its measured JSON body to
+`/v1/oauth/token/revoke`. Codex sends JSON to the root `/oauth/revoke`, prefers
+the refresh token, and includes the public client ID. The Codex contract is
+source-derived until a live quota-board run verifies server acceptance.
 
-**The body goes out in the provider's `body_style`**, through the same dispatch
-the token endpoint uses. The JSON shape above is Anthropic's and is measured
-(§10.3). For OpenAI nothing is measured, and RFC 7009 §2.1 requires
-`application/x-www-form-urlencoded` for a revocation request — the same reason
-`BodyStyle::Form` was chosen for that provider's token endpoint. Sending JSON
-regardless would be a guess in the one place a wrong guess cannot be seen:
-because the outcome is swallowed, a refused revocation looks exactly like an
-accepted one, and the user-visible result is a live refresh token left on the
-server after the account is gone locally.
-
-**Still unmeasured, and recorded as such.** No revocation request has ever been
-sent to OpenAI, so form encoding here is the standard's default rather than an
-observation. If a Codex account's tokens are found still valid after removal,
-check the body style first and the URL second — the CLI's request log uses a
-token endpoint that differs from the one discovery advertises, and its revoke
-sibling may differ the same way
-(`docs/research/codex-usage-endpoint.md`, "OAuth endpoints").
-
-### 10.7 Refresh-chain isolation — the benefit and the measured risk
+### 10.7 Claude refresh-chain isolation — the benefit and the measured risk
 
 The practical benefit of our own OAuth: because we obtain our own grant per
 account, we hold **independent refresh chains** and do not compete with Claude
@@ -994,6 +1137,11 @@ Had it gone the other way, the fallbacks were long-lived tokens via
 chains), or documenting a "one session per account" constraint. Neither is
 needed.
 
+This evidence is Claude-specific. quota-board also obtains its own Codex grant
+rather than reading Codex CLI's cache, but isolation of those OpenAI refresh
+chains remains part of the live verification gate rather than inheriting this
+Anthropic result.
+
 ## 11. Platform
 
 ### 11.1 Linux display server policy
@@ -1023,16 +1171,18 @@ on top and remembering its position is the definition of a widget, so that
 takes priority over sharpness.
 
 **In environments where XWayland is unavailable** (pure Wayland compositors,
-XWayland not installed), start under Wayland but inform the user in-app that
-the features above are inactive, and gray out those items in settings. Do not
-let them fail silently.
+XWayland not installed), this build cannot start. It does not fall back to a
+degraded Wayland window: forcing X11 happens before GTK initializes, and there
+are no corresponding settings controls to gray out. This limitation is stated
+in the README rather than hidden behind an unsupported promise.
 
 **Global hotkeys do not work in that environment either.** On Linux,
 `global-hotkey` opens an x11rb connection directly based on `$DISPLAY` and has
 no Wayland backend. This is independent of `GDK_BACKEND=x11` — that variable
-affects only GDK's window creation. Therefore **under pure Wayland the tray
-icon is the only way to recover the widget.** Do not treat global-hotkey
-registration failure as fatal; inform the user and continue running.
+affects only GDK's window creation. The shortcut can therefore fail even in an
+XWayland session where the widget itself runs; in that case the tray menu is
+the recovery route. Pure Wayland is already excluded by the startup constraint
+above.
 
 ### 11.2 Window state persistence
 
@@ -1085,11 +1235,11 @@ Electron 207MB vs Tauri 185MB — comparable, not 4× better.
 multi-process on Linux (GTK main + WebKitWebProcess + WebKitNetworkProcess), so
 measure PSS from `/proc/*/smaps_rollup`, not RSS.
 
-**WebKitGTK has a documented monotonically increasing memory leak in long-lived
-processes** — reports describe RSS growing without being returned, eventually
-invoking the OOM killer. A polling widget that stays resident for 24 hours
-**needs a periodic webview reload or a memory watchdog. Treat this as a
-functional requirement, not an optimization.**
+**WebKitGTK has reports of monotonically increasing memory use in long-lived
+processes**, including RSS not being returned before the OOM killer intervenes.
+If that behavior is measured in this application, a periodic webview reload or
+memory watchdog becomes a functional requirement rather than an optimization.
+It is not a current requirement on the strength of third-party reports alone.
 
 > **On the watchdog.** It is deliberately not implemented. A design for one was
 > written, reviewed before any code, and dropped — the reasons are worth keeping
@@ -1129,11 +1279,12 @@ functional requirement, not an optimization.**
 
 ## 12. Risks
 
-### 12.1 The 7-day number may not exist in the shape the UI assumes
+### 12.1 Provider windows do not share one fixed shape
 
 See §5.3. "Two bars per account" is not a safe assumption; measurement found an
 account where the weekly figure existed only as a per-model `weekly_scoped`
-entry.
+entry. Codex separately measured a free-plan 30d-only shape and a paid 5h + 7d
+shape. The UI renders the windows reported, not a two-bar template.
 
 ### 12.2 429 throttling is an ecosystem killer
 
@@ -1141,9 +1292,9 @@ A sustained 429 regression in March 2026 broke every statusline tool.
 anthropics/claude-code#30930 is **still open** with no policy response from
 Anthropic, and duplicate issues were closed as NOT_PLANNED.
 
-**If an honest User-Agent is ever throttled to effectively zero, the entire
-architecture collapses, and no fallback exists that does not consume
-inference.**
+**If an honest User-Agent is ever throttled to effectively zero, Claude support
+collapses, and no Claude fallback exists that does not consume inference.**
+Codex has a separate endpoint and an unmeasured throttle policy.
 
 ### 12.3 Identity misrepresentation is the one unambiguous prohibition, and this project brushes against it twice
 
@@ -1152,17 +1303,25 @@ inference.**
 (b) Reusing Claude Code's public client_id — **unavoidable.** There is no
 third-party registration program. The consent screen displays "Claude Code".
 
+Codex also uses the official client's public ID because no quota-board client
+registration exists. That flow is source-derived until live verification. It
+does not relax (a): authorize and API requests omit the CLI's identifying
+originator and keep the honest quota-board User-Agent.
+
 Precedent: in March 2026 OpenCode merged an "anthropic legal requests" PR
 removing the `claude-code-20250219` beta header and the Anthropic auth plugin.
 
 ### 12.4 Schema drift in an undocumented endpoint
 
-`/api/oauth/usage` **has already changed shape once.** Around July 2026,
+Both usage endpoints are undocumented. `/api/oauth/usage` **has already changed
+shape once.** Around July 2026,
 per-model weekly usage moved from the flat `seven_day_sonnet`/`seven_day_opus`
 keys into weekly_scoped entries in `limits[]`, and the flat keys began
 returning null for models that had actual usage (ccstatusline #503).
 
-Expect it to change again. **The failure mode to avoid is rendering a
+The later Codex paid capture also added `model_usage` beyond the August key set.
+That is evidence that snapshots are not closed schemas, not yet evidence of a
+breaking Codex change. Expect either endpoint to change. **The failure mode to avoid is rendering a
 confidently wrong number. Degrade to "unknown."**
 
 ### 12.5 Refresh-chain collision — measured, does not occur
@@ -1180,12 +1339,12 @@ and 7-day numbers is the response headers, and those require a real inference
 request per account. That consumes the very limit being measured, and it turns
 the app from a reader into an inference client.
 
-**Losing `/api/oauth/usage` is a product-termination event, not a
-degradation.**
+**Losing `/api/oauth/usage` is a Claude-support termination event, not a
+degraded Claude mode.** Codex's independent source remains usable.
 
 ### 12.7 Multi-account credential and cache bugs are a recurring bug class
 
-See §9.3. Keying on anything other than `account.uuid`, or failing to
+See §9.3. Keying on anything other than `(provider, account_id)`, or failing to
 fingerprint caches with the token, reproduces these bugs by default.
 
 ### 12.8 The per-account assumption — measured for N=3
@@ -1204,15 +1363,18 @@ The polling constants in §6.1 therefore do **not** need to scale with account
 count. A per-IP result would have forced the interval to be multiplied by the
 number of accounts, and the 180-second floor with it.
 
-Scope limit: three accounts on one machine, one run. Nothing here bounds how
-many accounts a single IP can poll before some other limit appears; the
+This result is Anthropic-only. Codex's multi-account throttle scope has not been
+measured and does not inherit the conclusion.
+
+Scope limit: three Claude accounts on one machine, one run. Nothing here bounds
+how many accounts a single IP can poll before some other limit appears; the
 conclusion is that the *429 budget* is not the shared thing.
 
 ## 13. Verification status
 
 What has been measured, and how, is recorded in
-**docs/research/usage-endpoint.md** — one section per run, Spikes A through E.
-In summary:
+**docs/research/usage-endpoint.md** and
+**docs/research/codex-usage-endpoint.md**. The Claude summary is:
 
 | Item | Status |
 |---|---|
@@ -1231,6 +1393,20 @@ In summary:
 | An unsigned bundle reads as *"damaged"*, an ad-hoc signed one as *"could not verify"* (§15) | **confirmed** — both seen on macOS 26, one evening apart |
 | Upgrading re-prompts for keychain access **once per account** | **confirmed** — N=3, on the 0.2.0 → 0.2.1 upgrade that also changed the bundle identifier |
 | Dismissing that prompt leaves every account reading as `SECRETS_LOCKED` | **not measured** — every prompt was approved |
+
+Codex evidence is deliberately graded separately:
+
+| Item | Status |
+|---|---|
+| `wham/usage` returns 200 with an honest quota-board User-Agent | **confirmed** — two plans |
+| One account sustained 90 reads near 60-second intervals without a 429 | **confirmed safe point**, not a boundary |
+| Free-plan 30d and paid-plan populated 5h + 7d window shapes | **confirmed** |
+| User ID and workspace ID are separate dimensions | **confirmed** by populated capture and official source |
+| Browser/device endpoints, optional workspace claim, claim mapping, refresh/revoke bodies and workspace header | **official-source-derived** — Codex 0.153.2 |
+| Dynamic `additional_rate_limits` and count-only reset-credit summary | **official-source-derived** — Codex 0.153.2; not live-measured here |
+| A complete quota-board Codex login → usage → refresh → usage → revoke run | **not yet measured** |
+| Codex 429 shape, `Retry-After` meaning and multi-account throttle scope | **not measured** |
+| Strong proof that reads consume no usage | **not measured** — observed values had insufficient resolution |
 
 **One row is graded differently, and the difference is the point.** Every other
 row above was measured on the wire, in a run written down with its method in the
@@ -1253,11 +1429,11 @@ strongest available short of it.
 | Target | Method |
 |---|---|
 | `usage` | Inject the endpoint URL and point it at a wiremock server on loopback (§4.3); verify parsing against stored response fixtures. **No real network calls.** Fixtures must include: both 5h and 7d present; `seven_day: null` with weekly_scoped; weekly entirely absent; many unknown fields; a completely alien shape (`UNKNOWN_SHAPE`) |
-| `scheduler` | Inject the clock to verify polling interval, stagger, freshness transitions, visibility gating, both meanings of `Retry-After`, and exponential backoff without real waiting. **Not jitter** — §6.1 records that it is deliberately not implemented |
-| `auth` | A local mock OAuth server for the PKCE flow, state-mismatch rejection, the manual-paste path, scope-preserving refresh, the one `invalid_scope` retry, one-strike `invalid_grant` quarantine, and serialized concurrent refresh |
-| `secrets` | Contract tests against an in-memory implementation. Distinguish the three states `NO_BACKEND`/`LOCKED`/`NOT_FOUND`. **Must test that the canary self-check detects a mock store** |
-| `accounts` | CRUD round-trip in a temporary directory. uuid keying, cache invalidation by token fingerprint |
-| webview | Extract color-step selection, "n minutes ago" formatting, bar width computation, and **variable bar-count rendering (1/2/N/0)** as pure functions and unit-test them |
+| `scheduler` | Inject the clock to verify polling interval, stagger, freshness transitions, visibility gating, the fixed `Retry-After: 0` fallback, exact positive `Retry-After` countdowns and the one-hour cap, plus exponential backoff for transient non-429 failures without real waiting. **Not jitter** — §6.1 records that it is deliberately not implemented |
+| `auth` | Local mock servers for Claude browser/manual PKCE and Codex browser/device flows; fixed callback ports and state rejection; exact provider-specific exchange, refresh and revoke bodies; claim fallbacks; device timeout; terminal errors; redaction; serialized concurrent refresh and a one-request 401 race |
+| `secrets` | Contract tests against an in-memory implementation. Distinguish `NO_BACKEND`/`LOCKED`/`NOT_FOUND`; freeze the Claude blob; bound every Codex split entry; fault-inject each refresh write and verify refresh-first recovery. **Must test that the canary self-check detects a mock store** |
+| `accounts` | CRUD round-trip in a temporary directory. Pair keying, legacy defaults, workspace-conflict refusal, cache invalidation by token fingerprint |
+| webview | Extract color-step selection, "n minutes ago" formatting, bar width computation, and **variable bar-count rendering (1/2/N/0)** as pure functions; test full provider names, equal add-account choices and distinct browser/device states |
 
 **No test may consume real account limits or throttle budget.**
 
@@ -1311,7 +1487,7 @@ strongest available short of it.
 
 - Claude.ai web subscription limits; Anthropic Console (API credit/billing)
   usage
-- Installing and logging into Claude Code on remote machines
+- Installing or logging into Claude Code or Codex CLI for quota-board to work
 - Automatic re-login on token expiry
 - Usage history graphs, notifications, threshold alerts
 - Showing "which machine is using this account" — meaningless, since limits are
@@ -1328,6 +1504,7 @@ position.
 - No central or remote server
 - No credential sharing between users
 - No reading or writing of another tool's credentials
+- No dependency on either provider's first-party CLI
 - No spoofing of User-Agent or headers
 - No attempts to circumvent rate limits
 

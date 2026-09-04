@@ -114,8 +114,8 @@ pub async fn refresh_account(
 /// The whole of `refresh_account` except the event, so it can be tested
 /// without an `AppHandle` — the same split `remove_account_for` uses.
 ///
-/// Returns whether a poll actually ran, alongside the answer: the two early
-/// returns below (throttled, already refreshing) must not fire
+/// Returns whether a poll actually ran, alongside the answer: the early
+/// returns below (throttled, quarantined, already refreshing) must not fire
 /// `usage://updated`, only the path that actually touched the network should,
 /// and that is a fact about which branch ran, not about whether the final
 /// `Result` came back `Ok`.
@@ -126,19 +126,22 @@ pub(crate) async fn refresh_account_for(
 ) -> (Result<AccountState, String>, bool) {
     {
         let sched = state.scheduler.lock().await;
-        // Already throttled by the server (§6.2), and this is now the **only**
-        // thing that refuses a press. §6.1's client-side floor used to refuse
-        // one too; §6.4 dropped it, because the moment a user asks is the
-        // moment the number matters and the server's own bucket is the real
-        // limit. This arm is a different question and it stays: re-hitting a
-        // server that has just sent `Retry-After` spends the request without
-        // shortening the block by a second (§6.2, measured).
+        // Already throttled by the server (§6.2), or quarantined because only
+        // re-login can repair the grant (§7.2). §6.1's client-side floor used
+        // to refuse ordinary presses too; §6.4 dropped it, because the moment a
+        // user asks is the moment the number matters and the server's own
+        // bucket is the real limit. These two states are different: throttle
+        // carries a future retry time, while AUTH_DEAD must never retry the
+        // known-dead grant.
         //
         // `AccountRow.svelte`'s `throttled` branch renders this state as
         // "throttled, after HH:MM" and `AccountList.svelte` renders it as
         // "throttled, available after HH:MM". Cited by name: both files move.
-        if let Some(s @ AccountState::Throttled { .. }) = sched.state(provider, uuid) {
-            return (Ok(s), false);
+        match sched.state(provider, uuid) {
+            Some(s @ AccountState::Throttled { .. }) | Some(s @ AccountState::AuthDead) => {
+                return (Ok(s), false)
+            }
+            _ => {}
         }
     }
     // The braces above are load-bearing: a `MutexGuard` created in an `if let`
@@ -160,14 +163,8 @@ pub(crate) async fn refresh_account_for(
     // by one poll (`IN_FLIGHT_RECLAIM_SECS`, derived in scheduler.rs), and this
     // is an async command, so the wait costs a task and not the UI thread.
     // `AccountRow.svelte` disables its button for the duration.
-    state.poll_one(provider, uuid).await;
-    let result = state
-        .scheduler
-        .lock()
-        .await
-        .state(provider, uuid)
-        .ok_or_else(|| "unknown account".to_string());
-    (result, true)
+    let (result, polled) = state.poll_one_manual(provider, uuid).await;
+    (result.ok_or_else(|| "unknown account".to_string()), polled)
 }
 
 /// One login at a time (§10.3). The second click is refused rather than
@@ -234,15 +231,18 @@ fn login_timeout_secs() -> u64 {
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum LoginStart {
     ClaudeBrowser {
+        attempt_id: u64,
         /// `None` when no loopback socket could be bound. Claude's manual URL
         /// remains usable without one.
         loopback: Option<String>,
         manual: String,
     },
     CodexBrowser {
+        attempt_id: u64,
         authorize_url: String,
     },
     CodexDevice {
+        attempt_id: u64,
         verification_url: String,
         /// A short-lived credential intentionally shown to the user. This type
         /// does not derive `Debug`, so it cannot leak through incidental logs.
@@ -255,6 +255,8 @@ pub enum LoginStart {
 /// `src/lib/types.ts`. Change both together.
 #[derive(Clone, serde::Serialize)]
 pub struct ManualFallback {
+    pub attempt_id: u64,
+    pub provider: Provider,
     pub url: String,
     /// Why the loopback path is not going to finish. Shown verbatim, so it is
     /// written for the user, not for a log.
@@ -280,9 +282,43 @@ enum LoginTask {
     },
 }
 
+impl LoginTask {
+    fn attempt_id(&self) -> u64 {
+        match self {
+            Self::ClaudeBrowser { generation, .. }
+            | Self::CodexBrowser { generation, .. }
+            | Self::CodexDevice { generation, .. } => *generation,
+        }
+    }
+
+    fn provider(&self) -> Provider {
+        match self {
+            Self::ClaudeBrowser { .. } => Provider::Anthropic,
+            Self::CodexBrowser { .. } | Self::CodexDevice { .. } => Provider::Openai,
+        }
+    }
+}
+
 struct PreparedLogin {
     start: LoginStart,
     task: Option<LoginTask>,
+}
+
+/// Payload of `auth://completed`. An attempt id is required even while login is
+/// process-wide single-flight: Claude's manual fallback can be replaced, and a
+/// queued event from the old attempt must not retire the new attempt's UI.
+#[derive(Clone, serde::Serialize)]
+pub struct AuthCompleted {
+    pub attempt_id: u64,
+    pub provider: Provider,
+}
+
+/// Payload of `auth://failed`, correlated for the same reason as completion.
+#[derive(Clone, serde::Serialize)]
+pub struct AuthFailed {
+    pub attempt_id: u64,
+    pub provider: Provider,
+    pub message: String,
 }
 
 enum LoginTaskFailure {
@@ -388,7 +424,11 @@ async fn prepare_claude_login(
         cancelled,
     });
     Ok(PreparedLogin {
-        start: LoginStart::ClaudeBrowser { loopback, manual },
+        start: LoginStart::ClaudeBrowser {
+            attempt_id: generation,
+            loopback,
+            manual,
+        },
         task,
     })
 }
@@ -405,7 +445,10 @@ async fn prepare_codex_login(
                     .map_err(|e| e.to_string())?;
             install_login_generation(state, generation, None).await;
             Ok(PreparedLogin {
-                start: LoginStart::CodexBrowser { authorize_url },
+                start: LoginStart::CodexBrowser {
+                    attempt_id: generation,
+                    authorize_url,
+                },
                 task: Some(LoginTask::CodexBrowser {
                     generation,
                     callback,
@@ -418,6 +461,7 @@ async fn prepare_codex_login(
                 .await
                 .map_err(codex_device_start_error)?;
             let start = LoginStart::CodexDevice {
+                attempt_id: generation,
                 verification_url: device.verification_url.clone(),
                 user_code: device.user_code.clone(),
                 expires_at: device.expires_at,
@@ -493,6 +537,8 @@ async fn run_login_task(
             };
             let fallback = |reason: String| {
                 LoginTaskFailure::ClaudeFallback(ManualFallback {
+                    attempt_id: generation,
+                    provider: Provider::Anthropic,
                     url: fallback_url.clone(),
                     reason,
                 })
@@ -653,6 +699,8 @@ pub async fn begin_login(app: tauri::AppHandle, provider: Provider) -> Result<Lo
         return Ok(start);
     };
 
+    let attempt_id = task.attempt_id();
+    let task_provider = task.provider();
     let handle = app.clone();
     tauri::async_runtime::spawn(async move {
         let _guard = guard;
@@ -660,13 +708,26 @@ pub async fn begin_login(app: tauri::AppHandle, provider: Provider) -> Result<Lo
         match run_login_task(&state, task).await {
             Ok(provider) => {
                 let _ = handle.emit("accounts://changed", ());
-                let _ = handle.emit("auth://completed", provider);
+                let _ = handle.emit(
+                    "auth://completed",
+                    AuthCompleted {
+                        attempt_id,
+                        provider,
+                    },
+                );
             }
             Err(LoginTaskFailure::ClaudeFallback(fallback)) => {
                 let _ = handle.emit("auth://manual-fallback", fallback);
             }
             Err(LoginTaskFailure::Terminal(error)) => {
-                let _ = handle.emit("auth://failed", error);
+                let _ = handle.emit(
+                    "auth://failed",
+                    AuthFailed {
+                        attempt_id,
+                        provider: task_provider,
+                        message: error,
+                    },
+                );
             }
             Err(LoginTaskFailure::Cancelled) => {}
         }
@@ -733,9 +794,15 @@ pub fn set_autostart(app: tauri::AppHandle, enabled: bool) -> Result<AutostartVi
 #[tauri::command]
 pub async fn submit_manual_code(app: tauri::AppHandle, pasted: String) -> Result<(), String> {
     let events = app.clone();
-    finish_manual_login_with(&app.state::<AppState>(), &pasted, move || {
+    finish_manual_login_with(&app.state::<AppState>(), &pasted, move |attempt_id| {
         let _ = events.emit("accounts://changed", ());
-        let _ = events.emit("auth://completed", Provider::Anthropic);
+        let _ = events.emit(
+            "auth://completed",
+            AuthCompleted {
+                attempt_id,
+                provider: Provider::Anthropic,
+            },
+        );
     })
     .await
 }
@@ -750,7 +817,7 @@ async fn finish_manual_login_with<F>(
     on_success: F,
 ) -> Result<(), String>
 where
-    F: FnOnce() + Send,
+    F: FnOnce(u64) + Send,
 {
     let (code, returned_state) = parse_manual_code(pasted).ok_or(
         "that is not a code#state line. Copy the whole line from the page, \
@@ -788,7 +855,7 @@ where
     // Emit completion while the generation is still current and the commit
     // mutex is held. Otherwise a new login can start between persistence and
     // this event and receive the previous attempt's completion signal.
-    on_success();
+    on_success(generation);
     finish_login_generation(state, generation);
     // The loopback task may still be unwinding from its cancellation. Release
     // immediately for the manual path; its generation-aware guard cannot clear
@@ -799,7 +866,7 @@ where
 
 #[cfg(test)]
 pub(crate) async fn finish_manual_login(state: &AppState, pasted: &str) -> Result<(), String> {
-    finish_manual_login_with(state, pasted, || {}).await
+    finish_manual_login_with(state, pasted, |_| {}).await
 }
 
 #[tauri::command]
@@ -865,10 +932,15 @@ pub(crate) async fn remove_account_for(
         })?
     };
 
-    // Lock order: scheduler before accounts.
-    state.scheduler.lock().await.remove(provider, uuid);
-    let removed =
-        state.accounts.lock().await.remove(provider, uuid).map_err(|e| e.to_string())?;
+    // Persist the row removal before dropping its scheduler entry. The account
+    // store restores its in-memory list if the flush fails, so an error leaves
+    // both halves present and the same button can retry the operation.
+    let removed = state
+        .accounts
+        .lock()
+        .await
+        .remove(provider, uuid)
+        .map_err(|e| e.to_string())?;
     if !removed {
         // `AccountStore::remove` answers `Ok(false)` for an unknown (provider,
         // id) pair (accounts.rs:137-149). Emitting `accounts://changed` for a
@@ -876,6 +948,7 @@ pub(crate) async fn remove_account_for(
         // no reason. Same shape as `rename_account`'s unknown-account arm.
         return Err("unknown account".into());
     }
+    state.scheduler.lock().await.remove(provider, uuid);
 
     // Removing an account must remove its cached usage too, or the app keeps
     // percentages and reset times on disk for an account the user deleted.
@@ -988,12 +1061,9 @@ pub struct StoreStatus {
     /// thread.
     pub description: String,
     /// Which of §9.2's states we are in. The settings window branches on this,
-    /// because `no_backend` and `keychain_locked` reach the user as the same
-    /// account state in this build — §9.2 keeps `NO_BACKEND` off the
-    /// account-state axis (design.md:592-594), but the passphrase prompt it
-    /// asks for instead cannot be raised from `setup()`, so both start as
-    /// `SECRETS_LOCKED` — while carrying two different remedies. Nothing else
-    /// on the wire tells them apart.
+    /// because `encrypted_file_locked`, `no_backend` and `keychain_locked`
+    /// reach the user as the same account state in this build while carrying
+    /// different remedies. Nothing else on the wire tells them apart.
     pub kind: StoreKind,
     /// Whether §9.2's fallback file already exists. Wording only — the first
     /// passphrase *creates* the store, so a typo there is permanent.
@@ -1020,9 +1090,9 @@ fn ensure_unlock_allowed(state: &AppState) -> Result<(), String> {
             Err("the OS keychain is open — there is nothing to unlock".into())
         }
         StoreKind::EncryptedFile => Err(
-            "the encrypted token store is already open — close and restart Quota Board to change it"
-                .into(),
+            "the encrypted token store is already open — there is nothing to unlock".into(),
         ),
+        StoreKind::EncryptedFileLocked => Ok(()),
         StoreKind::KeychainLocked => Err(
             "a keychain exists on this machine but did not answer; unlock it in the OS and restart Quota Board. A passphrase here would open a different, empty store"
                 .into(),
@@ -1047,8 +1117,7 @@ pub async fn unlock_secrets(
     // `FailureKind::from_stored_token_error` classifies that `AuthDead`,
     // `AppState::record` writes the quarantine through to accounts.json, where
     // `record_failure`'s one-strike quarantine never retries it. Only
-    // `NoBackend` — no credential store registered on this machine at all —
-    // may reach the fallback.
+    // `NoBackend` and `EncryptedFileLocked` may reach the fallback.
     ensure_unlock_allowed(&state)?;
     if passphrase.is_empty() {
         return Err("a passphrase is required".into());
@@ -1283,7 +1352,7 @@ mod tests {
     }
 
     /// The two protocol configs stay distinct rather than guessing OpenAI's
-    /// endpoints through Anthropic's `ProviderSpec` shape.
+    /// endpoints through Anthropic's `AnthropicAuthConfig` shape.
     #[test]
     fn auth_configs_keep_provider_overrides_separate() {
         let mut state = app_state(Arc::new(MemoryStore::default()));
@@ -1301,30 +1370,74 @@ mod tests {
     #[test]
     fn login_start_serializes_as_three_disjoint_provider_flows() {
         let claude = serde_json::to_value(LoginStart::ClaudeBrowser {
+            attempt_id: 41,
             loopback: Some("https://claude.example/loopback".into()),
             manual: "https://claude.example/manual".into(),
         })
         .unwrap();
         assert_eq!(claude["kind"], "claude_browser");
+        assert_eq!(claude["attempt_id"], 41);
         assert!(claude.get("authorize_url").is_none());
         assert!(claude.get("user_code").is_none());
 
         let browser = serde_json::to_value(LoginStart::CodexBrowser {
+            attempt_id: 42,
             authorize_url: "https://openai.example/authorize".into(),
         })
         .unwrap();
         assert_eq!(browser["kind"], "codex_browser");
+        assert_eq!(browser["attempt_id"], 42);
         assert!(browser.get("manual").is_none());
 
         let device = serde_json::to_value(LoginStart::CodexDevice {
+            attempt_id: 43,
             verification_url: "https://openai.example/device".into(),
             user_code: "ABCD-EFGH".into(),
             expires_at: chrono::DateTime::from_timestamp(1_800_000_000, 0).unwrap(),
         })
         .unwrap();
         assert_eq!(device["kind"], "codex_device");
+        assert_eq!(device["attempt_id"], 43);
         assert_eq!(device["user_code"], "ABCD-EFGH");
         assert!(device.get("manual").is_none());
+    }
+
+    #[test]
+    fn auth_event_payloads_identify_the_attempt_and_provider() {
+        let completed = serde_json::to_value(AuthCompleted {
+            attempt_id: 51,
+            provider: Provider::Openai,
+        })
+        .unwrap();
+        assert_eq!(
+            completed,
+            serde_json::json!({ "attempt_id": 51, "provider": "openai" })
+        );
+
+        let failed = serde_json::to_value(AuthFailed {
+            attempt_id: 52,
+            provider: Provider::Anthropic,
+            message: "the callback failed".into(),
+        })
+        .unwrap();
+        assert_eq!(
+            failed,
+            serde_json::json!({
+                "attempt_id": 52,
+                "provider": "anthropic",
+                "message": "the callback failed"
+            })
+        );
+
+        let fallback = serde_json::to_value(ManualFallback {
+            attempt_id: 53,
+            provider: Provider::Anthropic,
+            url: "https://claude.example/manual".into(),
+            reason: "the callback timed out".into(),
+        })
+        .unwrap();
+        assert_eq!(fallback["attempt_id"], 53);
+        assert_eq!(fallback["provider"], "anthropic");
     }
 
     fn token_body(account: Option<serde_json::Value>) -> serde_json::Value {
@@ -1393,8 +1506,20 @@ mod tests {
 
         let state = state_against(&server).await;
         armed(&state);
+        let expected_attempt = state.active_login.lock().unwrap().unwrap();
+        let completed_attempt = Arc::new(AtomicU64::new(NO_LOGIN));
+        let observed = Arc::clone(&completed_attempt);
 
-        finish_manual_login(&state, "  the-code#s-state \n").await.unwrap();
+        finish_manual_login_with(&state, "  the-code#s-state \n", move |attempt_id| {
+            observed.store(attempt_id, Ordering::SeqCst);
+        })
+        .await
+        .unwrap();
+        assert_eq!(
+            completed_attempt.load(Ordering::SeqCst),
+            expected_attempt,
+            "manual completion was attributed to a different login generation"
+        );
 
         let stored = state.secrets().get(&token_key(Provider::Anthropic, "u-42")).unwrap();
         assert!(stored.is_some(), "the token never reached the store");
@@ -1587,7 +1712,7 @@ mod tests {
             .expect("the split Codex credential was not loadable");
         assert_eq!(stored.access_token(), "e30.eyJleHAiOjk5OTk5OTk5OTl9.signature");
         assert_eq!(stored.workspace_id(), Some("workspace-one"));
-        assert!(stored.is_fedramp());
+        assert_eq!(stored.is_fedramp(), Some(true));
 
         let accounts = state.accounts.lock().await;
         let a = accounts
@@ -1683,6 +1808,28 @@ mod tests {
             Arc::ptr_eq(&before, &after) && Arc::ptr_eq(&installed, &after),
             "a repeated unlock swapped the live store"
         );
+    }
+
+    #[tokio::test]
+    async fn the_selected_encrypted_store_can_be_unlocked_on_a_later_launch() {
+        assert_eq!(
+            serde_json::to_value(StoreKind::EncryptedFileLocked).unwrap(),
+            serde_json::json!("encrypted_file_locked"),
+            "the Rust store state drifted from the TypeScript wire union"
+        );
+        let state = app_state_with(
+            Arc::new(crate::state::LockedStore),
+            StoreKind::EncryptedFileLocked,
+            std::env::temp_dir().join("quota-existing-fallback-settings.json"),
+        );
+        assert!(ensure_unlock_allowed(&state).is_ok());
+
+        let candidate: Arc<dyn SecretStore> = Arc::new(MemoryStore::default());
+        assert!(
+            state.install_fallback_store(candidate).is_ok(),
+            "the persisted fallback selection refused its passphrase store"
+        );
+        assert_eq!(state.store_kind(), StoreKind::EncryptedFile);
     }
 
     /// §9.3: `account.uuid` is the primary key and the email is display-only,
@@ -1875,8 +2022,8 @@ mod tests {
             expires_at: chrono::Utc::now() + chrono::TimeDelta::hours(1),
             client_id: "test".into(),
             account_id: "a".into(),
-            workspace_id: "workspace-a".into(),
-            is_fedramp: false,
+            workspace_id: Some("workspace-a".into()),
+            is_fedramp: Some(false),
         });
         save_tokens(state.secrets().as_ref(), Provider::Openai, "a", &tokens).unwrap();
 
@@ -1908,8 +2055,8 @@ mod tests {
             expires_at: chrono::Utc::now() + chrono::TimeDelta::hours(1),
             client_id: "test".into(),
             account_id: "a".into(),
-            workspace_id: "workspace-a".into(),
-            is_fedramp: false,
+            workspace_id: Some("workspace-a".into()),
+            is_fedramp: Some(false),
         });
         save_tokens(store.as_ref(), Provider::Openai, "a", &tokens).unwrap();
         store.arm();
@@ -1950,6 +2097,219 @@ mod tests {
                 .iter()
                 .all(|account| account.provider != Provider::Openai || account.account_id != "a")
         );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_queued_manual_refresh_rechecks_retry_after_before_touching_the_network() {
+        use wiremock::matchers::header;
+
+        let usage = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(header("authorization", "Bearer queued-access"))
+            .respond_with(
+                ResponseTemplate::new(429)
+                    .insert_header("retry-after", "60")
+                    .set_delay(Duration::from_millis(500)),
+            )
+            .expect(1)
+            .mount(&usage)
+            .await;
+
+        let store = Arc::new(MemoryStore::default());
+        save_tokens(
+            store.as_ref(),
+            Provider::Anthropic,
+            "a",
+            &StoredTokens::Anthropic(TokenSet {
+                access_token: "queued-access".into(),
+                refresh_token: "queued-refresh".into(),
+                expires_at: chrono::Utc::now() + chrono::TimeDelta::hours(1),
+                refresh_token_expires_at: chrono::Utc::now() + chrono::TimeDelta::days(30),
+                scopes: vec!["user:profile".into()],
+                client_id: "test".into(),
+            }),
+        )
+        .unwrap();
+        let mut state = app_state(store);
+        state.usage_url = usage.uri();
+        let state = Arc::new(state);
+
+        let first = {
+            let state = Arc::clone(&state);
+            tokio::spawn(async move {
+                refresh_account_for(&state, Provider::Anthropic, "a").await
+            })
+        };
+        for _ in 0..100 {
+            if usage.received_requests().await.unwrap().len() == 1 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        assert_eq!(
+            usage.received_requests().await.unwrap().len(),
+            1,
+            "the first refresh never reached the local mock"
+        );
+
+        // The delayed first response leaves enough time for this command to
+        // pass its optimistic pre-check and queue on the global permit.
+        let second = {
+            let state = Arc::clone(&state);
+            tokio::spawn(async move {
+                refresh_account_for(&state, Provider::Anthropic, "a").await
+            })
+        };
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        let (_, first_polled) = first.await.unwrap();
+        let (second_result, second_polled) = second.await.unwrap();
+        assert!(first_polled, "the request establishing Retry-After did not run");
+        assert!(!second_polled, "the queued request ignored the newly established Retry-After");
+        assert!(matches!(
+            second_result,
+            Ok(AccountState::Throttled { .. })
+        ));
+        assert_eq!(
+            usage.received_requests().await.unwrap().len(),
+            1,
+            "a second request reached the server inside Retry-After"
+        );
+    }
+
+    #[tokio::test]
+    async fn manual_refresh_does_not_retry_a_quarantined_account() {
+        let usage = MockServer::start().await;
+        Mock::given(method("GET"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "five_hour": {
+                    "utilization": 10,
+                    "resets_at": "2030-01-01T00:00:00Z"
+                },
+                "seven_day": null,
+                "limits": []
+            })))
+            .mount(&usage)
+            .await;
+
+        let store = Arc::new(MemoryStore::default());
+        save_tokens(
+            store.as_ref(),
+            Provider::Anthropic,
+            "a",
+            &StoredTokens::Anthropic(TokenSet {
+                access_token: "quarantined-access".into(),
+                refresh_token: "quarantined-refresh".into(),
+                expires_at: chrono::Utc::now() + chrono::TimeDelta::hours(1),
+                refresh_token_expires_at: chrono::Utc::now() + chrono::TimeDelta::days(30),
+                scopes: vec!["user:profile".into()],
+                client_id: "test".into(),
+            }),
+        )
+        .unwrap();
+        let mut state = app_state(store);
+        state.usage_url = usage.uri();
+        state.scheduler.lock().await.record_failure(
+            Provider::Anthropic,
+            "a",
+            quota_core::scheduler::FailureKind::AuthDead,
+        );
+
+        let (result, polled) = refresh_account_for(&state, Provider::Anthropic, "a").await;
+
+        assert_eq!(result.unwrap(), AccountState::AuthDead);
+        assert!(!polled, "a quarantined account was polled again");
+        assert!(
+            usage.received_requests().await.unwrap().is_empty(),
+            "manual refresh retried a grant already quarantined on one strike"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_metadata_remove_failure_keeps_the_row_and_scheduler_for_a_retry() {
+        let store = Arc::new(MemoryStore::default());
+        let mut state = app_state(store);
+
+        let mut dir = std::env::temp_dir();
+        dir.push(format!(
+            "quota-remove-retry-{}-{}",
+            std::process::id(),
+            chrono::Utc::now().timestamp_nanos_opt().unwrap()
+        ));
+        let moved = dir.with_extension("moved");
+        std::fs::create_dir_all(&dir).unwrap();
+        let accounts_path = dir.join("accounts.json");
+        let mut accounts = quota_core::accounts::AccountStore::load(&accounts_path);
+        accounts
+            .upsert(quota_core::accounts::Account {
+                account_id: "a".into(),
+                provider: Provider::Anthropic,
+                workspace_id: None,
+                is_fedramp: false,
+                display_label: "a".into(),
+                email: "a@example.invalid".into(),
+                created_at: chrono::Utc::now(),
+                last_ok_at: None,
+                quarantined: false,
+                sort_order: 0,
+            })
+            .unwrap();
+        state.accounts = tokio::sync::Mutex::new(accounts);
+
+        std::fs::rename(&dir, &moved).unwrap();
+        std::fs::write(&dir, b"blocks the account directory").unwrap();
+
+        let first = remove_account_for(&state, Provider::Anthropic, "a").await;
+        assert!(first.is_err(), "the blocked metadata write unexpectedly succeeded");
+        assert!(
+            state
+                .accounts
+                .lock()
+                .await
+                .list()
+                .iter()
+                .any(|account| {
+                    account.provider == Provider::Anthropic && account.account_id == "a"
+                }),
+            "the failed removal erased the in-memory row needed for retry"
+        );
+        assert!(
+            state
+                .scheduler
+                .lock()
+                .await
+                .state(Provider::Anthropic, "a")
+                .is_some(),
+            "the failed removal erased the scheduler entry needed for retry"
+        );
+
+        std::fs::remove_file(&dir).unwrap();
+        std::fs::rename(&moved, &dir).unwrap();
+        remove_account_for(&state, Provider::Anthropic, "a")
+            .await
+            .expect("the removal could not be retried after metadata recovered");
+        assert!(
+            state
+                .accounts
+                .lock()
+                .await
+                .list()
+                .iter()
+                .all(|account| {
+                    account.provider != Provider::Anthropic || account.account_id != "a"
+                })
+        );
+        assert!(
+            state
+                .scheduler
+                .lock()
+                .await
+                .state(Provider::Anthropic, "a")
+                .is_none()
+        );
+
+        std::fs::remove_file(accounts_path).ok();
+        std::fs::remove_dir(dir).ok();
     }
 
     /// §9.3 again, one layer up from `usage::raw::RawLog`'s own pair-key test:

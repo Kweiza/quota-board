@@ -15,14 +15,15 @@ whether the same product can show Codex usage beside it.
 
 `GET https://chatgpt.com/backend-api/wham/usage` returns Codex usage limits to
 an honest `quota-board/<version>` User-Agent, with no header that identifies
-Codex CLI and no Cloudflare challenge. §2.2's premise — a free query endpoint
-exists — holds for Codex.
+Codex CLI and no Cloudflare challenge. A read-only GET endpoint exists; no
+movement was observed after reads, but zero consumption is not proven because
+the same instrument did not move after one real turn either.
 
-The qualification is that **no window with usage in it was ever observed.** Both
-accounts read 0% throughout, so the shape a populated window takes, and what
-`reset_after_seconds` does once a window is in use, are not measured. §5.5's
-schema tolerance and the never-demote-to-0% rule carry the design across that
-gap, but the gap is real and is not closed by this run.
+The qualification at the time of this run was that **no window with usage in it
+was observed.** Both accounts read 0% throughout. A later sanitized paid-account
+capture closed the populated-window shape gap; see the 2026-09-04 addendum.
+What `reset_after_seconds` does over the full life of an active window remains
+unmeasured.
 
 ## The endpoint
 
@@ -39,8 +40,13 @@ Nothing else is required. Measured:
 |---|---|
 | `Authorization: Bearer` | required |
 | `User-Agent: quota-board/…` | **accepted**. 200 on the first attempt |
-| `ChatGPT-Account-Id: <id>` | **not required** — 200 with and without it |
+| `ChatGPT-Account-Id: <id>` | not required for the two personal accounts measured in this run |
 | `originator: codex_cli_rs` | never sent; not needed |
+
+The bearer-only result is not a general workspace-selection contract. Current
+Codex source obtains an optional `chatgpt_account_id` from the ID token;
+quota-board sends `ChatGPT-Account-ID` when that value is present so a user with
+more than one workspace queries the one selected during authorization.
 
 **The §5.2 problem does not arise here.** On the Anthropic side an honest
 User-Agent costs the generous throttle bucket, and that price is paid
@@ -90,7 +96,7 @@ used to make the two 403s above behave differently.
 
 ## Response schema
 
-Twelve top-level keys, identical on both plans:
+Twelve top-level keys, identical on both plans in the 2026-08-03 run:
 
 ```
 account_id  additional_rate_limits  code_review_rate_limit  credits
@@ -98,10 +104,11 @@ email       plan_type               promo                   rate_limit
 rate_limit_reached_type  rate_limit_reset_credits  spend_control  user_id
 ```
 
-`email`, `user_id`, and `account_id` are in the body. On the account measured,
-`account_id` and `user_id` were the same `user-…` string — a personal account
-with no workspace. **This body carries identifiers, so raw captures belong in
-`.local/`, never in this repository.**
+`email`, `user_id`, and `account_id` are in the body. On the personal accounts
+measured that day, `account_id` and `user_id` were the same `user-…` string.
+The later paid capture distinguishes them: `user_id` names the person and
+`account_id` names the selected workspace. **These bodies carry identifiers, so
+raw captures belong in `.local/`, never in this repository.**
 
 ### `rate_limit`
 
@@ -122,9 +129,9 @@ so it advances one second per second of wall clock — a comparison that include
 it will always report movement.
 
 `secondary_window`, `additional_rate_limits`, and `code_review_rate_limit` were
-`null` on both accounts. **Their populated shape is unmeasured.** The ChatGPT
-usage page shows no 5-hour window for this plan either, so the two-window
-5h + weekly shape assumed before this run may simply not exist here.
+`null` on both accounts. The later paid capture establishes the populated
+`secondary_window` shape, but the other two remain unmeasured. The ChatGPT usage
+page showed no 5-hour window for either account in this first run.
 
 ### `rate_limit_reset_credits`
 
@@ -136,6 +143,10 @@ usage page shows no 5-hour window for this plan either, so the two-window
 Present in the usage response itself, so the widget's reset-credit line needs
 **no second request**. The sibling path `…/rate-limit-reset-credits/consume`
 spends a credit and is never called by the script.
+
+The current official client also accepts the summary form
+`{ "available_count": N }` with no applicable count. The parser therefore
+keeps applicability optional: absence is unknown, not a fabricated zero.
 
 ### `credits` and `spend_control`
 
@@ -212,10 +223,12 @@ Discovery at `https://auth.openai.com/.well-known/openid-configuration`
 request log records `https://auth.openai.com/oauth/token`, and
 `https://auth.openai.com/deviceauth/callback` for device login. Both are
 recorded here because a design that picks one on the strength of discovery alone
-would be picking the one nothing has been observed to use.
+would be picking the one nothing has been observed to use. The source audit in
+the addendum establishes the full operational contract.
 
 The codex binary carries the public client `app_EMoamEEZ73f0CkXaXp7hrann`.
-**Not verified**: no authorization flow was run against it in this spike.
+The same value is confirmed in the official source; no quota-board
+authorization flow had been run against it as of this spike.
 
 Note for §10.4's counterpart: the advertised scope list contains nothing
 resembling `user:inference`, so there is no inference scope to decline. That is
@@ -314,17 +327,79 @@ free and with the instrument being too blunt at this scale.
 ## Scope limits
 
 - **Two accounts, one machine, one day, and neither had usage in flight.**
-  Every schema statement above describes a zero-usage account.
-- **`secondary_window`, `additional_rate_limits`, and `code_review_rate_limit`
-  are unmeasured.** They were `null` in every capture. A run in which a field
-  stays null measures nothing about that field.
+  Every schema statement in Spikes F and G describes a zero-usage account. The
+  later addendum is a separate paid-account observation.
+- **`additional_rate_limits` and `code_review_rate_limit` remain unmeasured
+  live.** They were `null` in every project capture. Official documentation and
+  source establish the former's dynamic bucket shape, which is implementation
+  evidence; no equivalent evidence is claimed for the latter.
 - **No throttle boundary was measured.** Spike B and D did that work for
   Anthropic; nothing equivalent exists here. The 429 behaviour of this endpoint,
   whether it sends `Retry-After`, and whether its budget is per account or per
   IP are all unknown. A poll interval for Codex accounts cannot be derived from
   this document.
-- **No OAuth flow was run.** The endpoints and client_id above come from
-  discovery and from the binary; nothing here confirms an authorization request
-  against them succeeds, or what the consent screen displays.
+- **No quota-board OAuth flow was run in these spikes.** The addendum separates
+  the later official-source confirmation from live quota-board verification;
+  source code proves what the official client does, not what this client has
+  successfully completed.
 - **The read-cost question is answered only in the weak direction.** Reads did
   not move the numbers, at a scale where one real turn did not move them either.
+
+---
+
+# 2026-09-04 addendum — populated usage and the official auth contract
+
+Two later pieces of evidence close different gaps and must not be conflated.
+
+## Populated paid-account capture (measured)
+
+A raw response captured on 2026-09-03 was sanitized into
+`crates/core/src/usage/fixtures/openai_paid_active.json`. It measured:
+
+- `primary_window`: 18,000 seconds (`5h`), 31% used;
+- `secondary_window`: 604,800 seconds (`7d`), 6% used;
+- different `user_id` and `account_id` values, establishing person and
+  workspace as separate dimensions;
+- an additional top-level `model_usage` field, demonstrating that the August
+  key list was a snapshot rather than a closed schema.
+
+This establishes the populated window layout. It does not establish the full
+temporal behavior of `reset_after_seconds`, populated
+`additional_rate_limits`, or populated `code_review_rate_limit`.
+
+## Official Codex 0.153.2 source audit (source-derived)
+
+The installed `codex-cli 0.153.2` was cross-checked against official tag
+`rust-v0.153.2` (`657a993cbee87acf52d14b758ce49dbd46d1b8eb`). The source uses:
+
+| Operation | Contract |
+|---|---|
+| Browser authorize | `GET https://auth.openai.com/oauth/authorize`, PKCE S256, callback `http://localhost:1455/auth/callback` with allowlisted fallback port 1457 |
+| Code exchange | form-encoded `POST https://auth.openai.com/oauth/token` |
+| Device start/poll | JSON `POST /api/accounts/deviceauth/usercode` and `/api/accounts/deviceauth/token`; verify at `/codex/device` |
+| Device exchange redirect | `https://auth.openai.com/deviceauth/callback` |
+| Refresh | JSON `POST https://auth.openai.com/oauth/token`, no scope field |
+| Revoke | JSON `POST https://auth.openai.com/oauth/revoke` |
+
+The current app-server contract exposes rate limits as a dynamic map rather
+than a fixed pair. The same official Codex 0.153.2 tag maps populated
+`additional_rate_limits` entries into that view and accepts a reset-credit
+summary containing only `available_count`. Each rate-limit entry carries a
+stable `metered_feature`, a display `limit_name`, and its own primary/secondary
+windows. quota-board keeps all readable entries, using the feature and slot
+together as the stable window id. This is implementation evidence; every
+project-owned live capture still had the field set to `null`.
+
+Identity comes from the ID token: `chatgpt_user_id` (falling back to the nested
+auth `user_id`) names the person, optional `chatgpt_account_id` names the
+workspace when the issuer supplies it, email falls back from the top-level
+claim to the profile claim, and `chatgpt_account_is_fedramp` controls the
+official client's conditional routing header. Usage requests send
+`ChatGPT-Account-ID` when that optional value exists; no `originator` header is
+needed for the request.
+
+This is authoritative evidence for the official client's protocol, not a claim
+that quota-board has completed it. Live quota-board login, refresh, revocation,
+the device-disabled fallback, multi-workspace behavior, FedRAMP routing, Codex
+429 semantics, and a strong proof that reads consume nothing remain separate
+verification questions until a dated run records them.

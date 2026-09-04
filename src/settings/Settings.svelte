@@ -3,7 +3,7 @@
   import type { UnlistenFn } from '@tauri-apps/api/event'
   import { openUrl } from '@tauri-apps/plugin-opener'
   import AccountList from './AccountList.svelte'
-  import { queriesPerDay } from '../lib/format'
+  import { queriesPerDay, untilHhMm } from '../lib/format'
   import { providerName } from '../lib/provider'
   import { accountKey } from '../lib/types'
   import {
@@ -14,6 +14,7 @@
     lastResponse,
     listAccounts,
     onAccountsChanged,
+    onAuthCompleted,
     onAuthFailed,
     onManualFallback,
     refreshAccount,
@@ -28,8 +29,10 @@
   } from '../lib/ipc'
   import type {
     AccountView,
+    AuthCompleted,
+    AuthFailed,
     AutostartView,
-    LoginUrls,
+    LoginStart,
     ManualFallback,
     Provider,
     RawResponse,
@@ -175,6 +178,129 @@
   let loadedFor: string | null = null
   $: loaded = selected !== '' && loadedFor === selected
 
+  type ActiveLogin = { attempt_id: number; provider: Provider }
+  type DeferredAuthEvent =
+    | { kind: 'completed'; payload: AuthCompleted }
+    | { kind: 'failed'; payload: AuthFailed }
+    | { kind: 'manual_fallback'; payload: ManualFallback }
+
+  /**
+   * Command results and background events cross independent IPC paths. A Codex
+   * device poll can fail before `begin_login` finishes returning the code that
+   * started it, so the attempt id is the authority for which panel an event may
+   * change.
+   */
+  let activeLogin: ActiveLogin | null = null
+  let latestSettledAttemptId = 0
+  const deferredAuthEvents = new Map<number, DeferredAuthEvent>()
+
+  function clearLoginUi(): void {
+    fallback = null
+    pasted = ''
+    codexLogin = null
+    codexOpenError = null
+  }
+
+  function deferAuthEvent(event: DeferredAuthEvent): void {
+    const id = event.payload.attempt_id
+    const previous = deferredAuthEvents.get(id)
+    // A terminal result outranks a fallback. The backend emits only one, but
+    // making the first terminal result sticky keeps a duplicate or reordered
+    // delivery from resurrecting an attempt.
+    if (previous?.kind === 'completed' || previous?.kind === 'failed') return
+    deferredAuthEvents.set(id, event)
+  }
+
+  function applyAuthEvent(event: DeferredAuthEvent): void {
+    const active = activeLogin
+    if (active === null || active.attempt_id !== event.payload.attempt_id) return
+    if (active.provider !== event.payload.provider) {
+      clearLoginUi()
+      activeLogin = null
+      latestSettledAttemptId = Math.max(latestSettledAttemptId, event.payload.attempt_id)
+      error = 'the backend returned an authentication event for the wrong provider'
+      return
+    }
+
+    if (event.kind === 'manual_fallback') {
+      fallback = event.payload
+      pasted = ''
+      codexLogin = null
+      codexOpenError = null
+      error = null
+      return
+    }
+
+    clearLoginUi()
+    activeLogin = null
+    latestSettledAttemptId = Math.max(latestSettledAttemptId, event.payload.attempt_id)
+    if (event.kind === 'failed') {
+      error = event.payload.message
+    } else {
+      error = null
+      void pullAccounts()
+    }
+  }
+
+  function receiveAuthEvent(event: DeferredAuthEvent): void {
+    const id = event.payload.attempt_id
+    if (id <= latestSettledAttemptId) return
+    if (activeLogin?.attempt_id === id) {
+      applyAuthEvent(event)
+      return
+    }
+    // Attempt ids increase for the life of the process. A smaller id can only
+    // belong to the attempt the currently visible one replaced.
+    if (activeLogin !== null && id < activeLogin.attempt_id) return
+    deferAuthEvent(event)
+  }
+
+  function loginStartProvider(started: LoginStart): Provider {
+    return started.kind === 'claude_browser' ? 'anthropic' : 'openai'
+  }
+
+  function loginIsActive(started: LoginStart): boolean {
+    return (
+      activeLogin?.attempt_id === started.attempt_id &&
+      activeLogin.provider === loginStartProvider(started)
+    )
+  }
+
+  /**
+   * Installs a command result, then consumes an event that won the race here.
+   * `true` means that event already decided the UI, so the caller must not open
+   * a browser or render the command result afterwards.
+   */
+  function acceptLoginStart(started: LoginStart, provider: Provider): boolean {
+    if (
+      started.attempt_id <= latestSettledAttemptId ||
+      (activeLogin !== null && started.attempt_id < activeLogin.attempt_id)
+    ) {
+      deferredAuthEvents.delete(started.attempt_id)
+      return true
+    }
+
+    const returnedProvider = loginStartProvider(started)
+    if (returnedProvider !== provider) {
+      clearLoginUi()
+      activeLogin = null
+      error = `the backend returned a ${providerName(returnedProvider)} login for a ${providerName(provider)} request`
+      return true
+    }
+
+    activeLogin = { attempt_id: started.attempt_id, provider }
+    clearLoginUi()
+    error = null
+    for (const id of deferredAuthEvents.keys()) {
+      if (id < started.attempt_id) deferredAuthEvents.delete(id)
+    }
+    const deferred = deferredAuthEvents.get(started.attempt_id)
+    if (deferred === undefined) return false
+    deferredAuthEvents.delete(started.attempt_id)
+    applyAuthEvent(deferred)
+    return true
+  }
+
   /**
    * Returns the debug panel to "nothing selected".
    *
@@ -193,7 +319,24 @@
   $: dailyCalls = queriesPerDay(intervalSecs, accounts.length)
 
   let unlisteners: UnlistenFn[] = []
+  /**
+   * Login can finish on a background task before `begin_login` returns. The
+   * event bridge is therefore part of the login precondition, not setup that a
+   * click may race. Both providers use the same gate.
+   */
+  let loginListenersReady = false
   let destroyed = false
+
+  function releaseListener(unlisten: UnlistenFn): void {
+    try {
+      unlisten()
+    } catch (e) {
+      // The webview/event plugin may already be gone during teardown. There is
+      // no listener left to leak in that state, so teardown must not become an
+      // unhandled rejection.
+      console.warn('quota-board: event listener was already unavailable', e)
+    }
+  }
 
   async function pullAccounts(): Promise<void> {
     try {
@@ -209,8 +352,16 @@
       // last good list, and reconciling against a list we failed to fetch would
       // clear every note instead.
       const live = new Set(accounts.map((a) => accountKey(a.account_id, a.provider)))
+      const authDead = new Set(
+        accounts
+          .filter((a) => a.state.kind === 'auth_dead')
+          .map((a) => accountKey(a.account_id, a.provider)),
+      )
       Object.keys(throttledUntil)
-        .filter((key) => !live.has(key))
+        // AUTH_DEAD makes re-login the only remedy. Retire a previous throttle
+        // note permanently here: merely hiding it would let it reappear after
+        // a successful re-login, attached to a grant that never received it.
+        .filter((key) => !live.has(key) || authDead.has(key))
         .forEach(forgetThrottle)
       // The debug panel is reconciled against the same list, for a stronger
       // reason than the notes above: a note is stale wall-clock text, while a
@@ -280,16 +431,14 @@
       }
     })()
     void (async () => {
-      // Login finishes in the background, so without these two subscriptions a
+      // Login finishes in the background, so without these subscriptions a
       // completed login never reaches this window.
-      const fns = [
-        await onAccountsChanged(() => {
+      const registrations = await Promise.allSettled([
+        onAccountsChanged(() => {
           // An `accounts://changed` means an account mutation *succeeded*, so
-          // it retires whatever error is on screen. `guard()` only clears the
-          // banner for click-driven commands; without this, the refusal from a
-          // second "Add account" click survives the login the user then
-          // completed in the browser — the account appears in the list and the
-          // widget while the banner still says a login is in progress.
+          // it retires whatever error is on screen. Login UI is deliberately
+          // not cleared here: rename/reorder/remove emit the same event and
+          // must not hide a live browser or device code.
           //
           // Cleared synchronously, before the awaited re-read: an
           // `auth://failed` arriving afterwards sets the banner again and must
@@ -297,36 +446,57 @@
           // The two events do not race for one outcome — they report different
           // ones.
           error = null
-          // The login is over, however it finished, so the paste form goes with
-          // it — leaving it up would invite a code for a login that is done.
-          fallback = null
-          pendingLoginProvider = null
           void pullAccounts()
         }),
-        await onAuthFailed((message) => {
-          error = message
-          fallback = null
-          pendingLoginProvider = null
-        }),
+        onAuthCompleted((payload) =>
+          receiveAuthEvent({ kind: 'completed', payload }),
+        ),
+        onAuthFailed((payload) =>
+          receiveAuthEvent({ kind: 'failed', payload }),
+        ),
         // The other two of §10.3's four loopback failures: both are seen only
         // by the background task, and neither ends the login.
-        await onManualFallback((f) => {
-          fallback = f
-          error = null
+        onManualFallback((f) => {
+          receiveAuthEvent({ kind: 'manual_fallback', payload: f })
         }),
-      ]
+      ])
+      const fns: UnlistenFn[] = []
+      let registrationFailed = false
+      let failure: unknown
+      for (const registration of registrations) {
+        if (registration.status === 'fulfilled') {
+          fns.push(registration.value)
+        } else if (!registrationFailed) {
+          registrationFailed = true
+          failure = registration.reason
+        }
+      }
+      if (registrationFailed) {
+        // `Promise.all` would discard the successful registrations as soon as
+        // one sibling rejects. Waiting for all four to settle lets every live
+        // listener be released, including one that registered after the first
+        // rejection, so a later window cannot receive duplicate events.
+        fns.forEach(releaseListener)
+        if (!destroyed) {
+          error = `Authentication updates could not be connected (${String(failure)}). Restart Quota Board before adding an account.`
+        }
+        return
+      }
       // Closing this window is a hide, not a destroy
       // (`src-tauri/src/main.rs`), so leaked subscriptions accumulate for the
       // life of the process. If destruction won the race against `listen`,
       // release them here — `onDestroy` has already run and saw an empty array.
-      if (destroyed) fns.forEach((fn) => fn())
-      else unlisteners = fns
+      if (destroyed) fns.forEach(releaseListener)
+      else {
+        unlisteners = fns
+        loginListenersReady = true
+      }
     })()
   })
 
   onDestroy(() => {
     destroyed = true
-    unlisteners.forEach((fn) => fn())
+    unlisteners.forEach(releaseListener)
     unlisteners = []
     // Same reason the unlisteners are released here: closing this window is a
     // hide, not a destroy, so anything left armed outlives every visit.
@@ -335,15 +505,13 @@
   })
 
   async function addAccount(provider: Provider): Promise<void> {
-    // No local "pending" flag. The Rust side is the single-flight
-    // (`begin_login` answers `a login is already in progress`), and a second
-    // disabled state here would be the two-sources-disagree hazard §7.1 exists
-    // to prevent — with the extra failure that success arrives on
-    // `accounts://changed`, so a flag cleared only on `auth://failed` would
-    // disable the button for the life of the process.
-    let urls: LoginUrls
+    // Rust remains the single-flight authority (`begin_login` refuses a second
+    // attempt). `activeLogin` above does not duplicate that policy; it only
+    // correlates the command result with the asynchronous event that finishes
+    // the accepted attempt.
+    let started: LoginStart
     try {
-      urls = await beginLogin(provider)
+      started = await beginLogin(provider)
     } catch (e) {
       // `begin_login` refused outright — a login is already in progress, or the
       // authorize URL is misconfigured (§10.2). There is no manual URL to fall
@@ -351,37 +519,89 @@
       error = String(e)
       return
     }
-    // Set only after `begin_login` accepts this attempt. A second button press
-    // rejected by the Rust single-flight must not relabel the first login.
-    pendingLoginProvider = provider
-    error = null
+    if (acceptLoginStart(started, provider)) return
 
-    // Two of §10.3's four loopback failures are visible only here, and the Rust
-    // side never learns about either, so neither can arrive as an event.
-    if (urls.loopback === null) {
-      fallback = {
-        url: urls.manual,
-        reason: 'no local port could be opened for the browser to reply to',
+    if (started.kind === 'claude_browser') {
+      // Two of §10.3's four Claude loopback failures are visible only here,
+      // and the Rust side never learns about either, so neither arrives as an
+      // event.
+      if (started.loopback === null) {
+        fallback = {
+          attempt_id: started.attempt_id,
+          provider: 'anthropic',
+          url: started.manual,
+          reason: 'no local port could be opened for the browser to reply to',
+        }
+        return
+      }
+      try {
+        await openUrl(started.loopback)
+      } catch (e) {
+        if (!loginIsActive(started)) return
+        fallback = {
+          attempt_id: started.attempt_id,
+          provider: 'anthropic',
+          url: started.manual,
+          reason: `the browser could not be opened (${String(e)})`,
+        }
       }
       return
     }
+
+    codexLogin = started
+    codexOpenError = null
+    const url = started.kind === 'codex_browser' ? started.authorize_url : started.verification_url
     try {
-      await openUrl(urls.loopback)
+      await openUrl(url)
     } catch (e) {
-      fallback = { url: urls.manual, reason: `the browser could not be opened (${String(e)})` }
+      if (!loginIsActive(started)) return
+      // This login is still alive. Keep its URL (and device code, when present)
+      // visible instead of replacing a recoverable state with a terminal error.
+      codexOpenError = codexOpenFailure(started, e)
     }
   }
 
-  /**
-   * §10.3's paste path, offered only once the loopback half cannot finish.
-   *
-   * Not an `error`: this is a login that can still succeed, and putting it in
-   * the warning banner would say the opposite. The banner stays for things that
-   * are actually over.
-   */
+  type CodexLogin = Extract<LoginStart, { kind: 'codex_browser' | 'codex_device' }>
+  let codexLogin: CodexLogin | null = null
+  let codexOpenError: string | null = null
+
+  function codexOpenFailure(login: CodexLogin, error: unknown): string {
+    const where = login.kind === 'codex_browser' ? 'on this computer' : 'in any browser'
+    return `The browser could not be opened (${String(error)}). Open the link below ${where}.`
+  }
+
+  async function reopenCodex(): Promise<void> {
+    if (codexLogin === null) return
+    const login = codexLogin
+    const url =
+      login.kind === 'codex_browser'
+        ? login.authorize_url
+        : login.verification_url
+    try {
+      await openUrl(url)
+      if (!loginIsActive(login)) return
+      codexOpenError = null
+    } catch (e) {
+      if (!loginIsActive(login)) return
+      codexOpenError = codexOpenFailure(login, e)
+    }
+  }
+
+  async function reopenClaude(): Promise<void> {
+    if (fallback === null) return
+    const current = fallback
+    try {
+      await openUrl(current.url)
+      if (fallback?.attempt_id !== current.attempt_id) return
+      error = null
+    } catch (e) {
+      if (fallback?.attempt_id !== current.attempt_id) return
+      error = `The browser could not be opened (${String(e)}). Copy the link above into any browser.`
+    }
+  }
+
+  /** Claude's manual-paste fallback. Codex never produces `code#state`. */
   let fallback: ManualFallback | null = null
-  let pendingLoginProvider: Provider | null = null
-  $: pendingLoginName = pendingLoginProvider === null ? 'account' : providerName(pendingLoginProvider)
   let pasted = ''
   let submitting = false
 
@@ -392,8 +612,9 @@
       await submitManualCode(pasted)
       error = null
       pasted = ''
-      // The block itself is cleared by `accounts://changed`, which is also what
-      // re-reads the list — the login is not finished until that arrives.
+      // The block itself is cleared by the correlated `auth://completed`. The
+      // account-list event also re-reads the list, but rename/remove/reorder use
+      // that event too and therefore cannot decide that a login ended.
     } catch (e) {
       // Every refusal from `submit_manual_code` is a different sentence naming
       // what to do next, so it is shown as-is.
@@ -426,11 +647,11 @@
     void guard(() => reorderAccounts(keys))
   }
 
-  function refresh(uuid: string, provider: Provider): void {
+  function refresh(uuid: string, provider: Provider): Promise<void> {
     const key = accountKey(uuid, provider)
     // `refresh_account` emits `usage://updated`, which only the widget listens
     // for, so this window re-reads the list itself.
-    void guard(async () => {
+    return guard(async () => {
       const state = await refreshAccount(uuid, provider)
       // Observed: "Refresh now does not work — the capture time never
       // changes." The cause then was §6.1's client-side floor, which §6.4 has
@@ -540,7 +761,10 @@
       <div class="provider-card" role="group" aria-labelledby="add-claude-title">
         <h3 id="add-claude-title">Claude</h3>
         <p>Connect a Claude account and monitor the limits it reports.</p>
-        <button type="button" on:click={() => addAccount('anthropic')}>Add Claude account</button>
+        <button
+          type="button"
+          disabled={!loginListenersReady}
+          on:click={() => addAccount('anthropic')}>Add Claude account</button>
         <!-- Reworded from the note on `pkce::begin` in
              `crates/core/src/auth/pkce.rs`. It lives inside the Claude choice
              because none of it applies to Codex. -->
@@ -552,20 +776,27 @@
       </div>
       <div class="provider-card" role="group" aria-labelledby="add-codex-title">
         <h3 id="add-codex-title">Codex</h3>
-        <p>Connect a Codex account and monitor the limits it reports.</p>
-        <button type="button" on:click={() => addAccount('openai')}>Add Codex account</button>
-        <p class="provider-note">OpenAI handles authorization for the Codex account you choose.</p>
+        <p>
+          Connect a Codex account and monitor the limits it reports. Codex and
+          ChatGPT Work share the same usage allowance.
+        </p>
+        <button
+          type="button"
+          disabled={!loginListenersReady}
+          on:click={() => addAccount('openai')}>Add Codex account</button>
+        <p class="provider-note">
+          Codex sign-in normally returns through this computer's browser. If
+          both registered callback ports are busy, OpenAI's device-code flow is
+          offered instead.
+        </p>
       </div>
     </div>
 
-    <!-- docs/design.md §10.3. Shown only after the automatic half has given up;
-         until then this whole block is absent, which is the decision recorded
-         in the plan (a permanently visible "can't open a browser?" disclosure
-         would be clutter for everyone who never needs it). -->
+    <!-- Claude alone has the provider-hosted code#state fallback. -->
     {#if fallback}
       {@const fb = fallback}
       <div class="fallback" aria-labelledby="fallback-title">
-        <h3 id="fallback-title">Finish adding {pendingLoginName}</h3>
+        <h3 id="fallback-title">Finish adding Claude</h3>
         <p class="warn">{fb.reason}.</p>
         <p class="hint">
           Open the link below in any browser — it does not have to be this
@@ -578,7 +809,7 @@
              The button is for the narrower case where a browser exists but
              could not be launched automatically. -->
         <p class="url">{fb.url}</p>
-        <button type="button" on:click={() => void openUrl(fb.url)}>Open in browser</button>
+        <button type="button" on:click={reopenClaude}>Open in browser</button>
         <label for="manual-code">Code from the page</label>
         <input
           id="manual-code"
@@ -589,6 +820,31 @@
         <button type="button" on:click={submitCode} disabled={submitting || pasted.trim() === ''}>
           Submit
         </button>
+      </div>
+    {/if}
+
+    {#if codexLogin}
+      <div class="fallback" aria-labelledby="codex-login-title">
+        <h3 id="codex-login-title">Finish adding Codex</h3>
+        {#if codexOpenError}<p class="warn">{codexOpenError}</p>{/if}
+        {#if codexLogin.kind === 'codex_browser'}
+          <p class="hint">
+            Complete sign-in in your browser. It will return to Quota Board on
+            this computer automatically.
+          </p>
+          <p class="url">{codexLogin.authorize_url}</p>
+          <button type="button" on:click={reopenCodex}>Open Codex sign-in</button>
+        {:else}
+          <p class="hint">
+            Open the link, sign in, and enter this one-time code. Device sign-in
+            is a beta OpenAI feature and may need to be enabled in ChatGPT
+            security or workspace settings.
+          </p>
+          <p class="url">{codexLogin.verification_url}</p>
+          <output class="device-code" aria-label="Codex device code">{codexLogin.user_code}</output>
+          <p class="hint">Expires at {untilHhMm(codexLogin.expires_at)}.</p>
+          <button type="button" on:click={reopenCodex}>Open Codex device sign-in</button>
+        {/if}
       </div>
     {/if}
   </section>
@@ -649,13 +905,12 @@
     {#if status}
       <p class="note">{status.description}</p>
       <!-- One branch per `StoreKind`, plus a fallback. The form's visibility is
-           decided by `kind`, never by `fallback_file_exists`: on a missing file
-           any passphrase opens an empty store and writes nothing, so that flag
-           is still false right after the first successful unlock — it chooses
-           the wording only. `encrypted_file` therefore cannot share a branch
-           with `no_backend`, which is how the shipped window came to tell a
-           user who had just unlocked the store that no store existed yet and
-           that values would not update. -->
+           decided by `kind`, not guessed from `fallback_file_exists`:
+           `encrypted_file_locked` means an existing credential store was
+           selected and needs its passphrase, while `no_backend` creates the
+           first one. `encrypted_file` cannot share either branch — an empty
+           open store may not have written its first file yet, and treating it
+           as locked was the shipped state this discriminant fixed. -->
       {#if status.kind === 'keychain'}
         <p class="note">Tokens are held in the OS keychain, which unlocks at login.</p>
       {:else if status.kind === 'encrypted_file'}
@@ -669,6 +924,15 @@
           OS and restart Quota Board — a passphrase here would open a
           different, empty store.
         </p>
+      {:else if status.kind === 'encrypted_file_locked'}
+        <p class="warn">
+          An existing encrypted store is selected, but it is locked. Enter its
+          passphrase to let values update; creating a different store would
+          strand the accounts already saved in this one.
+        </p>
+        <label for="passphrase">Passphrase</label>
+        <input id="passphrase" type="password" bind:value={passphrase} disabled={busy} />
+        <button on:click={unlock} disabled={busy || passphrase === ''}>Unlock</button>
       {:else if status.kind === 'no_backend'}
         <p class="warn">
           Values will not update until the passphrase is entered after each boot.
@@ -797,6 +1061,10 @@
   .settings .url { user-select: text; font-size: 11px; margin: .5em 0;
                    font-family: ui-monospace, monospace; word-break: break-all;
                    background: rgba(0, 0, 0, .35); padding: .4em; border-radius: 4px; }
+  .device-code { display: block; user-select: text; margin: .65em 0;
+                 padding: .35em .55em; border: 1px solid currentColor;
+                 border-radius: 4px; font: 700 16px/1.3 ui-monospace, monospace;
+                 letter-spacing: .08em; }
   .settings .fallback input { width: 100%; box-sizing: border-box; padding: .25em .35em;
                               margin-bottom: .5em; }
   /* Selectable on purpose: copying this into an issue is the panel's reason to

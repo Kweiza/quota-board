@@ -66,20 +66,30 @@ pub async fn fetch_usage(
     provider: Provider,
     access_token: &str,
 ) -> Result<Vec<UsageWindow>, UsageError> {
-    fetch_usage_for_account(http, provider, access_token, None, false).await
+    let url = match provider {
+        Provider::Anthropic => USAGE_URL,
+        Provider::Openai => OPENAI_USAGE_URL,
+    };
+    // The URL-taking compatibility wrapper owns the provider-blind OpenAI
+    // guard, so every legacy entry point fails before it can send a request.
+    fetch_usage_at(http, provider, url, access_token).await
 }
 
-/// The production fetch with optional OpenAI workspace context.
+/// The production fetch with OpenAI account and workspace context.
 ///
 /// `workspace_id` is OpenAI's quota-bearing `chatgpt_account_id`, not the user
-/// id used as this application's account key. Anthropic ignores both context
-/// values, and an absent workspace is never guessed from another identifier.
+/// id in `expected_account_id`, which is this application's account key. A
+/// Codex 200 is accepted only when its `user_id` matches that key; when a
+/// workspace was supplied, `account_id` must match it too. Anthropic ignores
+/// all three context values, and an absent workspace is never guessed from
+/// another identifier.
 pub async fn fetch_usage_for_account(
     http: &ReqwestHttp,
     provider: Provider,
+    expected_account_id: &str,
     access_token: &str,
     workspace_id: Option<&str>,
-    is_fedramp: bool,
+    is_fedramp: Option<bool>,
 ) -> Result<Vec<UsageWindow>, UsageError> {
     let url = match provider {
         Provider::Anthropic => USAGE_URL,
@@ -89,6 +99,7 @@ pub async fn fetch_usage_for_account(
         http,
         provider,
         url,
+        expected_account_id,
         access_token,
         workspace_id,
         is_fedramp,
@@ -98,31 +109,35 @@ pub async fn fetch_usage_for_account(
 
 /// The URL-taking form. Tests point this at a mock server.
 ///
-/// Signature unchanged apart from `provider`: `crates/cli` (via `fetch_usage`)
-/// and the tests below call this and must keep compiling. It is now a thin
-/// wrapper over the capturing form.
+/// Compatibility wrapper for the pre-provider Anthropic API. It is a thin
+/// wrapper over the capturing form; OpenAI responses fail closed because this
+/// signature cannot supply the identity they must be checked against.
 pub async fn fetch_usage_at(
     http: &ReqwestHttp,
     provider: Provider,
     url: &str,
     access_token: &str,
 ) -> Result<Vec<UsageWindow>, UsageError> {
-    fetch_usage_for_account_at(http, provider, url, access_token, None, false).await
+    fetch_usage_captured_at(http, provider, url, access_token)
+        .await
+        .outcome
 }
 
-/// The URL-taking form with optional OpenAI workspace context.
+/// The URL-taking form with OpenAI account and workspace context.
 pub async fn fetch_usage_for_account_at(
     http: &ReqwestHttp,
     provider: Provider,
     url: &str,
+    expected_account_id: &str,
     access_token: &str,
     workspace_id: Option<&str>,
-    is_fedramp: bool,
+    is_fedramp: Option<bool>,
 ) -> Result<Vec<UsageWindow>, UsageError> {
     fetch_usage_captured_for_account_at(
         http,
         provider,
         url,
+        expected_account_id,
         access_token,
         workspace_id,
         is_fedramp,
@@ -162,21 +177,35 @@ pub async fn fetch_usage_captured_at(
     url: &str,
     access_token: &str,
 ) -> CapturedFetch {
-    fetch_usage_captured_for_account_at(http, provider, url, access_token, None, false).await
+    if provider == Provider::Openai {
+        // This signature has no expected user id. Fetching would spend one
+        // provider request only to reject the body at the identity gate, and
+        // retaining its extra line would risk attaching another account's
+        // reset credits to this row.
+        return CapturedFetch {
+            raw: None,
+            extra: None,
+            outcome: Err(UsageError::UnknownShape),
+        };
+    }
+    fetch_usage_captured_for_account_at(http, provider, url, "", access_token, None, None).await
 }
 
-/// The capturing form with optional OpenAI workspace context.
+/// The capturing form with OpenAI account and workspace context.
 ///
 /// A true `is_fedramp` claim sends the provider's routing header. False and an
 /// absent workspace preserve the bearer-only request measured to work, rather
-/// than fabricating context from the user id.
+/// than fabricating context from the user id. The response still has to prove
+/// the expected user; when no workspace was supplied, no workspace match is
+/// invented on the way back either.
 pub async fn fetch_usage_captured_for_account_at(
     http: &ReqwestHttp,
     provider: Provider,
     url: &str,
+    expected_account_id: &str,
     access_token: &str,
     workspace_id: Option<&str>,
-    is_fedramp: bool,
+    is_fedramp: Option<bool>,
 ) -> CapturedFetch {
     let (status, body) = match fetch_usage_body_for_account_at(
         http,
@@ -205,10 +234,20 @@ pub async fn fetch_usage_captured_for_account_at(
             anthropic::parse_credit(&body).map(ExtraLine::Credit),
             anthropic::parse_usage(&body).map_err(map_parse_error),
         ),
-        Provider::Openai => (
-            openai::parse_reset_credits(&body).map(ExtraLine::ResetCredits),
-            openai::parse_usage(&body).map_err(map_parse_error),
-        ),
+        Provider::Openai => {
+            let parsed =
+                openai::parse_usage_for_account(&body, expected_account_id, workspace_id);
+            let parsed_extra = openai::parse_reset_credits_for_account(
+                &body,
+                expected_account_id,
+                workspace_id,
+            );
+            // Window-shape drift does not erase an independently readable
+            // reset-credit line. An identity failure is different: nothing in
+            // that body is known to belong to this row.
+            let extra = parsed_extra.ok().flatten().map(ExtraLine::ResetCredits);
+            (extra, parsed.map_err(map_parse_error))
+        }
     };
     CapturedFetch { raw, extra, outcome }
 }
@@ -225,7 +264,7 @@ async fn fetch_usage_body_for_account_at(
     url: &str,
     access_token: &str,
     workspace_id: Option<&str>,
-    is_fedramp: bool,
+    is_fedramp: Option<bool>,
 ) -> Result<(u16, serde_json::Value), UsageError> {
     let mut req = http.raw_client().get(url).bearer_auth(access_token);
     req = match provider {
@@ -241,7 +280,7 @@ async fn fetch_usage_body_for_account_at(
             if let Some(id) = workspace_id.filter(|id| !id.is_empty()) {
                 req = req.header("ChatGPT-Account-ID", id);
             }
-            if is_fedramp {
+            if is_fedramp == Some(true) {
                 req = req.header("X-OpenAI-Fedramp", "true");
             }
             req
@@ -342,14 +381,14 @@ fn is_oauth_not_allowed(body: &serde_json::Value) -> bool {
 
 /// Maps a parse failure to the fetch-level error it becomes.
 ///
-/// Shared by both providers: `anthropic::parse_usage` and `openai::parse_usage`
-/// return the same `ParseError`, and a window present but unreadable must be
-/// surfaced as an error rather than demoted to a fabricated empty success
+/// Shared by both providers: their parsers return the same `ParseError`, and a
+/// window present but unreadable must be surfaced as an error rather than
+/// demoted to a fabricated empty success
 /// (AGENTS.md: never demote a missing value to 0%) whichever provider produced
 /// it.
 ///
 /// Written as an exhaustive match, not `.map_err(|_| UsageError::UnknownShape)`:
-/// if `ParseError` ever gains a third variant, this fails to compile until
+/// if `ParseError` ever gains another variant, this fails to compile until
 /// that variant is given an explicit mapping here, instead of silently
 /// inheriting `UnknownShape` for a case nobody has thought through yet.
 fn map_parse_error(e: ParseError) -> UsageError {
@@ -358,6 +397,9 @@ fn map_parse_error(e: ParseError) -> UsageError {
         // A window existed but could not be read — surface it rather than
         // demoting it to 0%.
         ParseError::UnreadableSource => UsageError::UnknownShape,
+        // A readable body for an unverified user/workspace is no more usable
+        // than an unreadable one. Never attach its values to the requested row.
+        ParseError::UnverifiedIdentity => UsageError::UnknownShape,
     }
 }
 
@@ -369,6 +411,14 @@ mod tests {
     use std::sync::{Arc, Mutex};
     use wiremock::matchers::{header, method, path};
     use wiremock::{Mock, MockServer, Request, ResponseTemplate};
+
+    fn openai_plus_body(user_id: &str, workspace_id: &str) -> serde_json::Value {
+        let mut body: serde_json::Value =
+            serde_json::from_str(include_str!("fixtures/openai_plus_zero.json")).unwrap();
+        body["user_id"] = serde_json::json!(user_id);
+        body["account_id"] = serde_json::json!(workspace_id);
+        body
+    }
 
     #[tokio::test]
     async fn sends_our_own_user_agent_and_only_the_oauth_beta_header() {
@@ -545,11 +595,14 @@ mod tests {
             .mount(&server)
             .await;
 
-        let got = fetch_usage_captured_at(
+        let got = fetch_usage_captured_for_account_at(
             &ReqwestHttp::new().unwrap(),
             Provider::Openai,
             &server.uri(),
+            "user-one",
             TOKEN,
+            None,
+            None,
         )
         .await;
         assert!(matches!(got.outcome, Err(UsageError::UnknownShape)));
@@ -769,7 +822,16 @@ mod tests {
             .await;
 
         let http = ReqwestHttp::new().unwrap();
-        let got = fetch_usage_captured_at(&http, Provider::Openai, &server.uri(), "t").await;
+        let got = fetch_usage_captured_for_account_at(
+            &http,
+            Provider::Openai,
+            &server.uri(),
+            "user-one",
+            "t",
+            None,
+            None,
+        )
+        .await;
 
         match got.outcome {
             Err(UsageError::EdgeRefused { status: 403 }) => {}
@@ -793,11 +855,17 @@ mod tests {
             .await;
 
         let http = ReqwestHttp::new().unwrap();
-        let got = fetch_usage_captured_at(&http, Provider::Openai, &server.uri(), "t").await;
-        assert!(
-            !matches!(got.outcome, Err(UsageError::EdgeRefused { .. })),
-            "a backend answer was mistaken for an edge block"
-        );
+        let got = fetch_usage_captured_for_account_at(
+            &http,
+            Provider::Openai,
+            &server.uri(),
+            "user-one",
+            "t",
+            None,
+            None,
+        )
+        .await;
+        assert!(matches!(got.outcome, Err(UsageError::Unauthorized)));
     }
 
     /// Provider context selects an OpenAI workspace without impersonating an
@@ -811,7 +879,7 @@ mod tests {
             .and(wiremock::matchers::header_regex("user-agent", "^quota-board/"))
             .respond_with(
                 ResponseTemplate::new(200)
-                    .set_body_string(include_str!("fixtures/openai_plus_zero.json"))
+                    .set_body_json(openai_plus_body("user-one", "workspace-one"))
                     .insert_header("x-oai-request-id", "req-1"),
             )
             .mount(&server)
@@ -822,9 +890,10 @@ mod tests {
             &http,
             Provider::Openai,
             &server.uri(),
+            "user-one",
             "t",
             Some("workspace-one"),
-            true,
+            Some(true),
         )
         .await;
         let windows = got.outcome.expect("the mock only matches an honest UA");
@@ -864,33 +933,27 @@ mod tests {
         );
     }
 
-    /// Existing bearer-only callers keep their old behavior. Absence is not
-    /// permission to guess a workspace from the user id or to invent a FedRAMP
-    /// claim.
+    /// Provider-blind callers cannot validate an OpenAI response identity. The
+    /// request itself has no useful outcome, so fail closed before spending
+    /// network or provider budget rather than fetching a 200 only to discard
+    /// it.
     #[tokio::test]
-    async fn the_legacy_openai_wrapper_fabricates_no_account_context() {
+    async fn provider_blind_openai_wrappers_fail_without_a_request() {
         let server = MockServer::start().await;
-        Mock::given(method("GET"))
-            .respond_with(
-                ResponseTemplate::new(200)
-                    .set_body_string(include_str!("fixtures/openai_plus_zero.json"))
-                    .insert_header("x-oai-request-id", "req-1"),
-            )
-            .mount(&server)
-            .await;
+        let http = ReqwestHttp::new().unwrap();
 
-        let got = fetch_usage_captured_at(
-            &ReqwestHttp::new().unwrap(),
-            Provider::Openai,
-            &server.uri(),
-            "t",
-        )
-        .await;
-        got.outcome.unwrap();
+        let plain = fetch_usage_at(&http, Provider::Openai, &server.uri(), "t").await;
+        assert!(matches!(plain, Err(UsageError::UnknownShape)));
 
-        let sent = &server.received_requests().await.unwrap()[0];
-        assert!(sent.headers.get("chatgpt-account-id").is_none());
-        assert!(sent.headers.get("x-openai-fedramp").is_none());
+        let captured =
+            fetch_usage_captured_at(&http, Provider::Openai, &server.uri(), "t").await;
+        assert!(matches!(captured.outcome, Err(UsageError::UnknownShape)));
+        assert!(captured.raw.is_none());
+        assert!(captured.extra.is_none());
+        assert!(
+            server.received_requests().await.unwrap().is_empty(),
+            "a request with no verifiable response identity reached the provider"
+        );
     }
 
     /// False is a real negative claim, not a request to send `false`. OpenAI's
@@ -902,7 +965,7 @@ mod tests {
         Mock::given(method("GET"))
             .respond_with(
                 ResponseTemplate::new(200)
-                    .set_body_string(include_str!("fixtures/openai_plus_zero.json"))
+                    .set_body_json(openai_plus_body("user-one", "workspace-one"))
                     .insert_header("x-oai-request-id", "req-1"),
             )
             .mount(&server)
@@ -912,9 +975,10 @@ mod tests {
             &ReqwestHttp::new().unwrap(),
             Provider::Openai,
             &server.uri(),
+            "user-one",
             "t",
             Some("workspace-one"),
-            false,
+            Some(false),
         )
         .await;
         got.outcome.unwrap();
@@ -922,6 +986,41 @@ mod tests {
         let sent = &server.received_requests().await.unwrap()[0];
         assert!(sent.headers.get("chatgpt-account-id").is_some());
         assert!(sent.headers.get("x-openai-fedramp").is_none());
+    }
+
+    /// A personal grant can omit workspace context. The response's user id is
+    /// still verified, but a response-selected workspace is neither required
+    /// to match nor copied into a later request.
+    #[tokio::test]
+    async fn an_absent_workspace_remains_bearer_only_and_verifies_the_user() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(openai_plus_body("user-one", "server-selected-workspace"))
+                    .insert_header("x-oai-request-id", "req-optional-context"),
+            )
+            .mount(&server)
+            .await;
+
+        let got = fetch_usage_captured_for_account_at(
+            &ReqwestHttp::new().unwrap(),
+            Provider::Openai,
+            &server.uri(),
+            "user-one",
+            "t",
+            None,
+            None,
+        )
+        .await;
+        assert!(got.outcome.is_ok());
+        assert!(got.extra.is_some());
+
+        let sent = &server.received_requests().await.unwrap()[0];
+        assert!(sent.headers.get("chatgpt-account-id").is_none());
+        assert!(sent.headers.get("x-openai-fedramp").is_none());
+        assert!(sent.headers.get("originator").is_none());
+        assert!(sent.headers.get("anthropic-beta").is_none());
     }
 
     /// OpenAI context has no meaning on Anthropic's endpoint. Even a caller
@@ -941,9 +1040,10 @@ mod tests {
             &ReqwestHttp::new().unwrap(),
             Provider::Anthropic,
             &server.uri(),
+            "anthropic-account",
             "t",
             Some("workspace-one"),
-            true,
+            Some(true),
         )
         .await;
         got.outcome.unwrap();
@@ -965,11 +1065,14 @@ mod tests {
             .mount(&server)
             .await;
 
-        let err = fetch_usage_at(
+        let err = fetch_usage_for_account_at(
             &ReqwestHttp::new().unwrap(),
             Provider::Openai,
             &server.uri(),
+            "user-one",
             "t",
+            None,
+            None,
         )
         .await
         .unwrap_err();
@@ -987,20 +1090,60 @@ mod tests {
         Mock::given(method("GET"))
             .respond_with(
                 ResponseTemplate::new(200)
-                    .set_body_string(include_str!("fixtures/openai_plus_zero.json"))
+                    .set_body_json(openai_plus_body("user-one", "workspace-one"))
                     .insert_header("x-oai-request-id", "req-1"),
             )
             .mount(&server)
             .await;
 
         let http = ReqwestHttp::new().unwrap();
-        let got = fetch_usage_captured_at(&http, Provider::Openai, &server.uri(), "t").await;
+        let got = fetch_usage_captured_for_account_at(
+            &http,
+            Provider::Openai,
+            &server.uri(),
+            "user-one",
+            "t",
+            Some("workspace-one"),
+            Some(false),
+        )
+        .await;
+        assert!(got.outcome.is_ok());
         match got.extra {
             Some(ExtraLine::ResetCredits(r)) => {
                 assert_eq!(r.available, 1);
-                assert_eq!(r.applicable, 0);
+                assert_eq!(r.applicable, Some(0));
             }
             other => panic!("expected reset credits, got {other:?}"),
         }
+    }
+
+    /// Exercises the HTTP plumbing rather than only the pure parser: the
+    /// expected user id must survive every wrapper and reach the body check.
+    #[tokio::test]
+    async fn a_200_for_another_openai_identity_becomes_unknown_and_keeps_no_extra() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(openai_plus_body("other-user", "workspace-one"))
+                    .insert_header("x-oai-request-id", "req-identity"),
+            )
+            .mount(&server)
+            .await;
+
+        let got = fetch_usage_captured_for_account_at(
+            &ReqwestHttp::new().unwrap(),
+            Provider::Openai,
+            &server.uri(),
+            "user-one",
+            "t",
+            Some("workspace-one"),
+            Some(false),
+        )
+        .await;
+
+        assert!(matches!(got.outcome, Err(UsageError::UnknownShape)));
+        assert!(got.extra.is_none(), "another account's reset credits were retained");
+        assert!(got.raw.is_some(), "the mismatched body is still needed for diagnosis");
     }
 }

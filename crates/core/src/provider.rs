@@ -48,105 +48,6 @@ impl Provider {
             Provider::Openai => 180,
         }
     }
-
-    /// Everything the OAuth flow needs that differs between providers.
-    /// docs/design.md §10.1-§10.4 for Anthropic; discovery plus the codex
-    /// binary for OpenAI (docs/research/codex-usage-endpoint.md, "OAuth
-    /// endpoints").
-    pub fn spec(self) -> ProviderSpec {
-        match self {
-            Provider::Anthropic => ProviderSpec {
-                authorize_url: "https://claude.com/cai/oauth/authorize".into(),
-                token_url: "https://platform.claude.com/v1/oauth/token".into(),
-                // Matches design.md §10.1's table. An explicit field rather than
-                // `format!("{token_url}/revoke")`: OpenAI's revoke endpoint is a
-                // sibling of its token endpoint, not a suffix of it (see the
-                // Openai arm below), so deriving one from the other would be
-                // correct for Anthropic and wrong for OpenAI.
-                revoke_url: "https://platform.claude.com/v1/oauth/token/revoke".into(),
-                // Anthropic runs no third-party OAuth client registration program,
-                // so this reuses Claude Code's own public client. The visible
-                // consequence is that the consent screen shows "Claude Code"
-                // rather than this app's name. Must stay overridable via
-                // configuration so we can switch the moment a real client_id
-                // becomes available — docs/design.md §10.2.
-                client_id: "9d1c250a-e61b-44d9-88ed-5944d1962f5e".into(),
-                // `user:inference` was dropped after measurement, not by guess: a
-                // live spike showed the server accepts `user:profile` alone at
-                // consent, issues a token scoped to it (does not silently re-add
-                // `user:inference`), and that token's `/api/oauth/usage` calls —
-                // both on the initial token and after a refresh — return 200.
-                // Claude Code's insistence on requesting both scopes is therefore
-                // a client-side gate, not a server requirement. A token that
-                // cannot run inference is the point, not an optimisation: it is
-                // the terms-of-service position this whole project is built
-                // around — docs/design.md §10.4, §5.2.
-                scopes: vec!["user:profile"],
-                body_style: BodyStyle::JsonWithState,
-            },
-            Provider::Openai => ProviderSpec {
-                authorize_url: "https://auth.openai.com/api/accounts/authorize".into(),
-                token_url: "https://auth.openai.com/api/accounts/oauth/token".into(),
-                // The CLI's request log shows it using https://auth.openai.com/oauth/token
-                // rather than the endpoint discovery advertises. Both are recorded in
-                // docs/research/codex-usage-endpoint.md; the advertised one is used here
-                // because it is the documented contract, and this comment exists so the
-                // other candidate is one grep away when a refresh starts failing.
-                revoke_url: "https://auth.openai.com/api/accounts/oauth/revoke".into(),
-                // The codex binary's public client. **Not verified** — no
-                // authorization flow has been run against it (see the research
-                // document's "OAuth endpoints" section).
-                client_id: "app_EMoamEEZ73f0CkXaXp7hrann".into(),
-                // Discovery's full advertised list. Unlike Anthropic there is no
-                // `user:inference`-shaped scope to decline — see docs/design.md
-                // §10.4's counterpart note and the research document.
-                scopes: vec!["openid", "profile", "email", "offline_access"],
-                // Discovery advertises a JSON token endpoint, but nothing here
-                // confirms its request shape — no authorization flow has been
-                // run against OpenAI (research document, "Scope limits"). RFC
-                // 6749's own form encoding is assumed until measurement says
-                // otherwise, which is the opposite default from Anthropic's
-                // measured JsonWithState.
-                body_style: BodyStyle::Form,
-            },
-        }
-    }
-}
-
-/// Everything the OAuth flow needs that differs between providers.
-///
-/// A value, not a trait. The flow itself — PKCE S256, loopback redirect, manual
-/// paste fallback — is identical, and only these fields change.
-///
-/// **`String`, not `&'static str`, for every field but `scopes`.** `token_url`
-/// is the one field this application overrides at runtime: a debug-only
-/// environment variable in `src-tauri/main.rs` points it at a local mock
-/// server for manual verification, and every test in this module, in
-/// `auth::token`, and in `auth::stored` does the same to reach `wiremock`. A
-/// `&'static str` field would have forced every one of those call sites to
-/// leak a string to get a `'static` lifetime out of a value that only exists
-/// at runtime. `scopes` carries no such requirement — both providers' lists
-/// are compile-time constants that nothing ever overrides — so it alone stays
-/// `Vec<&'static str>`.
-#[derive(Debug, Clone)]
-pub struct ProviderSpec {
-    pub authorize_url: String,
-    pub token_url: String,
-    pub revoke_url: String,
-    pub client_id: String,
-    pub scopes: Vec<&'static str>,
-    /// Anthropic's token endpoint takes a JSON body carrying a non-standard
-    /// `state`; the standard is form encoding. docs/design.md §10.3 records the
-    /// first as measured.
-    pub body_style: BodyStyle,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum BodyStyle {
-    /// JSON, with `state` included. Measured against Anthropic (§10.3).
-    JsonWithState,
-    /// `application/x-www-form-urlencoded`, the RFC 6749 form.
-    Form,
 }
 
 /// docs/design.md §9.3: entries are keyed uniquely under our own service name.
@@ -244,24 +145,6 @@ mod tests {
     #[test]
     fn the_same_id_under_two_providers_yields_two_keys() {
         assert_ne!(token_key(Provider::Anthropic, "x"), token_key(Provider::Openai, "x"));
-    }
-
-    /// Measured from auth.openai.com's discovery document, 2026-08-03.
-    #[test]
-    fn the_openai_spec_matches_the_measured_discovery_document() {
-        let s = Provider::Openai.spec();
-        assert_eq!(s.authorize_url, "https://auth.openai.com/api/accounts/authorize");
-        assert_eq!(s.token_url, "https://auth.openai.com/api/accounts/oauth/token");
-        assert_eq!(s.revoke_url, "https://auth.openai.com/api/accounts/oauth/revoke");
-        assert!(s.scopes.contains(&"offline_access"), "no refresh without it");
-    }
-
-    /// docs/design.md §10.4 drops `user:inference` deliberately. OpenAI's
-    /// advertised list contains no inference scope to drop, so the test pins
-    /// what we do request rather than what we omit.
-    #[test]
-    fn the_anthropic_spec_still_requests_profile_alone() {
-        assert_eq!(Provider::Anthropic.spec().scopes, vec!["user:profile"]);
     }
 
     /// The serialized form is a contract with `src/lib/types.ts:51`

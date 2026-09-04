@@ -1,5 +1,5 @@
 use crate::auth::pkce::PendingAuth;
-use crate::provider::{BodyStyle, Provider, ProviderSpec};
+use crate::provider::Provider;
 use chrono::{DateTime, TimeDelta, Utc};
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
@@ -10,10 +10,35 @@ pub const ANTHROPIC_BETA: &str = "oauth-2025-04-20";
 /// docs/design.md §10.5: treat a token as expired 5 minutes ahead of its
 /// reported expiry, so a request in flight never straddles the boundary.
 pub const EXPIRY_SKEW_SECS: i64 = 300;
-/// Provider-only marker produced by OpenAI's refresh adapter. OpenAI treats a
-/// bare 401 and a changed refreshed identity as terminal; Anthropic does not,
-/// so status alone cannot drive the shared predicate.
-pub(crate) const OPENAI_DEAD_GRANT_CODE: &str = "openai_refresh_dead";
+/// Anthropic's browser OAuth configuration.
+///
+/// OpenAI deliberately cannot be represented by this type: its browser,
+/// device, refresh and revoke protocols live in [`crate::auth::openai`].
+#[derive(Debug, Clone)]
+pub struct AnthropicAuthConfig {
+    pub authorize_url: String,
+    pub token_url: String,
+    pub revoke_url: String,
+    pub client_id: String,
+    pub scopes: Vec<&'static str>,
+}
+
+impl AnthropicAuthConfig {
+    pub fn production() -> Self {
+        Self {
+            authorize_url: "https://claude.com/cai/oauth/authorize".into(),
+            token_url: "https://platform.claude.com/v1/oauth/token".into(),
+            revoke_url: "https://platform.claude.com/v1/oauth/token/revoke".into(),
+            // Anthropic has no third-party registration program, so this is
+            // Claude Code's public client. Requests still identify quota-board
+            // honestly; docs/design.md §5.2 and §10.2.
+            client_id: "9d1c250a-e61b-44d9-88ed-5944d1962f5e".into(),
+            // Measured end to end: consent, usage and refresh all work without
+            // the inference scope.
+            scopes: vec!["user:profile"],
+        }
+    }
+}
 
 /// docs/design.md §10.6: `revoke` gets its own, shorter timeout than the
 /// 30-second default baked into `ReqwestHttp`'s client. Task 18's settings
@@ -44,14 +69,47 @@ pub enum AuthError {
     },
     #[error("failed to parse the response: {0}")]
     Decode(String),
+    /// A rotated grant changed the identity stored under its account key.
+    /// Keeping it would make one row act with another identity's token. The
+    /// provider is part of the variant so a wrapper carrying contradictory
+    /// context cannot turn it into a terminal failure for another provider.
+    #[error("the refreshed token belongs to a different account or workspace")]
+    IdentityMismatch { provider: Provider },
 }
 
 impl AuthError {
-    /// Whether the refresh chain is permanently dead. docs/design.md §10.5 —
-    /// the account is quarantined on the first strike, not retried.
-    pub fn is_dead_grant(&self) -> bool {
-        matches!(self, AuthError::OAuth { code, .. }
-            if matches!(code.as_deref(), Some("invalid_grant") | Some(OPENAI_DEAD_GRANT_CODE)))
+    /// Whether the refresh chain is permanently dead for this provider.
+    /// docs/design.md §10.5 — the account is quarantined on the first strike,
+    /// not retried.
+    ///
+    /// A bare 401 is terminal at OpenAI's refresh endpoint. Anthropic's
+    /// terminal contract is an explicit invalid-grant code; sharing OpenAI's
+    /// status-only rule would quarantine a Claude account without evidence
+    /// that its rotating chain is dead.
+    pub fn is_dead_grant_for(&self, provider: Provider) -> bool {
+        match self {
+            AuthError::IdentityMismatch { provider: owner } => *owner == provider,
+            AuthError::OAuth { status, code, .. } => {
+                let normalized = code.as_deref().map(str::to_ascii_lowercase);
+                match provider {
+                    Provider::Anthropic => normalized.as_deref() == Some("invalid_grant"),
+                    Provider::Openai => {
+                        *status == 401
+                            || (*status == 400
+                                && normalized.as_deref() == Some("invalid_grant"))
+                            || matches!(
+                                normalized.as_deref(),
+                                Some(
+                                    "refresh_token_reused"
+                                        | "refresh_token_expired"
+                                        | "refresh_token_invalidated"
+                                )
+                            )
+                    }
+                }
+            }
+            _ => false,
+        }
     }
     /// Whether the caller should retry once with the stored scopes sent back
     /// verbatim. docs/design.md §10.5.
@@ -251,8 +309,8 @@ impl ReqwestHttp {
     }
 
     /// Exposes the underlying client for `usage::http`, which needs the
-    /// `Retry-After` header on a 429 — `get_json` decodes straight to `T` and
-    /// has nowhere to hand that header back.
+    /// `Retry-After` header on a 429 — the typed token POST methods decode
+    /// straight to `T` and have nowhere to hand that header back.
     pub fn raw_client(&self) -> &reqwest::Client {
         &self.client
     }
@@ -439,12 +497,12 @@ fn identity_from(
 /// authorization_code → token exchange. docs/design.md §10.3.
 ///
 /// Anthropic's body is JSON and carries `state`, which is non-standard for a
-/// token request but is the measured shape its server expects. Passing an
-/// OpenAI provider/spec fails before the network; its protocol lives in
-/// `auth::openai`.
+/// token request but is the measured shape its server expects. Passing the
+/// OpenAI provider fails before the network; its protocol lives in
+/// `auth::openai` and cannot be represented by this configuration type.
 pub async fn exchange_code<H: TokenHttp>(
     http: &H,
-    cfg: &ProviderSpec,
+    cfg: &AnthropicAuthConfig,
     provider: Provider,
     pending: &PendingAuth,
     code: &str,
@@ -456,7 +514,7 @@ pub async fn exchange_code<H: TokenHttp>(
     if returned_state != pending.state {
         return Err(AuthError::StateMismatch);
     }
-    if provider != Provider::Anthropic || cfg.body_style != BodyStyle::JsonWithState {
+    if provider != Provider::Anthropic {
         return Err(AuthError::Decode(
             "OpenAI authentication must use auth::openai".into(),
         ));
@@ -500,14 +558,9 @@ pub async fn exchange_code<H: TokenHttp>(
 /// refresh_token -> a new TokenSet. docs/design.md §10.5.
 pub async fn refresh<H: TokenHttp>(
     http: &H,
-    cfg: &ProviderSpec,
+    cfg: &AnthropicAuthConfig,
     tokens: &TokenSet,
 ) -> Result<TokenSet, AuthError> {
-    if cfg.body_style != BodyStyle::JsonWithState {
-        return Err(AuthError::Decode(
-            "OpenAI authentication must use auth::openai".into(),
-        ));
-    }
     // Send the stored scopes back verbatim. Falling back to a hardcoded list
     // here would silently narrow the scopes on every refresh, and the
     // narrowing is cumulative and invisible until something that needed the
@@ -564,15 +617,10 @@ pub async fn refresh<H: TokenHttp>(
 /// blocked by the revocation endpoint being unreachable or slow — the local
 /// deletion proceeds either way. docs/design.md §10.6.
 ///
-/// This is Anthropic-only and sends its measured JSON shape. An OpenAI spec
-/// fails closed before the network; `auth::openai::revoke` owns OpenAI's
+/// This is Anthropic-only and sends its measured JSON shape. Its configuration
+/// type cannot represent OpenAI; `auth::openai::revoke` owns OpenAI's
 /// issuer-root JSON endpoint.
-pub async fn revoke<H: TokenHttp>(http: &H, cfg: &ProviderSpec, refresh_token: &str) {
-    if cfg.body_style != BodyStyle::JsonWithState {
-        // Fail closed. OpenAI revocation is a separate JSON protocol at an
-        // issuer-root endpoint and must go through `auth::openai::revoke`.
-        return;
-    }
+pub async fn revoke<H: TokenHttp>(http: &H, cfg: &AnthropicAuthConfig, refresh_token: &str) {
     let json_body = serde_json::json!({
         "token": refresh_token,
         "token_type_hint": "refresh_token",
@@ -598,15 +646,15 @@ mod tests {
         }
     }
 
-    async fn cfg_for(server: &MockServer) -> ProviderSpec {
-        ProviderSpec {
+    async fn cfg_for(server: &MockServer) -> AnthropicAuthConfig {
+        AnthropicAuthConfig {
             token_url: format!("{}/v1/oauth/token", server.uri()),
             // Also pointed at the mock: `revoke_url` is no longer derived from
             // `token_url` (it is now its own field, since OpenAI's revoke
             // endpoint is a sibling of its token endpoint rather than a suffix
             // of it), so the tests exercising `revoke` need this set too.
             revoke_url: format!("{}/v1/oauth/token/revoke", server.uri()),
-            ..Provider::Anthropic.spec()
+            ..AnthropicAuthConfig::production()
         }
     }
 
@@ -617,7 +665,7 @@ mod tests {
             "grant_type": "authorization_code",
             "code": "the-code",
             "redirect_uri": "http://localhost:1234/callback",
-            "client_id": Provider::Anthropic.spec().client_id,
+            "client_id": AnthropicAuthConfig::production().client_id,
             "code_verifier": "test-verifier",
             "state": "test-state"
         })
@@ -659,17 +707,16 @@ mod tests {
         assert_eq!(identity.unwrap().uuid, "acc-1");
     }
 
-    /// The obsolete shared body-style branch sent plausible-looking requests
-    /// to the wrong OpenAI endpoints. Keeping the old public Anthropic
-    /// functions temporarily source-compatible is safe only if they refuse an
-    /// OpenAI spec before touching the network.
+    /// The provider argument on the legacy Claude exchange must fail closed.
+    /// Refresh and revoke cannot express OpenAI at all: their configuration
+    /// type is Anthropic-specific.
     #[tokio::test]
-    async fn legacy_anthropic_entry_points_fail_closed_for_openai() {
+    async fn the_anthropic_exchange_fails_closed_for_openai() {
         let server = MockServer::start().await;
-        let cfg = ProviderSpec {
+        let cfg = AnthropicAuthConfig {
             token_url: format!("{}/wrong-token", server.uri()),
             revoke_url: format!("{}/wrong-revoke", server.uri()),
-            ..Provider::Openai.spec()
+            ..AnthropicAuthConfig::production()
         };
         let http = ReqwestHttp::new().unwrap();
 
@@ -683,8 +730,6 @@ mod tests {
         )
         .await
         .is_err());
-        assert!(refresh(&http, &cfg, &tokens_with(&[])).await.is_err());
-        revoke(&http, &cfg, "refresh-token").await;
         assert!(server.received_requests().await.unwrap().is_empty());
     }
 
@@ -948,7 +993,7 @@ mod tests {
             expires_at: Utc::now() - TimeDelta::seconds(1),
             refresh_token_expires_at: Utc::now() + TimeDelta::days(30),
             scopes: scopes.iter().map(|s| s.to_string()).collect(),
-            client_id: Provider::Anthropic.spec().client_id,
+            client_id: AnthropicAuthConfig::production().client_id,
         }
     }
 
@@ -961,7 +1006,7 @@ mod tests {
         let expected = serde_json::json!({
             "grant_type": "refresh_token",
             "refresh_token": "old-rt",
-            "client_id": Provider::Anthropic.spec().client_id,
+            "client_id": AnthropicAuthConfig::production().client_id,
             "scope": "user:profile user:inference user:mcp_servers"
         })
         .to_string();
@@ -1070,11 +1115,11 @@ mod tests {
         )
         .await
         .unwrap_err();
-        assert!(err.is_dead_grant());
+        assert!(err.is_dead_grant_for(Provider::Anthropic));
     }
 
     /// OpenAI's refresh protocol treats any 401 as terminal, but that rule is
-    /// provider-specific. Applying it in `AuthError::is_dead_grant` to every
+    /// provider-specific. Applying it without a provider to every
     /// OAuth response would quarantine an Anthropic account for a generic 401
     /// that carries no `invalid_grant` code.
     #[tokio::test]
@@ -1094,7 +1139,39 @@ mod tests {
         )
         .await
         .unwrap_err();
-        assert!(!err.is_dead_grant());
+        assert!(!err.is_dead_grant_for(Provider::Anthropic));
+        assert!(err.is_dead_grant_for(Provider::Openai));
+    }
+
+    #[test]
+    fn terminal_codes_are_case_insensitive_but_internal_words_cannot_collide() {
+        let terminal = AuthError::OAuth {
+            status: 400,
+            code: Some("REFRESH_TOKEN_INVALIDATED".into()),
+            description: None,
+        };
+        assert!(
+            !terminal.is_dead_grant_for(Provider::Anthropic),
+            "an OpenAI refresh subtype escaped its provider context"
+        );
+        assert!(terminal.is_dead_grant_for(Provider::Openai));
+
+        let collision = AuthError::OAuth {
+            status: 400,
+            code: Some("openai_refresh_dead".into()),
+            description: None,
+        };
+        assert!(!collision.is_dead_grant_for(Provider::Anthropic));
+        assert!(!collision.is_dead_grant_for(Provider::Openai));
+    }
+
+    #[test]
+    fn a_typed_identity_mismatch_is_terminal_only_for_its_owner() {
+        let mismatch = AuthError::IdentityMismatch {
+            provider: Provider::Openai,
+        };
+        assert!(mismatch.is_dead_grant_for(Provider::Openai));
+        assert!(!mismatch.is_dead_grant_for(Provider::Anthropic));
     }
 
     #[tokio::test]
@@ -1154,7 +1231,7 @@ mod tests {
         let expected = serde_json::json!({
             "token": "the-refresh-token",
             "token_type_hint": "refresh_token",
-            "client_id": Provider::Anthropic.spec().client_id,
+            "client_id": AnthropicAuthConfig::production().client_id,
         })
         .to_string();
 
