@@ -693,8 +693,11 @@ A separate, ordinary (decorated) window, entered via the widget's gear icon.
 
 ### 8.5 Tray icon and global hotkey
 
-For recovery and quit only. The menu has two items: "show / hide widget" and
-"quit". Settings are deliberately not included.
+For recovery and quit only. The menu has three items: "show / hide widget",
+"move widget to primary display", and "quit". Settings are deliberately not
+included. The move action is unconditional and also shows the widget: it is the
+escape hatch when a display is disconnected while the app is running or the
+platform still reports a stale monitor position as valid.
 
 **Every action must live in the tray *menu*.** Tauri documents that icon click
 events (`TrayIconEvent`) do not fire on Linux, so a "left-click to toggle the
@@ -1197,9 +1200,13 @@ above.
 VISIBLE=8, DECORATIONS=16, FULLSCREEN=32.
 
 Two of its behaviors fit a widget exactly: it restores position only when the
-saved rectangle intersects a currently available monitor (otherwise deferring
-to the OS — the correct behavior for docking/undocking), and it tracks
-prev_x/prev_y.
+saved rectangle intersects a currently available monitor, and it tracks
+prev_x/prev_y. The widget's configured initial position is centered on the
+primary monitor before that restore runs. A valid saved position therefore
+overrides the default, while a missing, corrupt, or no-longer-visible position
+leaves a deterministic primary-display fallback instead of asking macOS to
+choose a display. The tray's explicit move action (§8.5) covers display changes
+that happen after startup.
 
 Apply `.skip_initial_state("settings")` to the settings window so it does not
 fight the widget's placement.
@@ -1283,6 +1290,31 @@ It is not a current requirement on the strength of third-party reports alone.
 > both whether the feature is needed and whether a reload is the right lever —
 > if it is not, the remedy is a different one (recreating the webview window, or
 > a supervised restart) and belongs in a different design.
+
+### 11.5 macOS CoreAudio failure mode
+
+WKWebView creates its GPU process and enables its audio session even when the
+page contains no media. This is unconditional inside WebKit; Wry's autoplay
+setting changes only whether playback needs a user gesture and does not disable
+audio initialization.
+
+Measured on macOS 26.6.2: a wedged CoreAudio HAL device enumeration blocked the
+GPU process in `HALC_ShellPlugIn::_ReconcileDeviceList`. An opaque page, a
+transparent page, and both variants with and without `backdrop-filter` all
+loaded and then lost their rendered surface at roughly three seconds. The DOM,
+IPC, native window and drag hit testing stayed live, so the symptom was a fully
+transparent but draggable widget. A minimal Wry view with autoplay disabled
+failed identically. The bounded `system_profiler ... SPAudioDataType` probe
+returned no bytes before recovery; after restarting `coreaudiod` it returned a
+complete device list, and a new Quota Board GPU process no longer blocked in
+HAL.
+
+There is no supported WKWebView configuration that bypasses this path. Do not
+attribute the failure to CSS or add a private WebKit preference: the A/B tests
+exclude the former, and the GPU connection does not consult the latter. The
+recovery belongs to macOS audio state — restart the Mac or `coreaudiod`, then
+isolate aggregate/external devices and third-party HAL drivers if it recurs.
+The README carries the user-facing, non-destructive order of operations.
 
 ## 12. Risks
 

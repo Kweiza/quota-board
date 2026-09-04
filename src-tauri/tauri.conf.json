@@ -28,7 +28,7 @@
         "skipTaskbar": true,
         "visible": false,
         "focus": false,
-        "center": false,
+        "center": true,
         "acceptFirstMouse": true,
         "backgroundColor": "#00000000"
       },
