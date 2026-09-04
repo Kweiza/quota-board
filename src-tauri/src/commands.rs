@@ -242,7 +242,7 @@ pub struct ManualFallback {
 /// endpoint. Without OpenAI's half, `Provider::Openai` always resolved to the
 /// real `auth.openai.com`, and nothing could exercise a Codex login —
 /// `begin_login` → `complete_login` → `register_authenticated` — without
-/// reaching the real network, which CLAUDE.md forbids a test to do.
+/// reaching the real network, which AGENTS.md forbids a test to do.
 fn login_cfg(state: &AppState, provider: Provider) -> ProviderSpec {
     match provider {
         Provider::Anthropic => state.cfg.clone(),
@@ -733,7 +733,7 @@ pub(crate) async fn reorder_accounts_for(
 /// A user passphrase in transit.
 ///
 /// **`Debug` is hand-written and prints `<redacted>`** — the same rule and the
-/// same shape as `TokenSet` (crates/core/src/auth/token.rs:76-87), which CLAUDE.md
+/// same shape as `TokenSet` (crates/core/src/auth/token.rs:76-87), which AGENTS.md
 /// names as the pattern to copy. A derived `Debug` would put a live credential
 /// into any `format!("{:?}")`. Separately, the store's own errors are safe to
 /// stringify: `SecretError` carries only descriptions and a `limit: usize`
@@ -929,7 +929,7 @@ pub async fn get_settings(state: State<'_, AppState>) -> Result<SettingsView, St
 /// `SettingsError::UnknownVersion` before clamping, because rewriting that file
 /// would delete the newer build's settings. Returning the view as if nothing
 /// had happened would show the user the old interval with no reason given,
-/// which is the settings-window form of the confidently-wrong display CLAUDE.md
+/// which is the settings-window form of the confidently-wrong display AGENTS.md
 /// forbids. `writable` on the view is the same fact offered ahead of time.
 #[tauri::command]
 pub async fn set_settings(
@@ -945,7 +945,7 @@ pub async fn set_settings(
 /// `Ok(None)` means this account has not been polled successfully since the
 /// process started — **not** that the response was empty. The panel renders the
 /// two differently; `unwrap_or_default` here would be exactly the
-/// confidently-wrong display CLAUDE.md forbids.
+/// confidently-wrong display AGENTS.md forbids.
 ///
 /// The body was masked at capture, in `usage::raw` — nothing is masked here,
 /// and there is no unmasked copy anywhere to forget about. Takes neither
@@ -1115,7 +1115,7 @@ mod tests {
     /// this reachable at all: before it existed, `login_cfg` resolved every
     /// `Provider::Openai` login straight to the real `auth.openai.com`, and
     /// no test could drive this path without reaching the real network,
-    /// which CLAUDE.md forbids.
+    /// which AGENTS.md forbids.
     #[tokio::test]
     async fn a_good_codex_paste_stores_the_token_and_registers_the_account() {
         let server = MockServer::start().await;
@@ -1316,7 +1316,7 @@ mod tests {
     /// server-side revocation. Sending an OpenAI refresh token to Anthropic's
     /// revoke endpoint is not a silent no-op — it is a live credential
     /// reaching a vendor it does not belong to, which is exactly what
-    /// CLAUDE.md's token rules exist to prevent.
+    /// AGENTS.md's token rules exist to prevent.
     ///
     /// Two separate mock servers, no mock mounted on the Anthropic one: if
     /// the Codex removal reached it anyway, wiremock would still answer with

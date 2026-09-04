@@ -5,7 +5,7 @@
 //! **This lives in the core, not in `src-tauri`.** Same reasoning as
 //! `snapshots.rs:1-11`: `src-tauri` has no test harness reachable from
 //! `cargo test -p quota-core`, and this module decides what a display surface
-//! is allowed to show. CLAUDE.md records that the same redaction defect already
+//! is allowed to show. AGENTS.md records that the same redaction defect already
 //! shipped twice in this repository, so the masking must sit where it can be
 //! back-tested.
 
@@ -119,7 +119,7 @@ impl RawLog {
     }
 
     /// `None` means "nothing captured for this account yet". **Callers must
-    /// render that as its own state**, never as an empty body — CLAUDE.md's
+    /// render that as its own state**, never as an empty body — AGENTS.md's
     /// "never demote a missing value" applies to a debug view exactly as it
     /// applies to a percentage.
     pub fn get(&self, provider: Provider, uuid: &str) -> Option<&RawResponse> {
@@ -620,7 +620,7 @@ mod tests {
 
     /// The log holds one entry per account and `remove` is the only way out.
     /// There is no eviction: an account that polled successfully must never
-    /// read as "nothing captured yet" (CLAUDE.md — never demote a missing
+    /// read as "nothing captured yet" (AGENTS.md — never demote a missing
     /// value), and design.md:531 puts no limit on account count.
     #[test]
     fn every_account_that_polled_keeps_its_entry_however_many_there_are() {
@@ -658,7 +658,7 @@ mod tests {
         assert_eq!(log.len(), 1, "removing an unknown uuid must be a no-op");
     }
 
-    /// CLAUDE.md: never demote a missing value to a fabricated one. An account
+    /// AGENTS.md: never demote a missing value to a fabricated one. An account
     /// that has not polled yet has *no* entry — not an empty body.
     #[test]
     fn an_account_with_no_capture_reads_as_absent_not_as_an_empty_body() {

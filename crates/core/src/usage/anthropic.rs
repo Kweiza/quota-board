@@ -208,7 +208,7 @@ fn parse_money(v: &Value) -> Option<Money> {
 /// Measured 2026-07-31 on an account that had never enabled credits: the
 /// endpoint still sends `used: {amount_minor: 0, currency: "USD", exponent: 2}`
 /// and `percent: 0`, with only `limit` null. Gating on either of the first two
-/// paints "0% · $0.00" on an account that has no credit concept — CLAUDE.md's
+/// paints "0% · $0.00" on an account that has no credit concept — AGENTS.md's
 /// never-demote-a-missing-value-to-0% rule, in the one place the endpoint
 /// actively invites the mistake.
 ///
@@ -536,7 +536,7 @@ mod tests {
         );
     }
 
-    /// CLAUDE.md: never demote a missing value to 0%. An account that never
+    /// AGENTS.md: never demote a missing value to 0%. An account that never
     /// enabled credits still reports `spend.used` as $0.00 **and
     /// `spend.percent` as 0** — reading either without checking the limit
     /// paints a credit line reading "0% · $0.00" on an account that has no

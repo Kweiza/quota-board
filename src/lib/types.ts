@@ -54,11 +54,11 @@ export type ExtraLine =
  *
  * These strings are **the wire form, not a display name** — the UI says
  * "Claude" and "Codex", which are product names rather than vendor ones, and
- * `AccountRow.svelte`'s `BADGE` maps one to the other. A rename on the Rust
- * side that this file did not follow would leave `BADGE[account.provider]`
- * `undefined` and throw while rendering, which is a blank widget rather than a
- * type error. `provider_serializes_as_the_typescript_union_spells_it` pins the
- * Rust half; nothing in either test suite catches the drift on its own.
+ * `provider.ts` maps one to the other for every view. A rename on the Rust
+ * side that this file did not follow would leave that lookup `undefined` and
+ * throw while rendering, which is a blank widget rather than a type error.
+ * `provider_serializes_as_the_typescript_union_spells_it` pins the Rust half;
+ * nothing in either test suite catches the drift on its own.
  */
 export type Provider = 'anthropic' | 'openai'
 
@@ -164,7 +164,7 @@ export interface SettingsView {
  * `body` is masked **in Rust, at capture** — the webview never receives an
  * unmasked one. `truncated` says the masked body was longer than
  * `MAX_BODY_BYTES`; showing a cut body as whole would be the confidently-wrong
- * display CLAUDE.md forbids, so it is on the wire rather than inferred.
+ * display AGENTS.md forbids, so it is on the wire rather than inferred.
  */
 export interface RawResponse {
   captured_at: string

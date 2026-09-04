@@ -5,7 +5,7 @@
 /src-tauri/gen
 
 # Private working artifacts: implementation plans, session handoffs, raw
-# research logs. Never published. See CLAUDE.md.
+# research logs. Never published. See AGENTS.md.
 /.local/
 
 # Agent session scratch

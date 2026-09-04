@@ -11,7 +11,7 @@
 //! so the floor had nothing to defend against.
 //!
 //! **A settings file that cannot be understood degrades to the documented
-//! default, never to a nonsense value, and never silently.** That is CLAUDE.md's
+//! default, never to a nonsense value, and never silently.** That is AGENTS.md's
 //! "never demote a missing or unparseable value to 0%" applied to
 //! configuration: a hand-edited `poll_interval_secs: 5` must not become a
 //! five-second polling loop, and it must not vanish without the settings window

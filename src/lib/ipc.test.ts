@@ -315,7 +315,7 @@ describe('command wrappers', () => {
 
   // `null` means "nothing captured for this account yet", which the debug panel
   // renders differently from an empty body. A `??` default anywhere on this
-  // path would erase that distinction — CLAUDE.md's never-demote rule.
+  // path would erase that distinction — AGENTS.md's never-demote rule.
   it('lastResponse passes a null capture through unchanged', async () => {
     recordArgs()
 

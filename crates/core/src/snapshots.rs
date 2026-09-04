@@ -6,7 +6,7 @@
 //! harness, and cannot be reached by `cargo test -p quota-core` at all — so
 //! the one part of this task that handles a credential-derived value and writes
 //! a file would otherwise ship with zero coverage, in a repository whose
-//! CLAUDE.md records that the same redaction defect already shipped twice. The
+//! AGENTS.md records that the same redaction defect already shipped twice. The
 //! only piece that genuinely needs Tauri is resolving the cache directory, and
 //! that stays in the wiring.
 

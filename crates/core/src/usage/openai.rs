@@ -52,7 +52,7 @@ fn label_for(seconds: i64) -> String {
 fn window(root: &Value, slot: &str) -> Option<UsageWindow> {
     let w = root.get("rate_limit")?.get(slot)?;
     // Every field is required. A window missing any of them is dropped rather
-    // than filled in: CLAUDE.md forbids demoting a missing value, and a bar
+    // than filled in: AGENTS.md forbids demoting a missing value, and a bar
     // drawn from a default is exactly that.
     let percent = w.get("used_percent")?.as_f64()?;
     let seconds = w.get("limit_window_seconds")?.as_i64()?;
@@ -179,7 +179,7 @@ mod tests {
         assert_eq!(w[1].percent, 62.0);
     }
 
-    /// CLAUDE.md: never demote a missing value to 0%. A body with no
+    /// AGENTS.md: never demote a missing value to 0%. A body with no
     /// `rate_limit` at all is not an account at 0% — it is a body we do not
     /// understand.
     #[test]
