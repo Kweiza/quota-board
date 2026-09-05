@@ -94,7 +94,9 @@ crates/core/          Headless library. Knows nothing about Tauri.
   src/model.rs        UsageWindow, Severity — the normalized domain types
   src/accounts.rs     Account metadata store ((provider, account_id)-keyed,
                       no tokens)
-  src/secrets/        Token store: keychain first, encrypted file fallback
+  src/secrets/        Token store: keychain first, encrypted file fallback.
+                      `packed` puts every key in one macOS keychain entry —
+                      that ACL is granted per entry, so entries are prompts
   src/auth/openai.rs  Codex browser/device auth, claim parsing, refresh, revoke
   src/usage/          Anthropic and OpenAI usage response parsing
 docs/design.md        Architecture, constraints, terms-of-service position
