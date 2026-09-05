@@ -327,6 +327,44 @@ describe('AccountList', () => {
     })
 
     /**
+     * **WebKit blurs the focused element when a drag begins, and it does so
+     * before `dragstart`.** Measured in Playwright WebKit 26.6 against this
+     * component: with the handle focused, the whole trace was `focus`, `blur`,
+     * and then nothing — no `dragstart`, no `drop`, no reorder. Chromium never
+     * fires the blur at all, which is why every other test here, and every
+     * manual check in Chrome, passed against the broken build that shipped in
+     * v0.4.0.
+     *
+     * The mechanism is not the blur itself but what a handler was doing with
+     * it: clearing the flag that `draggable` is bound to. The row stopped being
+     * draggable in the instant between the press and the drag, so WebKit
+     * started an ordinary selection drag instead of an element drag — visibly a
+     * drag, inert on release, which is exactly how it was reported.
+     *
+     * jsdom cannot model WebKit's drag machine, but it does not have to: the
+     * defect is in this component's own state, and dispatching the blur in the
+     * position WebKit puts it reproduces it exactly.
+     */
+    it('survives the handle losing focus between the press and the drag', async () => {
+      const orders: string[][] = []
+      render(AccountList, {
+        accounts: three,
+        provider: 'anthropic',
+        onReorder: (_p, ids) => orders.push(ids),
+      })
+
+      const [first, , third] = rows()
+      const handle = first.querySelector('button.handle') as HTMLElement
+      await fireEvent.mouseDown(handle)
+      await fireEvent.blur(handle)
+      first.dispatchEvent(dragEvent('dragstart'))
+      third.dispatchEvent(dragEvent('dragover'))
+      third.dispatchEvent(dragEvent('drop'))
+
+      expect(orders).toEqual([['id-b', 'id-c', 'id-a']])
+    })
+
+    /**
      * §8.6's auto sort owns the order while it is on, so the list on screen is
      * not the stored arrangement. A drop would either be discarded or would
      * overwrite the user's arrangement with a computed one they never chose;
