@@ -99,6 +99,19 @@
    * renaming an account would stop working in exchange for a drag the handle
    * already offers. `mousedown` fires before `dragstart`, which is what leaves
    * Svelte a turn to set the attribute.
+   *
+   * **Nothing may clear this between the press and `dragstart`.** v0.4.0 shipped
+   * an `on:blur` on the handle that did, and WebKit blurs the focused element
+   * when a drag begins — before `dragstart`. The row therefore stopped being
+   * draggable in that instant, WebKit started a selection drag instead of an
+   * element drag, and the release did nothing. Measured in Playwright WebKit
+   * 26.6: the entire trace was `focus`, `blur`, silence. Chromium never fires
+   * that blur, so every automated check and every look in Chrome passed.
+   *
+   * The `draggable` binding therefore reads `armedId === id || draggingId ===
+   * id`, and the second half is not redundant: it holds the attribute true for
+   * the whole life of the drag, so no later state change can take `draggable`
+   * away from an element the engine is already dragging.
    */
   let armedId: string | null = null
 
@@ -208,7 +221,7 @@
       class="row"
       class:dragging={draggingId === a.account_id}
       class:over={overId === a.account_id && draggingId !== a.account_id}
-      draggable={reorderable && armedId === a.account_id}
+      draggable={reorderable && (armedId === a.account_id || draggingId === a.account_id)}
       on:dragstart={(e) => beginDrag(e, a.account_id)}
       on:dragover={(e) => dragOver(e, a.account_id)}
       on:drop={(e) => drop(e, a.account_id)}
@@ -232,7 +245,7 @@
           : 'Turn off Sort by soonest weekly reset to reorder by hand'}
         on:mousedown={() => (armedId = a.account_id)}
         on:keydown={(e) => handleKey(e, a.account_id)}
-        on:blur={() => (armedId = null)}>⠿</button
+        on:mouseup={() => (armedId = null)}>⠿</button
       >
       <div class="ident">
         <!-- `value=` rather than `bind:value=`: binding would write through
