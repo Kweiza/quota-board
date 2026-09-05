@@ -324,9 +324,17 @@
      because §8.2 reserves the colour channel for severity and warnings. */
   .row.dragging { opacity: .4; }
   .row.over { border-bottom-color: currentColor; box-shadow: inset 0 2px 0 currentColor; }
-  .handle { background: none; border: none; color: inherit; opacity: .5;
-            cursor: grab; font-size: 13px; line-height: 1; padding: .2em .15em; }
+  /* `align-self: stretch` makes the whole left edge of the row the grab target
+     rather than the glyph's own box. Measured: the glyph alone came to
+     12.8×18.2px, against 22.1px square for the icon buttons beside it — the
+     smallest target in the row was the one the row's main new gesture depends
+     on. Stretched it is the row's full height. */
+  .handle { align-self: stretch; display: flex; align-items: center;
+            justify-content: center; min-width: 1.7em;
+            background: none; border: none; color: inherit; opacity: .55;
+            cursor: grab; font-size: 14px; line-height: 1; padding: 0; }
   .handle:hover:not(:disabled) { opacity: .9; }
+  .handle:active:not(:disabled) { cursor: grabbing; }
   .handle:disabled { cursor: default; opacity: .25; }
   .ident { display: flex; flex-direction: column; gap: .2em; min-width: 0; }
   .label { font: inherit; font-weight: 600; padding: .2em .35em; width: 100%;
