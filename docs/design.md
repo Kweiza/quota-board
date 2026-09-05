@@ -610,34 +610,46 @@ cached value is shown as `STALE` rather than an empty screen.
 
 Undecorated (`decorations: false`), always on top, hidden from the taskbar, not
 resizable, starting with `visible: false` and shown after the position is
-restored (to avoid placement flicker). Fixed width of about 280px; height
-follows content.
+restored (to avoid placement flicker). Height follows content.
+
+**The accounts are grouped into one column per provider, Claude left and Codex
+right.** One flat list mixed the two services, so the card grew straight down
+and nothing separated them but whatever order the user had arranged by hand.
 
 ```
-┌──────────────────────────────┐
-│                            ⚙ │
-│  work@example.com          ↻ │
-│  5h  ███████░░░  72%   1h23m │   ← yellow
-│  7d  ████░░░░░░  41%   4d12h │   ← teal
-│                              │
-│  personal@example.com      ↻ │
-│  5h  ██░░░░░░░░  18%   2h05m │   ← green
-│  weekly (Opus) █████████░ 91%│   ← per-model weekly window
-│  weekly (Sonnet) ███░░░░░ 27%│
-│                              │
-│  side@example.com   12m ago ↻│
-│  5h  ████░░░░░░  38%   0h47m │   ← entire row dimmed
-│  weekly not reported         │
-└──────────────────────────────┘
+┌─────────────────────────────────────────────────────────────┐
+│                                                           ⚙ │
+│  CLAUDE                        │  CODEX                     │
+│  work@example.com          ↻   │  side@example.com      ↻   │
+│  5h  ███████░░░  72%   1h23m   │  5h  ██░░░░░░░░ 18%  2h05m │
+│  7d  ████░░░░░░  41%   4d12h   │  7d  ███░░░░░░░ 27%  3d04h │
+│                                │                            │
+│  personal@example.com      ↻   │  alt@example.com 12m ago ↻ │
+│  5h  ██░░░░░░░░  18%   2h05m   │  5h  ████░░░░░░ 38%  0h47m │
+│  weekly (Opus) █████████░ 91%  │                            │
+│  weekly (Sonnet) ███░░░░░ 27%  │  ← entire row dimmed       │
+└─────────────────────────────────────────────────────────────┘
 ```
 
 **The fact that the number of bars can differ per account is the central
-constraint of this layout** (§5.3).
+constraint of this layout** (§5.3), and the columns do not change it: the two
+are independent, so a Claude account with three bars does not push a Codex row
+down.
 
-Every row starts with a visible, neutral text badge spelling **Claude** or
-**Codex** in full. Provider identity does not use the green/teal/yellow/red
-channel, because that channel already means utilization severity. The same
-full names appear in Settings controls and the Debug selector.
+**Width follows the account list, not a constant.** About 520px with both
+columns, about 280px with one — a user of a single service keeps the narrow
+card, rather than a window half of which is empty. `src/lib/layout.ts` owns
+both numbers, because the view measures itself and pushes its size back
+(`followContentHeight`): the document's own minimum width and the window size
+must agree, or the height pushed back is the height of a squeezed layout.
+
+The product name is a neutral text heading at the top of each column, announced
+once as that column's accessible name. It was on a badge at the start of every
+row until the columns arrived; the heading says the same thing once, and at half
+the width the account name needs the track back. Provider identity does not use
+the green/teal/yellow/red channel, because that channel already means
+utilization severity. The same full names appear in Settings controls and the
+Debug selector.
 
 **Every retryable account row carries its own `↻`**, including the states with
 no numbers to show, which are often the rows most worth retrying. `AUTH_DEAD` is
@@ -680,7 +692,24 @@ Requires the `core:window:allow-start-dragging` capability.
 
 A separate, ordinary (decorated) window, entered via the widget's gear icon.
 
-- **Account list**: provider name / add / remove / edit display name / reorder
+- **Account list**: one column per provider in §8.1's order, each headed by the
+  product name. Both columns are always present here, unlike the widget's —
+  this is where the account that would fill an empty one gets added, so a
+  column that disappeared with its last account would take that invitation with
+  it. Each row: edit display name / refresh / remove / reorder
+- **Reordering** is drag-and-drop within a column, from a handle on the row.
+  Dragging across columns is not offered — it would mean changing an account's
+  provider. The handle rather than the whole row is what starts the drag,
+  because the row holds the rename field and a permanently draggable ancestor
+  takes the press that would place the caret in it. **`Alt`+`↑`/`↓` on the
+  focused handle does the same thing**: dragging is a pointer gesture with no
+  keyboard equivalent, and the Move up/down buttons this replaced were the only
+  route a keyboard-only user ever had
+- **Refresh and remove are icon buttons** (`↻`, `✕`); the refresh glyph is the
+  widget's, because the two controls do the same thing. Their accessible names
+  are the full sentences the text buttons carried, unchanged
+- **Sort accounts by soonest weekly reset**: §8.6's toggle, beside the list it
+  reorders. Disables the drag handles while it is on
 - **Add account**: equal Claude and Codex cards. Claude uses browser OAuth with
   its manual-paste fallback; Codex uses its browser callback with device code
   as the port-unavailable fallback. No limit on account count
@@ -690,6 +719,9 @@ A separate, ordinary (decorated) window, entered via the widget's gear icon.
 - **Store status**: whether the current tokens live in the OS keychain or in
   the encrypted file (§9.2)
 - **Debug**: view the last raw JSON response (§5.5)
+- **Version**: the running app version in the footer, from Tauri's own
+  `getVersion`. Shown only when it is actually known — a version is the first
+  thing a bug report carries, so a placeholder there would be believed
 
 ### 8.5 Tray icon and global hotkey
 
@@ -711,6 +743,37 @@ as a package dependency.
 The global hotkey is fixed at Ctrl+Alt+Q and toggles widget visibility. Per
 §11.1, however, it requires X11.
 
+### 8.6 Auto sort by soonest weekly reset
+
+Off by default. When on, `list_accounts` returns every account ordered by its
+**soonest seven-day reset, nearest first**, and both windows render that order.
+An account with no seven-day window, or in a state that carries no windows at
+all, comes **last** — never treated as resetting now, and never given a
+borrowed timestamp from another window.
+
+Three decisions here are load-bearing.
+
+**It sorts in `list_accounts`, not in the webview.** The widget does not read
+the settings file, so a webview-side sort would need the setting pushed to it
+and kept in step — two copies of the order, free to disagree while one of them
+repaints. Sorting the one list both windows already share removes the
+possibility.
+
+**`sort_order` is never rewritten.** The toggle changes what is returned, not
+what is stored, so turning it off restores the arrangement the user dragged
+into place, exactly. The sort is stable for the same reason: accounts that tie,
+and accounts it cannot rank, keep the order they arrived in.
+
+**Which window is the seven-day one is recorded by the parser, not recovered
+from a name.** `UsageWindow::weekly` is set where the response was read.
+Neither `window_id` nor `label` can stand in for it: Anthropic's per-model
+weekly windows are `weekly:<model>` labelled "weekly (Opus)", and on the Codex
+side the slot holding a week is plan-dependent — `primary_window` was measured
+as 7d on an idle paid account, 30d on free and 5h on an active paid one
+(§5.6). A name-based test would rank a free Codex account by a seven-day reset
+it does not have, which is the confidently-wrong display this project treats as
+its worst failure mode.
+
 ## 9. Storage
 
 ### 9.1 Locations
@@ -724,6 +787,19 @@ The global hotkey is fixed at Ctrl+Alt+Q and toggles widget visibility. Per
 
 Platform-specific paths are resolved by `dirs`. **No path, hostname, or
 username is hardcoded anywhere.**
+
+The settings file holds the polling interval (§6.1) and §8.6's `auto_sort`.
+Adding a field needs no `FORMAT_VERSION` bump — `#[serde(default)]` on the
+container fills in what an older file does not carry, and unknown keys are
+preserved so saving one setting cannot delete a newer build's.
+
+The snapshot cache holds `UsageWindow`s, so it carries §8.6's `weekly` flag.
+That field is `#[serde(default)]` for a reason worth stating: without it every
+cache written before the field existed fails to parse, and an unparseable cache
+is silently an empty one — the first launch after an upgrade would lose every
+stale value the cache exists to keep. A window restored without the flag is
+treated as "not known to be weekly", which sorts it last and makes no claim
+about it, rather than as "not weekly".
 
 ### 9.2 Token store (the `secrets` module)
 

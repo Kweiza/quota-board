@@ -1,7 +1,8 @@
 import { mount } from 'svelte'
 import { getCurrentWindow, LogicalSize } from '@tauri-apps/api/window'
 // Keep this import. The reset it carries is what keeps the widget inside its
-// own window; dropping it silently widens the document past 280px.
+// own window; dropping it silently makes the document 8px wider than whichever
+// width `widgetWidth` asked for.
 import './app.css'
 import Widget from './widget/Widget.svelte'
 import Settings from './settings/Settings.svelte'
@@ -16,11 +17,9 @@ import {
   refreshAccount,
   setWidgetVisible,
 } from './lib/ipc'
+import { widgetWidth } from './lib/layout'
 import { widgetProps } from './lib/props.svelte'
 import type { Provider } from './lib/types'
-
-/** docs/design.md §8.1: "Fixed width of about 280px; height follows content." */
-const WIDGET_WIDTH = 280
 
 /**
  * How often the widget re-reports its visibility (§6.3). The Rust side cannot
@@ -32,8 +31,21 @@ const VISIBILITY_HEARTBEAT_MS = 30_000
 
 /**
  * The window cannot measure the DOM, so the view measures itself and pushes
- * the height back. `StateFlags::SIZE` is deliberately off in
- * `src-tauri/src/main.rs`: a restored height would fight this on every launch.
+ * its size back. `StateFlags::SIZE` is deliberately off in
+ * `src-tauri/src/main.rs`: a restored size would fight this on every launch.
+ *
+ * **The width is pushed back too, and it is not a constant any more** —
+ * docs/design.md §8.1 widens the card to two columns once both providers have
+ * an account. It is read from `widgetProps.accounts` rather than passed in,
+ * because this observer outlives every account-list read: the same reactive
+ * object the widget renders from is the one that decides how wide it must be,
+ * so the two cannot answer differently.
+ *
+ * The re-measure that follows a width change comes for free: setting the size
+ * reflows the document, which fires this observer again with the height the
+ * new width actually produced. `Widget.svelte`'s `min-width` is what keeps
+ * that second pass from being a visible jump — the document already laid
+ * itself out at the wider size before the window caught up.
  */
 function followContentHeight(root: HTMLElement): void {
   // Absent when the page is opened in a plain browser, e.g. `npm run dev`.
@@ -46,7 +58,9 @@ function followContentHeight(root: HTMLElement): void {
 
   new ResizeObserver(() => {
     const height = Math.ceil(root.getBoundingClientRect().height)
-    if (height > 0) void appWindow.setSize(new LogicalSize(WIDGET_WIDTH, height))
+    if (height > 0) {
+      void appWindow.setSize(new LogicalSize(widgetWidth(widgetProps.accounts), height))
+    }
   }).observe(root)
 }
 

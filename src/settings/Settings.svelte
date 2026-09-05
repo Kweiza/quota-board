@@ -4,10 +4,11 @@
   import { openUrl } from '@tauri-apps/plugin-opener'
   import AccountList from './AccountList.svelte'
   import { queriesPerDay, untilHhMm } from '../lib/format'
-  import { providerName } from '../lib/provider'
+  import { PROVIDER_ORDER, accountsOf, providerName } from '../lib/provider'
   import { accountKey } from '../lib/types'
   import {
     accountsWarning,
+    appVersion,
     beginLogin,
     getAutostart,
     getSettings,
@@ -21,6 +22,7 @@
     removeAccount,
     renameAccount,
     reorderAccounts,
+    setAutoSort,
     setAutostart,
     setSettings,
     storeStatus,
@@ -124,6 +126,16 @@
 
   let view: SettingsView | null = null
   let intervalSecs: number | null = null
+  /**
+   * The checkbox's own state, mirrored out of `view` rather than bound to it.
+   *
+   * A `bind:checked` straight onto `view.auto_sort` would leave a refused write
+   * showing as applied, exactly as `bind:value` would for the rename field in
+   * `AccountList`. This is assigned from the command's answer instead.
+   */
+  let autoSortChecked = false
+  /** `null` until read, and outside Tauri. The footer renders nothing then. */
+  let version: string | null = null
 
   /** §11.3. `null` until the first read answers; never assumed either way. */
   let autostart: AutostartView | null = null
@@ -419,9 +431,16 @@
       try {
         view = await getSettings()
         intervalSecs = view.poll_interval_secs
+        autoSortChecked = view.auto_sort
       } catch (e) {
         error = String(e)
       }
+    })()
+    // Its own read, and deliberately not folded into the one above: a version
+    // this window could not resolve must not take the polling interval down
+    // with it. `appVersion` already answers `null` rather than throwing.
+    void (async () => {
+      version = await appVersion()
     })()
     void (async () => {
       try {
@@ -636,15 +655,59 @@
     void guard(() => renameAccount(uuid, provider, label))
   }
 
-  function move(uuid: string, provider: Provider, delta: number): void {
-    const from = accounts.findIndex((a) => a.account_id === uuid && a.provider === provider)
-    const to = from + delta
-    if (from < 0 || to < 0 || to >= accounts.length) return
-    // The command takes the whole rearranged array, not a pair: `reorder`
-    // rewrites `sort_order` from the order it is given.
+  /**
+   * One column's new order, folded back into the whole list.
+   *
+   * `reorder_accounts` takes the entire rearranged array — `AccountStore::
+   * reorder` rewrites `sort_order` from the order it is given — but a drag
+   * happened inside one provider's column and must not move the other
+   * provider's accounts. So the positions this provider already occupies are
+   * refilled in the new order and every other index is left exactly as it was:
+   * a Claude drag never renumbers a Codex account, and the stored order stays
+   * whatever interleaving it already had rather than being silently regrouped.
+   */
+  function reorder(provider: Provider, orderedIds: string[]): void {
     const keys = accounts.map((a) => ({ account_id: a.account_id, provider: a.provider }))
-    keys.splice(to, 0, ...keys.splice(from, 1))
+    const slots = keys.flatMap((k, i) => (k.provider === provider ? [i] : []))
+    // A stale column — `accounts://changed` landed between the drop and here.
+    // Writing a shorter order would drop accounts out of `sort_order`
+    // altogether, so the press is abandoned and the re-read stands.
+    if (orderedIds.length !== slots.length) return
+    slots.forEach((slot, n) => {
+      keys[slot] = { account_id: orderedIds[n], provider }
+    })
     void guard(() => reorderAccounts(keys))
+  }
+
+  /**
+   * docs/design.md §8.6. The answer is written back the way `applyInterval`
+   * writes the clamped interval back: the toggle then shows what the settings
+   * file actually holds, not what was asked for.
+   */
+  async function toggleAutoSort(event: Event): Promise<void> {
+    // Captured before the first await: `currentTarget` is null once the event
+    // has finished dispatching, and the correction below needs the element.
+    const box = event.currentTarget as HTMLInputElement
+    const wanted = box.checked
+    try {
+      view = await setAutoSort(wanted)
+      error = null
+    } catch (e) {
+      error = String(e)
+    } finally {
+      // **The DOM has to be corrected by hand**, exactly as `toggleAutostart`
+      // above records. The click already moved the checkbox, and on a refusal
+      // `autoSortChecked` is written back with the value it already had — so
+      // Svelte re-renders nothing and the box keeps the position the user put
+      // it in while the stored setting says otherwise. Assigning the state as
+      // well keeps `reorderable` in step for the drag handles.
+      autoSortChecked = view?.auto_sort ?? false
+      box.checked = autoSortChecked
+    }
+    // The list order changed under us. The command emits `accounts://changed`
+    // too, but this window's own listener is the one that repaints it, and
+    // waiting for the round trip would leave the old order on screen.
+    await pullAccounts()
   }
 
   function refresh(uuid: string, provider: Provider): Promise<void> {
@@ -745,16 +808,73 @@
 
   <section>
     <h2>Accounts</h2>
-    <AccountList {accounts} {throttledUntil}
-                 onRemove={(uuid, provider) => void guard(() => removeAccount(uuid, provider))}
-                 onRename={rename} onMove={move} onRefresh={refresh} />
-    {#if accountsProblem}
-      <!-- The alert above already explains this state. Showing loading or an
-           empty invitation beside it would contradict that explanation. -->
-    {:else if !accountsLoaded}
+    <!-- docs/design.md §8.4: one column per provider, in §8.1's order, so this
+         window groups the accounts the same way the widget does. Both columns
+         are always rendered here, unlike the widget's — this window is where
+         you add the account that would fill an empty one, and a column that
+         vanished when its last account was removed would take its heading with
+         it. -->
+    <div class="account-columns">
+      {#each PROVIDER_ORDER as p (p)}
+        {@const forProvider = accountsOf(accounts, p)}
+        <section class="account-column" aria-labelledby={`accounts-${p}`}>
+          <h3 id={`accounts-${p}`}>{providerName(p)}</h3>
+          <AccountList
+            accounts={forProvider}
+            provider={p}
+            {throttledUntil}
+            reorderable={!autoSortChecked}
+            onRemove={(uuid, provider) => void guard(() => removeAccount(uuid, provider))}
+            onRename={rename}
+            onReorder={reorder}
+            onRefresh={refresh}
+          />
+          <!-- Only the empty case is per column. The loading line is announced
+               once below, outside the loop: two columns each carrying their own
+               `role="status"` would announce "Loading accounts…" twice for one
+               read, and neither copy would be about that column in particular.
+               A problem reading the file is explained by the alert above, and
+               an empty invitation beside it would contradict that. -->
+          {#if accountsLoaded && !accountsProblem && forProvider.length === 0}
+            <p class="hint">No {providerName(p)} accounts yet.</p>
+          {/if}
+        </section>
+      {/each}
+    </div>
+    {#if !accountsLoaded && !accountsProblem}
       <p class="hint" role="status">Loading accounts…</p>
-    {:else if accounts.length === 0}
-      <p class="hint">No accounts yet.</p>
+    {/if}
+
+    <!-- docs/design.md §8.6. Inside the Accounts section rather than beside the
+         polling interval: it changes what this list is showing, and the
+         disabled drag handles above are the other half of the same fact. -->
+    {#if view}
+      <div class="auto-sort">
+        <input
+          id="auto-sort"
+          type="checkbox"
+          checked={autoSortChecked}
+          disabled={!view.writable}
+          on:change={toggleAutoSort}
+        />
+        <label for="auto-sort">Sort accounts by soonest weekly reset</label>
+      </div>
+      <p class="hint">
+        {#if autoSortChecked}
+          Both windows list the account whose 7-day window resets first at the
+          top. Accounts that report no 7-day window come last. Turn this off to
+          drag them back into your own order — it is kept while this is on.
+        {:else}
+          Drag the {'⠿'} handle to arrange the accounts, or hold Alt and press the up
+          or down arrow.
+        {/if}
+      </p>
+      {#if !view.writable}
+        <p class="warn">
+          The settings file cannot be written by this build, so this cannot be
+          changed here.
+        </p>
+      {/if}
     {/if}
 
     <div class="provider-grid" role="group" aria-label="Add account">
@@ -1004,6 +1124,15 @@
       <pre>{captured.body}</pre>
     {/if}
   </section>
+
+  <!-- Rendered only once a version is actually known. `appVersion` answers
+       `null` outside a Tauri webview and on a failed read, and a footer that
+       filled in a placeholder there would be a string someone pastes into a
+       bug report — wrong is worse than absent. Selectable for the same
+       reason. -->
+  {#if version}
+    <footer class="version">Quota Board {version}</footer>
+  {/if}
 </main>
 
 <style>
@@ -1039,6 +1168,22 @@
   .hint { font-size: 11px; opacity: .7; margin: .5em 0 0; }
   .note { font-size: 11px; opacity: .85; margin: .5em 0 0; }
   .warn { font-size: 11px; color: #fbbf24; margin: .5em 0 0; }
+  /* §8.4's two account columns, in §8.1's order. `minmax(0, 1fr)` for the same
+     reason the widget's columns use it: an `auto` track minimum refuses to
+     shrink below its content, so one long email would widen its own column and
+     push the other off the window. The `auto-fit` minimum lets the pair fall
+     back to one column when the window is dragged near its 520px floor. */
+  .account-columns { display: grid; gap: 0 1.25em;
+                     grid-template-columns: repeat(auto-fit, minmax(15em, 1fr)); }
+  .account-column { min-width: 0; }
+  .settings .account-column h3 { margin: 0 0 .35em; font-size: 11px;
+                                 font-weight: 700; letter-spacing: .04em;
+                                 text-transform: uppercase; opacity: .6; }
+  /* The label sits after the box, so `display: block` from the shared `label`
+     rule would drop it onto its own line. */
+  .auto-sort { display: flex; align-items: center; gap: .5em; margin-top: 1em; }
+  .settings .auto-sort label { display: inline; margin: 0; font-size: 12px;
+                               opacity: 1; }
   .provider-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr));
                    gap: .75em; margin-top: .85em; }
   .provider-card { display: flex; flex-direction: column; align-items: flex-start;
@@ -1075,4 +1220,8 @@
     background: rgba(0, 0, 0, .35); padding: .5em; font-size: 11px;
     white-space: pre-wrap; word-break: break-all;
   }
+  /* Selectable on purpose, like `pre` above: the version is the first thing a
+     bug report needs, and it is here so it can be copied. */
+  .version { user-select: text; font-size: 11px; opacity: .55;
+             padding-top: 1em; border-top: 1px solid rgba(148, 163, 184, .25); }
 </style>

@@ -53,6 +53,12 @@ interface Backend {
    */
   autostartApplied?: AutostartView
   raw?: RawResponse | null
+  /** What `set_auto_sort` answers with — the settings the backend stored. */
+  autoSortApplied?: SettingsView
+  /** Rejects `set_auto_sort` with this message, as an unwritable file does. */
+  autoSortError?: string
+  /** What `getVersion()` answers with. `undefined` leaves the footer absent. */
+  version?: string
 }
 
 const account = (uuid: string, label: string, email: string): AccountView => ({
@@ -68,12 +74,13 @@ const two = [
   account('uuid-home', 'Personal', 'home@example.com'),
 ]
 
-const settings = (secs: number, writable = true): SettingsView => ({
+const settings = (secs: number, writable = true, autoSort = false): SettingsView => ({
   poll_interval_secs: secs,
   min_interval_secs: 180,
   max_interval_secs: 86400,
   warning: null,
   writable,
+  auto_sort: autoSort,
 })
 
 const store = (kind: StoreStatus['kind'], exists: boolean): StoreStatus => ({
@@ -143,6 +150,14 @@ function mockBackend(b: Backend = {}): IpcCall[] {
             writable: true,
           }
         )
+      case 'set_auto_sort':
+        if (b.autoSortError !== undefined) return Promise.reject(b.autoSortError)
+        return (
+          b.autoSortApplied ??
+          settings(300, true, (args as { enabled?: boolean } | undefined)?.enabled ?? false)
+        )
+      case 'plugin:app|version':
+        return b.version ?? null
       case 'last_response':
         return b.raw ?? null
       default:
@@ -346,11 +361,17 @@ describe('Settings account loading', () => {
     render(Settings)
     await whenSubscribed(calls)
 
+    // One status line for one read, not one per column: §8.4 renders a column
+    // per provider now, and a `role="status"` inside each would announce the
+    // same sentence twice while saying nothing about either column.
     expect(screen.getByRole('status').textContent).toBe('Loading accounts…')
-    expect(screen.queryByText('No accounts yet.')).toBeNull()
+    expect(screen.queryByText(/No .* accounts yet\./)).toBeNull()
 
     resolveAccounts([])
-    expect(await screen.findByText('No accounts yet.')).toBeTruthy()
+    // The invitation *is* per column, because which one is empty is the part
+    // worth saying: it names the button below that would fill it.
+    expect(await screen.findByText('No Claude accounts yet.')).toBeTruthy()
+    expect(screen.getByText('No Codex accounts yet.')).toBeTruthy()
     expect(screen.queryByText(/Loading accounts/)).toBeNull()
   })
 
@@ -362,7 +383,7 @@ describe('Settings account loading', () => {
 
     expect(await screen.findByText(/saved accounts could not be read/)).toBeTruthy()
     expect(screen.queryByText(/Loading accounts/)).toBeNull()
-    expect(screen.queryByText('No accounts yet.')).toBeNull()
+    expect(screen.queryByText(/No .* accounts yet\./)).toBeNull()
   })
 })
 
@@ -1405,5 +1426,178 @@ describe('Settings start at login', () => {
 
     expect((screen.getByLabelText(/Launch Quota Board/) as HTMLInputElement).checked).toBe(false)
     expect(screen.getByText(/development build/)).toBeTruthy()
+  })
+})
+
+const codex = (uuid: string, label: string, email: string): AccountView => ({
+  ...account(uuid, label, email),
+  provider: 'openai',
+})
+
+/**
+ * docs/design.md §8.4's columns, and the reordering that replaced the Move
+ * up/down buttons.
+ */
+describe('Settings account columns', () => {
+  /**
+   * Interleaved on purpose. A Claude drag must renumber only the positions
+   * Claude already held: an implementation that regrouped the array — every
+   * Claude account, then every Codex one — would pass any test whose fixture
+   * was already grouped, and would silently rewrite the stored order of a user
+   * who had interleaved theirs.
+   */
+  const interleaved = [
+    account('claude-a', 'A', 'a@example.com'),
+    codex('codex-c', 'C', 'c@example.com'),
+    account('claude-b', 'B', 'b@example.com'),
+  ]
+
+  it('renders one column per provider, each naming itself', async () => {
+    const calls = mockBackend({ accounts: interleaved })
+    render(Settings)
+    await whenSubscribed(calls)
+
+    expect(await screen.findByRole('region', { name: 'Claude' })).toBeTruthy()
+    expect(screen.getByRole('region', { name: 'Codex' })).toBeTruthy()
+  })
+
+  it('invites the provider whose column is empty, by name', async () => {
+    const calls = mockBackend({ accounts: [account('claude-a', 'A', 'a@example.com')] })
+    render(Settings)
+    await whenSubscribed(calls)
+
+    expect(await screen.findByText('No Codex accounts yet.')).toBeTruthy()
+    expect(screen.queryByText('No Claude accounts yet.')).toBeNull()
+  })
+
+  it('reorders within a column without moving the other provider’s accounts', async () => {
+    const calls = mockBackend({ accounts: interleaved })
+    render(Settings)
+    await whenSubscribed(calls)
+
+    const handle = await screen.findByRole('button', { name: /^Reorder Claude account A/ })
+    await fireEvent.keyDown(handle, { key: 'ArrowDown', altKey: true })
+
+    await waitFor(() => {
+      expect(calls.some((c) => c.cmd === 'reorder_accounts')).toBe(true)
+    })
+    const sent = calls.find((c) => c.cmd === 'reorder_accounts')!.args.keys
+    // Index 1 is still the Codex account. The two Claude accounts swapped
+    // around it rather than being gathered to the front.
+    expect(sent).toEqual([
+      { account_id: 'claude-b', provider: 'anthropic' },
+      { account_id: 'codex-c', provider: 'openai' },
+      { account_id: 'claude-a', provider: 'anthropic' },
+    ])
+  })
+
+  /**
+   * The Move up/down buttons are gone (§8.4), and a stale test that still
+   * looked for them would pass by finding nothing. This asserts the absence
+   * against the presence of what replaced them, so it cannot pass in a build
+   * where the row lost both.
+   */
+  it('replaces the move buttons with one drag handle per row', async () => {
+    const calls = mockBackend({ accounts: interleaved })
+    render(Settings)
+    await whenSubscribed(calls)
+
+    expect(await screen.findAllByRole('button', { name: /^Reorder / })).toHaveLength(3)
+    expect(screen.queryByRole('button', { name: /^Move .* (up|down)$/ })).toBeNull()
+  })
+})
+
+/** docs/design.md §8.6. */
+describe('Settings auto sort', () => {
+  it('sends the toggle and re-reads the list in the new order', async () => {
+    const calls = mockBackend({ accounts: two })
+    render(Settings)
+    await whenSubscribed(calls)
+
+    const box = await screen.findByLabelText(/Sort accounts by soonest weekly reset/)
+    const before = calls.filter((c) => c.cmd === 'list_accounts').length
+    await fireEvent.click(box)
+
+    await waitFor(() => {
+      expect(calls.some((c) => c.cmd === 'set_auto_sort')).toBe(true)
+    })
+    expect(calls.find((c) => c.cmd === 'set_auto_sort')!.args).toEqual({ enabled: true })
+    // The order this window shows comes from `list_accounts`, so the toggle is
+    // only half-applied until the list is read again.
+    await waitFor(() => {
+      expect(calls.filter((c) => c.cmd === 'list_accounts').length).toBeGreaterThan(before)
+    })
+  })
+
+  /**
+   * While auto sort owns the order, the list on screen is not the stored
+   * arrangement — so a drop would either be discarded or would overwrite that
+   * arrangement with a computed one the user never chose.
+   */
+  it('disables the drag handles while it is on', async () => {
+    const calls = mockBackend({ accounts: two, settings: settings(300, true, true) })
+    render(Settings)
+    await whenSubscribed(calls)
+
+    const handles = (await screen.findAllByRole('button', {
+      name: /^Reorder /,
+    })) as HTMLButtonElement[]
+    expect(handles).not.toHaveLength(0)
+    for (const handle of handles) expect(handle.disabled).toBe(true)
+  })
+
+  /**
+   * A refused write must not stay on screen looking applied. The click has
+   * already moved the checkbox, so the stored value has to be written back
+   * over it — the same correction `toggleAutostart` makes, for the same
+   * reason.
+   */
+  it('puts the checkbox back when the write is refused', async () => {
+    const calls = mockBackend({ accounts: two, autoSortError: 'the settings file is read-only' })
+    render(Settings)
+    await whenSubscribed(calls)
+
+    const box = (await screen.findByLabelText(
+      /Sort accounts by soonest weekly reset/,
+    )) as HTMLInputElement
+    await fireEvent.click(box)
+
+    expect(await screen.findByText(/read-only/)).toBeTruthy()
+    await waitFor(() => expect(box.checked).toBe(false))
+  })
+
+  it('reflects the stored value on open rather than defaulting to off', async () => {
+    const calls = mockBackend({ accounts: two, settings: settings(300, true, true) })
+    render(Settings)
+    await whenSubscribed(calls)
+
+    const box = (await screen.findByLabelText(
+      /Sort accounts by soonest weekly reset/,
+    )) as HTMLInputElement
+    await waitFor(() => expect(box.checked).toBe(true))
+  })
+})
+
+describe('Settings version', () => {
+  it('shows the running version', async () => {
+    const calls = mockBackend({ version: '9.9.9' })
+    render(Settings)
+    await whenSubscribed(calls)
+
+    expect(await screen.findByText('Quota Board 9.9.9')).toBeTruthy()
+  })
+
+  /**
+   * A version is the first thing a bug report carries, so an unknown one is
+   * shown as nothing at all rather than as a placeholder someone would paste
+   * in and be believed.
+   */
+  it('shows nothing at all when the version cannot be read', async () => {
+    const calls = mockBackend()
+    render(Settings)
+    await whenSubscribed(calls)
+
+    await waitFor(() => expect(screen.getByText('Debug')).toBeTruthy())
+    expect(screen.queryByText(/^Quota Board /)).toBeNull()
   })
 })

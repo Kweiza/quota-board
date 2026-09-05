@@ -56,6 +56,14 @@ struct SettingsFile {
     /// future build that bumped the version is refused rather than misread.
     version: u32,
     poll_interval_secs: i64,
+    /// docs/design.md §8.6. Off by default: the manual order in `accounts.json`
+    /// is what the user arranged by hand, and a fresh install must not silently
+    /// rearrange it.
+    ///
+    /// **No `FORMAT_VERSION` bump.** The constant is bumped only when the
+    /// meaning of an *existing* field changes; `#[serde(default)]` on the
+    /// container already fills this in for a file written before it existed.
+    auto_sort: bool,
     /// Every key this build does not know, kept so that saving one setting
     /// does not delete another build's. Without it, an older build that only
     /// knows `poll_interval_secs` silently drops `launch_at_login` and
@@ -70,6 +78,7 @@ impl Default for SettingsFile {
         Self {
             version: FORMAT_VERSION,
             poll_interval_secs: default_poll_interval_secs(),
+            auto_sort: false,
             extra: serde_json::Map::new(),
         }
     }
@@ -197,6 +206,37 @@ impl SettingsStore {
     /// Why the defaults are in use, if they are.
     pub fn warning(&self) -> Option<&str> {
         self.warning.as_deref()
+    }
+
+    /// docs/design.md §8.6: whether the account list is ordered by its soonest
+    /// seven-day reset instead of by the user's arrangement.
+    pub fn auto_sort(&self) -> bool {
+        self.file.auto_sort
+    }
+
+    /// Writes, and rolls back in memory if the write fails.
+    ///
+    /// The `unknown_version` refusal and the rollback are here for the same
+    /// reasons `set_poll_interval_secs` carries them, and this method must not
+    /// be simplified to drop either: rewriting an unreadable file would delete
+    /// a newer build's settings, and keeping a value the file does not carry
+    /// would leave the toggle showing a state the next launch does not restore.
+    pub fn set_auto_sort(&mut self, enabled: bool) -> Result<bool, SettingsError> {
+        if let Some(found) = self.unknown_version {
+            return Err(SettingsError::UnknownVersion { found, understood: FORMAT_VERSION });
+        }
+        let previous = self.file.auto_sort;
+        self.file.auto_sort = enabled;
+        match self.flush() {
+            Ok(()) => {
+                self.warning = None;
+                Ok(enabled)
+            }
+            Err(e) => {
+                self.file.auto_sort = previous;
+                Err(e)
+            }
+        }
     }
 
     /// Clamps, writes, and returns the value that actually took effect.
@@ -405,6 +445,82 @@ mod tests {
         s.set_poll_interval_secs(900).unwrap();
         let text = std::fs::read_to_string(&path).unwrap();
         assert!(text.contains("opacity"), "an unknown setting was deleted: {text}");
+        std::fs::remove_file(&path).ok();
+    }
+
+    /// §8.6 is off until the user asks for it. A fresh install that silently
+    /// reordered the widget would be indistinguishable, to the user, from the
+    /// app losing the arrangement they made.
+    #[test]
+    fn auto_sort_is_off_by_default_and_survives_a_reload() {
+        let path = tmp();
+        let mut s = SettingsStore::load(&path);
+        assert!(!s.auto_sort(), "a fresh install must not reorder anything");
+
+        assert!(s.set_auto_sort(true).unwrap());
+        assert!(SettingsStore::load(&path).auto_sort(), "the toggle did not reach disk");
+
+        s.set_auto_sort(false).unwrap();
+        assert!(!SettingsStore::load(&path).auto_sort());
+        std::fs::remove_file(&path).ok();
+    }
+
+    /// The two settings share one file and one `flush`, which rewrites the
+    /// whole struct. Saving either must not revert the other.
+    #[test]
+    fn each_setting_survives_a_save_of_the_other() {
+        let path = tmp();
+        let mut s = SettingsStore::load(&path);
+        s.set_poll_interval_secs(900).unwrap();
+        s.set_auto_sort(true).unwrap();
+
+        let reloaded = SettingsStore::load(&path);
+        assert_eq!(reloaded.poll_interval_secs(), 900);
+        assert!(reloaded.auto_sort());
+
+        // And the other direction: writing the interval last must not clear it.
+        s.set_poll_interval_secs(600).unwrap();
+        let reloaded = SettingsStore::load(&path);
+        assert_eq!(reloaded.poll_interval_secs(), 600);
+        assert!(reloaded.auto_sort(), "saving the interval reverted the toggle");
+        std::fs::remove_file(&path).ok();
+    }
+
+    /// A settings file written before this field existed. `#[serde(default)]`
+    /// on the container is what keeps the interval in it readable; without
+    /// that, the whole file fails to parse and the interval silently reverts
+    /// too.
+    #[test]
+    fn a_file_written_before_auto_sort_existed_keeps_its_interval() {
+        let path = tmp();
+        std::fs::write(&path, br#"{"version": 1, "poll_interval_secs": 900}"#).unwrap();
+        let s = SettingsStore::load(&path);
+        assert_eq!(s.poll_interval_secs(), 900, "the older file stopped parsing");
+        assert!(!s.auto_sort());
+        std::fs::remove_file(&path).ok();
+    }
+
+    /// The same refusal `set_poll_interval_secs` makes, for the same reason:
+    /// `flush` writes the whole struct, and for an unknown version that struct
+    /// is this build's defaults with an empty `extra`.
+    #[test]
+    fn auto_sort_cannot_overwrite_a_file_from_an_unknown_format_version() {
+        let path = tmp();
+        let original = format!(
+            r#"{{"version": {}, "poll_interval_secs": 900, "opacity": 0.8}}"#,
+            FORMAT_VERSION + 1
+        );
+        std::fs::write(&path, &original).unwrap();
+
+        let mut s = SettingsStore::load(&path);
+        let err = s.set_auto_sort(true).unwrap_err();
+        assert!(matches!(err, SettingsError::UnknownVersion { .. }), "wrong error: {err}");
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            original,
+            "the newer build's settings file was modified"
+        );
+        assert!(!s.auto_sort(), "a refused write must not stick in memory either");
         std::fs::remove_file(&path).ok();
     }
 

@@ -40,7 +40,16 @@ fn is_present_non_null(root: &Value, key: &str) -> bool {
     root.get(key).is_some_and(|v| !v.is_null())
 }
 
-fn flat_window(root: &Value, key: &str, window_id: &str, label: &str) -> Option<UsageWindow> {
+/// `weekly` is passed in rather than inferred from `key` or `label`: the two
+/// call sites read `five_hour` and `seven_day`, and which of those is a week is
+/// knowledge this function does not otherwise have. See `UsageWindow::weekly`.
+fn flat_window(
+    root: &Value,
+    key: &str,
+    window_id: &str,
+    label: &str,
+    weekly: bool,
+) -> Option<UsageWindow> {
     let obj = root.get(key)?;
     if obj.is_null() {
         return None;
@@ -51,6 +60,7 @@ fn flat_window(root: &Value, key: &str, window_id: &str, label: &str) -> Option<
         percent: parse_percent(obj.get("utilization")?)?,
         resets_at: parse_reset(obj.get("resets_at")?)?,
         scope: None,
+        weekly,
     })
 }
 
@@ -82,6 +92,11 @@ fn parse_weekly_entry(e: &Value) -> Option<UsageWindow> {
         percent: parse_percent(e.get("percent")?)?,
         resets_at: parse_reset(e.get("resets_at")?)?,
         scope: model.map(str::to_string),
+        // Unconditional: every element `is_weekly_entry` admits is a weekly
+        // limit, whether or not it names a model. The per-model ones are
+        // labelled "weekly (Opus)" rather than "7d", which is why nothing
+        // downstream may re-derive this from the label.
+        weekly: true,
     })
 }
 
@@ -135,7 +150,7 @@ fn scoped_weekly_windows(root: &Value) -> WeeklyLimits {
 ///   3. If neither exists, produce no weekly window (the caller displays
 ///      "weekly not reported")
 pub fn parse_usage(raw: &Value) -> Result<Vec<UsageWindow>, ParseError> {
-    let five_hour = flat_window(raw, "five_hour", "five_hour", "5h");
+    let five_hour = flat_window(raw, "five_hour", "five_hour", "5h", false);
     // The five_hour key was present and non-null but failed to parse — that is
     // not "not reported".
     let five_hour_unreadable = five_hour.is_none() && is_present_non_null(raw, "five_hour");
@@ -150,7 +165,7 @@ pub fn parse_usage(raw: &Value) -> Result<Vec<UsageWindow>, ParseError> {
             weekly_unreadable = true;
         }
         weekly_limits.windows
-    } else if let Some(w) = flat_window(raw, "seven_day", "seven_day", "7d") {
+    } else if let Some(w) = flat_window(raw, "seven_day", "seven_day", "7d", true) {
         vec![w]
     } else {
         if is_present_non_null(raw, "seven_day") {
@@ -328,9 +343,11 @@ mod tests {
         assert_eq!(w.len(), 2);
         assert_eq!(w[0].window_id, "five_hour");
         assert_eq!(w[0].percent, 28.0);
+        assert!(!w[0].weekly);
         assert_eq!(w[1].window_id, "seven_day");
         assert_eq!(w[1].percent, 41.0);
         assert_eq!(w[1].scope, None);
+        assert!(w[1].weekly);
     }
 
     /// docs/design.md §5.3: read limits[] first. Weekly information must not be
@@ -340,12 +357,18 @@ mod tests {
         let w = parse_usage(&fixture("weekly_scoped")).unwrap();
         assert_eq!(w.len(), 3, "one 5h window plus two per-model weekly windows");
         assert_eq!(w[0].window_id, "five_hour");
+        assert!(!w[0].weekly);
         assert_eq!(w[1].window_id, "weekly:Opus");
         assert_eq!(w[1].label, "weekly (Opus)");
         assert_eq!(w[1].percent, 31.0);
         assert_eq!(w[1].scope.as_deref(), Some("Opus"));
         assert_eq!(w[2].window_id, "weekly:Sonnet");
         assert_eq!(w[2].percent, 12.0);
+        // Neither of these is labelled "7d" — they read "weekly (Opus)" and
+        // "weekly (Sonnet)". A label-based weekly test would miss both, and
+        // §8.6 would then find no weekly reset on a Claude account that has
+        // two of them.
+        assert!(w[1].weekly && w[2].weekly);
     }
 
     /// limits[] beats the flat seven_day — when both exist, only limits[] is used.

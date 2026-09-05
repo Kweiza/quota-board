@@ -33,6 +33,10 @@ fn parse_reset(v: &Value) -> Option<DateTime<Utc>> {
     DateTime::from_timestamp(v.as_i64()?, 0)
 }
 
+/// One week, in seconds. Named because it decides two different things —
+/// the `7d` label and `UsageWindow::weekly` — and they must not drift apart.
+const WEEK_SECONDS: i64 = 604_800;
+
 /// Derived from the window's own length rather than from its slot name. The
 /// slot is both plan- and state-dependent: `primary_window` was measured as 7d
 /// on an idle paid account, 30d on free, and 5h on an active paid account.
@@ -41,7 +45,7 @@ fn label_for(seconds: i64) -> String {
     match seconds {
         18_000 => "5h".to_string(),
         86_400 => "1d".to_string(),
-        604_800 => "7d".to_string(),
+        WEEK_SECONDS => "7d".to_string(),
         2_592_000 => "30d".to_string(),
         s if s % 86_400 == 0 => format!("{}d", s / 86_400),
         s if s % 3_600 == 0 => format!("{}h", s / 3_600),
@@ -83,6 +87,12 @@ fn window(
         percent,
         resets_at,
         scope: display_name.map(str::to_string),
+        // The same reason `label_for` reads the duration rather than the slot
+        // name: `secondary_window` is the weekly one on a paid account and is
+        // something else on a free one, so a slot-name test would mark a free
+        // account's window as weekly and let §8.6's auto sort order that
+        // account by a seven-day reset it does not have.
+        weekly: seconds == WEEK_SECONDS,
     })
 }
 
@@ -280,6 +290,7 @@ mod tests {
         assert_eq!(w[0].percent, 0.0);
         assert_eq!(w[0].resets_at.timestamp(), 1786345526);
         assert_eq!(w[0].scope, None);
+        assert!(w[0].weekly, "a 7d window is weekly whichever slot it arrives in");
     }
 
     /// The window length is plan-dependent — 30 days on free, 7 on plus. A
@@ -288,6 +299,22 @@ mod tests {
     fn labels_a_free_accounts_window_by_its_own_length() {
         let w = parse_usage(&v(FREE_ZERO)).unwrap();
         assert_eq!(w[0].label, "30d");
+        assert!(!w[0].weekly, "thirty days is not a week");
+    }
+
+    /// The one fixture pair that proves the `weekly` flag cannot be recovered
+    /// from `window_id`. Both of these accounts report a window in the
+    /// **`primary`** slot, and only one of them is a week — so a downstream
+    /// test for `window_id == "secondary"`, or for a label starting "7d",
+    /// would rank a free account by a seven-day reset it does not have.
+    /// docs/design.md §8.6 is what would then be confidently wrong.
+    #[test]
+    fn the_weekly_flag_follows_the_duration_not_the_slot_name() {
+        let plus = parse_usage(&v(PLUS_ZERO)).unwrap();
+        let free = parse_usage(&v(FREE_ZERO)).unwrap();
+        assert_eq!(plus[0].window_id, free[0].window_id, "the same slot");
+        assert!(plus[0].weekly);
+        assert!(!free[0].weekly, "same slot, and not a week");
     }
 
     #[test]
@@ -304,8 +331,10 @@ mod tests {
         assert_eq!(w[1].window_id, "secondary");
         assert_eq!(w[0].label, "5h", "the paid primary window is the short one");
         assert_eq!(w[0].percent, 31.0);
+        assert!(!w[0].weekly);
         assert_eq!(w[1].label, "7d", "the paid secondary window is the weekly one");
         assert_eq!(w[1].percent, 6.0);
+        assert!(w[1].weekly);
     }
 
     /// A valid-looking 200 for another user or workspace is not this row's

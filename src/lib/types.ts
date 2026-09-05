@@ -6,6 +6,20 @@ export interface UsageWindow {
   percent: number
   resets_at: string
   scope: string | null
+  /**
+   * Whether this window covers seven days. Filled in by the Rust parser that
+   * read the response — mirrors `UsageWindow::weekly` in
+   * `crates/core/src/model.rs`, which carries the reasoning.
+   *
+   * **Never re-derive this from `window_id` or `label` here.** The two
+   * providers spell a weekly window four different ways ("seven_day",
+   * "weekly:Opus" labelled "weekly (Opus)", and Codex's "primary" or
+   * "secondary" depending on the plan), and Codex's slot is only sometimes a
+   * week. Optional because a snapshot cached before the field existed comes
+   * back without it; treat a missing value as "not known to be weekly", never
+   * as a reason to guess.
+   */
+  weekly?: boolean
 }
 
 /**
@@ -161,6 +175,14 @@ export interface SettingsView {
    * a save that is guaranteed to fail.
    */
   writable: boolean
+  /**
+   * docs/design.md §8.6. When true, `list_accounts` returns both windows'
+   * accounts ordered by their soonest seven-day reset rather than by the
+   * arrangement the user dragged them into. The order arrives already applied
+   * — nothing on this side re-sorts — so the widget, which never reads
+   * settings, cannot disagree with this window about it.
+   */
+  auto_sort: boolean
 }
 
 /**

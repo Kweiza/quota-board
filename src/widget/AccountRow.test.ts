@@ -6,13 +6,27 @@ import type { AccountView } from '../lib/types'
 const NOW = new Date('2026-07-29T12:00:00Z')
 const OLD = new Date(NOW.getTime() - 12 * 60_000).toISOString()
 
-const win = (id: string, label: string, pct: number) => ({
+/**
+ * `weekly` is explicit on every fixture because the parsers now always set it
+ * (`UsageWindow::weekly`). Leaving it off models a window restored from a
+ * snapshot cached before the field existed, which the last test in
+ * "AccountRow weekly" is specifically about — so it must not be the default
+ * here, or that test would be indistinguishable from the others.
+ */
+const win = (id: string, label: string, pct: number, weekly = false) => ({
   window_id: id,
   label,
   percent: pct,
   resets_at: '2026-07-29T13:23:00Z',
   scope: null,
+  weekly,
 })
+
+/** A window whose weekliness was never recorded. See `win`. */
+const unrecordedWin = (id: string, label: string, pct: number) => {
+  const { weekly: _weekly, ...rest } = win(id, label, pct)
+  return rest
+}
 
 /**
  * The general fixture: every field defaults to the Claude row this file has
@@ -40,17 +54,27 @@ const ok = (windows: ReturnType<typeof win>[], fetchedAt = NOW.toISOString()) =>
   view({ kind: 'ok', windows, extra: null, fetched_at: fetchedAt })
 
 describe('AccountRow provider', () => {
-  it('shows full product names when every other account field is identical', () => {
+  /**
+   * The visible per-row badge moved to the column heading in `Widget.svelte`
+   * (docs/design.md §8.1), where the product name is announced once as the
+   * column's accessible name. What must **not** have moved is the name inside
+   * each control's own accessible name: a screen-reader user landing on a
+   * button still has to hear which service it acts on, and with the badge gone
+   * these labels are the only place that says so.
+   */
+  it('keeps the product name in every control name now that the row badge is gone', () => {
     const same = { label: 'Work', email: 'same@example.com' }
     const claude = render(AccountRow, {
       account: acct({ ...same, provider: 'anthropic' }),
     })
-    expect(screen.getByLabelText('Provider: Claude').textContent).toBe('Claude')
+    expect(screen.queryByLabelText('Provider: Claude')).toBeNull()
+    expect(claude.container.querySelector('.badge')).toBeNull()
+    expect(screen.getByRole('button', { name: 'Refresh Claude account Work' })).toBeTruthy()
     claude.unmount()
 
     render(AccountRow, { account: acct({ ...same, provider: 'openai' }) })
-    expect(screen.getByLabelText('Provider: Codex').textContent).toBe('Codex')
-    expect(screen.queryByLabelText('Provider: Claude')).toBeNull()
+    expect(screen.queryByLabelText('Provider: Codex')).toBeNull()
+    expect(screen.getByRole('button', { name: 'Refresh Codex account Work' })).toBeTruthy()
   })
 
   /// The note serves design.md §5.3's read order, which has no Codex counterpart.
@@ -77,16 +101,20 @@ describe('AccountRow provider', () => {
 
   /// AccountRow.svelte's CSS comment records the bug this prevents: `.amounts`
   /// was left out of the stale list and money rendered at full strength inside an
-  /// otherwise dimmed row. The badge is the same class of element.
-  it('dims the badge on a stale row', () => {
+  /// otherwise dimmed row. `.age` is the same class of element, and it is now
+  /// the only child of `.head` besides `.name` — this test replaces the one
+  /// that watched `.badge`, which moved to the column heading.
+  it('dims the age on a stale row', () => {
     const { container } = render(AccountRow, {
       account: acct({
         provider: 'openai',
         state: { kind: 'stale', windows: [], extra: null, fetched_at: OLD },
       }),
+      now: NOW,
     })
-    const badge = container.querySelector('.badge')!
-    expect(getComputedStyle(badge).opacity).not.toBe('1')
+    const age = container.querySelector('.age')!
+    expect(age.textContent).toBe('12m ago')
+    expect(getComputedStyle(age).opacity).not.toBe('1')
   })
 })
 
@@ -155,7 +183,27 @@ describe('AccountRow bars', () => {
   })
 
   it('does not say that when a weekly window is present', () => {
-    render(AccountRow, { account: ok([win('weekly:Opus', 'weekly (Opus)', 55)]), now: NOW })
+    render(AccountRow, { account: ok([win('weekly:Opus', 'weekly (Opus)', 55, true)]), now: NOW })
+    expect(screen.queryByText('weekly not reported')).toBeNull()
+  })
+
+  /**
+   * A snapshot cached before `UsageWindow.weekly` existed comes back with the
+   * flag missing, and missing is **not** false: it means the weekliness was
+   * never recorded. Claiming "weekly not reported" from that would be a
+   * confidently-wrong display for the minutes between a restart and the first
+   * poll — the failure mode AGENTS.md puts above every other.
+   */
+  it('makes no claim when the weekly flag was never recorded', () => {
+    render(AccountRow, {
+      account: view({
+        kind: 'stale',
+        windows: [unrecordedWin('five_hour', '5h', 20)],
+        extra: null,
+        fetched_at: OLD,
+      }),
+      now: NOW,
+    })
     expect(screen.queryByText('weekly not reported')).toBeNull()
   })
 })

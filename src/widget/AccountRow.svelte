@@ -50,12 +50,27 @@
   $: state = account.state
   // Spec §5.3: the weekly window count is 0, 1 or N — never assumed.
   $: windows = state.kind === 'ok' || state.kind === 'stale' ? state.windows : []
-  // §5.3's read order is Anthropic's; Codex has no counterpart, so a plan
-  // simply has the windows it has. Ungated, this note appears on every Codex
-  // row forever.
+  /**
+   * §5.3's read order is Anthropic's; Codex has no counterpart, so a plan
+   * simply has the windows it has. Ungated, this note appears on every Codex
+   * row forever.
+   *
+   * `weekly` rather than a test on `window_id`, so the one definition of
+   * "weekly" lives in the parser that read the response — the same field
+   * §8.6's auto sort orders by. A name test would also have to know that
+   * Anthropic's per-model windows are `weekly:<model>` and Codex's is
+   * `secondary` only on some plans; see `UsageWindow::weekly` in
+   * `crates/core/src/model.rs`.
+   *
+   * **`undefined` is not `false` here.** A snapshot cached before the field
+   * existed comes back with the flag missing, and that means the weekliness
+   * was not recorded — not that there is no weekly window. Claiming "weekly
+   * not reported" from a missing flag would be the confidently-wrong display
+   * AGENTS.md forbids, for the minutes between a restart and the first poll.
+   */
+  $: weeklyRecorded = windows.every((w) => w.weekly !== undefined)
   $: hasWeekly =
-    account.provider !== 'anthropic' ||
-    windows.some((w) => w.window_id.startsWith('weekly') || w.window_id === 'seven_day')
+    account.provider !== 'anthropic' || !weeklyRecorded || windows.some((w) => w.weekly)
   /**
    * Absent whenever the account has nothing to put under its bars — an
    * Anthropic account with no spending limit, or a Codex account with no reset
@@ -73,10 +88,11 @@
 
 <div class="account" class:stale={isStale}>
   <div class="head">
-    <!-- Full product name rather than an abbreviation or a colour. §8.2
-         already gives colour one job (severity), and `title`-only expansion is
-         unavailable to keyboard, touch and many assistive-technology users. -->
-    <span class="badge" aria-label={`Provider: ${provider}`}>{provider}</span>
+    <!-- No provider badge. The product name is on the column head in
+         `Widget.svelte` now, where it is announced once as the column's
+         accessible name instead of once per row — and at half the widget's
+         width the account name needs the track the badge used to take.
+         docs/design.md §8.1. -->
     <span class="name" title={account.label}>{account.label}</span>
     {#if isStale && state.kind === 'stale'}
       <span class="age">{relativeAge(new Date(state.fetched_at), now)}</span>
@@ -175,15 +191,12 @@
      .58 measures 4.67:1 (AA for the account name), at .5 measures 3.90:1 and
      at .45 measures 3.42:1 (both above the 3:1 floor for the secondary text).
      Any darker backdrop only raises these. */
+  /* Every one of `.head`'s text children belongs in this group. One left out
+     lights up at full strength inside an otherwise dimmed row — the shipped
+     bug this file's own history records, which is why `.badge` was listed here
+     until the badge moved to the column head. */
   .account.stale .name,
-  .account.stale .age,
-  /* `.badge` joins this group for the same reason `.amounts` joins the group
-     below: it is another of `.head`'s children, and one left out of a stale
-     rule lights up at full strength inside an otherwise dimmed row — the
-     shipped bug this file's own history records. Joined here rather than
-     given a separate rule so the two cannot drift to different values, the
-     way `.name`'s and `.age`'s already do not. */
-  .account.stale .badge { opacity: .58; }
+  .account.stale .age { opacity: .58; }
   .account.stale .note { opacity: .5; }
   .account.stale :global(.label),
   .account.stale :global(.pct),
@@ -203,14 +216,6 @@
           font-size: 11px; font-weight: 600; white-space: nowrap;
           overflow: hidden; text-overflow: ellipsis; }
   .age  { font-size: 10px; opacity: .8; white-space: nowrap; }
-  /* No opacity here on purpose: full strength is this badge's resting state,
-     the same as `.name`'s. Setting one here as well as in the stale group
-     above would make the two numbers fight over the same element, and
-     whichever should win would depend on which rule happens to be more
-     specific rather than on which state the row is actually in. */
-  .badge { flex-shrink: 0; font-size: 9px; font-weight: 700; letter-spacing: .04em;
-           border: 1px solid currentColor; border-radius: 3px;
-           padding: 0 .25em; line-height: 1.35; }
   /* Deliberately matched to `.gear` in Widget.svelte — same colour, same hover,
      same borderless glyph. They are the widget's only two chrome controls and
      must read as one family. `flex-shrink: 0` keeps it whole when a long

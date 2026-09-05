@@ -48,10 +48,29 @@ pub struct AccountView {
 
 #[tauri::command]
 pub async fn list_accounts(state: State<'_, AppState>) -> Result<Vec<AccountView>, String> {
+    Ok(list_accounts_for(&state).await)
+}
+
+/// The whole of `list_accounts`, taking `&AppState` so it can be tested — the
+/// same split `remove_account_for` and `reorder_accounts_for` use.
+///
+/// **Both windows read the order from here rather than deciding it
+/// themselves.** §8.6's auto sort could have lived in the webview, but the
+/// widget does not read the settings file at all, so it would have needed the
+/// setting pushed to it and kept in step — two copies of the order, free to
+/// disagree while one of them repainted. Sorting the one list every reader
+/// already shares removes that possibility, and it is also what makes turning
+/// the toggle off exact: `sort_order` is never rewritten, so the manual
+/// arrangement comes back untouched.
+pub(crate) async fn list_accounts_for(state: &AppState) -> Vec<AccountView> {
+    // Read and release before the other two locks. `AppState`'s doc comment
+    // keeps `settings` outside the scheduler/accounts lock order, and holding
+    // it across them is exactly what would put it inside.
+    let auto_sort = state.settings.lock().await.auto_sort();
     // Lock order: scheduler before accounts. See the doc comment on `AppState`.
     let sched = state.scheduler.lock().await;
     let accounts = state.accounts.lock().await;
-    Ok(accounts
+    let mut views: Vec<AccountView> = accounts
         .list()
         .iter()
         .map(|a| AccountView {
@@ -61,7 +80,11 @@ pub async fn list_accounts(state: State<'_, AppState>) -> Result<Vec<AccountView
             email: a.email.clone(),
             state: sched.state(a.provider, &a.account_id).unwrap_or(AccountState::Loading),
         })
-        .collect())
+        .collect();
+    if auto_sort {
+        quota_core::model::by_weekly_reset(&mut views, |v| &v.state);
+    }
+    views
 }
 
 /// §6.3. Records what the widget webview reports; the polling loop combines it
@@ -1208,6 +1231,9 @@ pub struct SettingsView {
     /// instead of offering a save that is guaranteed to fail — and `warning`
     /// already carries the reason to show beside it.
     pub writable: bool,
+    /// docs/design.md §8.6. When true, `list_accounts` orders both windows by
+    /// each account's soonest seven-day reset instead of by `sort_order`.
+    pub auto_sort: bool,
 }
 
 /// The two locks are taken sequentially, never nested — see
@@ -1215,9 +1241,9 @@ pub struct SettingsView {
 /// so it is dropped at the end of that statement.
 async fn settings_view(state: &AppState) -> SettingsView {
     let poll_interval_secs = state.scheduler.lock().await.policy().interval().num_seconds();
-    let (warning, writable) = {
+    let (warning, writable, auto_sort) = {
         let settings = state.settings.lock().await;
-        (settings.warning().map(str::to_string), settings.is_writable())
+        (settings.warning().map(str::to_string), settings.is_writable(), settings.auto_sort())
     };
     SettingsView {
         poll_interval_secs,
@@ -1225,6 +1251,7 @@ async fn settings_view(state: &AppState) -> SettingsView {
         max_interval_secs: PollPolicy::MAX_INTERVAL_SECS,
         warning,
         writable,
+        auto_sort,
     }
 }
 
@@ -1253,6 +1280,36 @@ pub async fn set_settings(
 ) -> Result<SettingsView, String> {
     state.set_poll_interval(poll_interval_secs).await?;
     Ok(settings_view(&state).await)
+}
+
+/// docs/design.md §8.6's toggle.
+///
+/// A command of its own rather than another parameter on `set_settings`. The
+/// interval is applied on blur and is clamped on the way in (§6.1), so it
+/// answers with a value that may differ from the one sent; the toggle applies
+/// on change and is taken verbatim. Folding them together would make every
+/// keystroke in the interval field carry the toggle's state and every flip of
+/// the toggle re-submit a half-typed interval.
+///
+/// **Emits `accounts://changed`.** The setting changes the *order*
+/// `list_accounts` answers with, and the widget never reads the settings file
+/// — so without this event the widget would keep the old order until the next
+/// poll, up to §6.1's interval away, and the user would see the toggle do
+/// nothing.
+#[tauri::command]
+pub async fn set_auto_sort(app: tauri::AppHandle, enabled: bool) -> Result<SettingsView, String> {
+    let state = app.state::<AppState>();
+    set_auto_sort_for(&state, enabled).await?;
+    let _ = app.emit("accounts://changed", ());
+    Ok(settings_view(&state).await)
+}
+
+/// The whole of `set_auto_sort` except the event, so it can be tested without
+/// an `AppHandle` — the same split `reorder_accounts_for` uses.
+pub(crate) async fn set_auto_sort_for(state: &AppState, enabled: bool) -> Result<bool, String> {
+    // Taken alone and released here: `settings` sits outside the
+    // scheduler/accounts lock order (see `AppState`).
+    state.settings.lock().await.set_auto_sort(enabled).map_err(|e| e.to_string())
 }
 
 /// docs/design.md §8.4's "Debug: view the last raw JSON response (§5.5)".
@@ -1287,6 +1344,123 @@ mod tests {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use wiremock::matchers::{method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    /// docs/design.md §8.6, end to end through the one list both windows read.
+    ///
+    /// The two accounts are seeded so that the **second** one in the manual
+    /// order resets first, so an implementation that simply returned
+    /// `sort_order` would fail the middle assertion rather than pass by
+    /// coincidence.
+    #[tokio::test]
+    async fn auto_sort_orders_by_the_soonest_weekly_reset_and_leaves_the_manual_order_intact() {
+        use quota_core::model::UsageWindow;
+        use quota_core::snapshots::CachedSnapshot;
+
+        let state = app_state(Arc::new(MemoryStore::default()));
+
+        fn snapshot(weekly_in_days: i64) -> CachedSnapshot {
+            CachedSnapshot {
+                windows: vec![
+                    // A 5h window on both, resetting in the opposite order, so
+                    // reading the wrong window is visible as the wrong answer
+                    // rather than as no change at all.
+                    UsageWindow {
+                        window_id: "five_hour".into(),
+                        label: "5h".into(),
+                        percent: 10.0,
+                        resets_at: chrono::Utc::now() + chrono::TimeDelta::minutes(8 - weekly_in_days),
+                        scope: None,
+                        weekly: false,
+                    },
+                    UsageWindow {
+                        window_id: "seven_day".into(),
+                        label: "7d".into(),
+                        percent: 40.0,
+                        resets_at: chrono::Utc::now() + chrono::TimeDelta::days(weekly_in_days),
+                        scope: None,
+                        weekly: true,
+                    },
+                ],
+                fetched_at: chrono::Utc::now(),
+                token_fingerprint: "fp".into(),
+            }
+        }
+
+        {
+            let mut sched = state.scheduler.lock().await;
+            sched.seed_from_cache(Provider::Anthropic, "a", snapshot(6), "fp");
+            sched.seed_from_cache(Provider::Anthropic, "b", snapshot(2), "fp");
+        }
+
+        let ids = |views: &[AccountView]| {
+            views.iter().map(|v| v.account_id.clone()).collect::<Vec<_>>()
+        };
+
+        assert_eq!(ids(&list_accounts_for(&state).await), ["a", "b"], "off by default");
+
+        set_auto_sort_for(&state, true).await.unwrap();
+        assert_eq!(
+            ids(&list_accounts_for(&state).await),
+            ["b", "a"],
+            "\"b\" resets in two days and must come first"
+        );
+
+        set_auto_sort_for(&state, false).await.unwrap();
+        assert_eq!(
+            ids(&list_accounts_for(&state).await),
+            ["a", "b"],
+            "turning the toggle off must restore the arrangement, not a re-sort of it"
+        );
+    }
+
+    /// An account the sort cannot rank goes last and is not invented a reset.
+    #[tokio::test]
+    async fn auto_sort_puts_an_account_with_no_weekly_window_last() {
+        use quota_core::model::UsageWindow;
+        use quota_core::snapshots::CachedSnapshot;
+
+        let state = app_state(Arc::new(MemoryStore::default()));
+        {
+            let mut sched = state.scheduler.lock().await;
+            // "a" is LOADING — `add` registered it and nothing has polled it.
+            // "b" has a weekly window a week out. Even so, "b" outranks the
+            // account with no answer at all.
+            sched.seed_from_cache(
+                Provider::Anthropic,
+                "b",
+                CachedSnapshot {
+                    windows: vec![UsageWindow {
+                        window_id: "seven_day".into(),
+                        label: "7d".into(),
+                        percent: 40.0,
+                        resets_at: chrono::Utc::now() + chrono::TimeDelta::days(7),
+                        scope: None,
+                        weekly: true,
+                    }],
+                    fetched_at: chrono::Utc::now(),
+                    token_fingerprint: "fp".into(),
+                },
+                "fp",
+            );
+        }
+        set_auto_sort_for(&state, true).await.unwrap();
+        let views = list_accounts_for(&state).await;
+        assert_eq!(
+            views.iter().map(|v| v.account_id.clone()).collect::<Vec<_>>(),
+            ["b", "a"]
+        );
+    }
+
+    /// `SettingsView` is what the settings window renders the toggle from, so
+    /// a stored value that never reached the view would show the toggle off
+    /// while the list was being sorted.
+    #[tokio::test]
+    async fn the_settings_view_reports_the_stored_auto_sort() {
+        let state = app_state(Arc::new(MemoryStore::default()));
+        assert!(!settings_view(&state).await.auto_sort);
+        set_auto_sort_for(&state, true).await.unwrap();
+        assert!(settings_view(&state).await.auto_sort);
+    }
 
     #[derive(Default)]
     struct DeleteFailsOnceStore {

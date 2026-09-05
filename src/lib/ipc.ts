@@ -137,6 +137,43 @@ export const setSettings = (pollIntervalSecs: number): Promise<SettingsView> =>
   invoke('set_settings', { pollIntervalSecs })
 
 /**
+ * docs/design.md §8.6's toggle. Its own command rather than a second argument
+ * to `setSettings`: the interval applies on blur and is clamped on the way in,
+ * this applies on change and is taken verbatim.
+ *
+ * The command also emits `accounts://changed`, so both windows re-read the list
+ * in the new order without either of them re-sorting anything locally.
+ */
+export const setAutoSort = (enabled: boolean): Promise<SettingsView> =>
+  invoke('set_auto_sort', { enabled })
+
+/**
+ * The running app's version, for the settings window's footer.
+ *
+ * `null` outside a Tauri webview (`npm run dev` in a plain browser, and every
+ * test) — the footer renders nothing rather than a placeholder, because a
+ * version string is the kind of value someone pastes into a bug report and a
+ * made-up one there is worse than none. The import is dynamic for the same
+ * reason `enableDrag` resolves `getCurrentWindow()` lazily: reaching for
+ * `__TAURI_INTERNALS__` at module scope throws outside the webview.
+ *
+ * No capability entry is needed: `core:default` already contains
+ * `core:app:default`, which grants `core:app:allow-version`.
+ */
+export async function appVersion(): Promise<string | null> {
+  if (!inTauri()) return null
+  try {
+    const { getVersion } = await import('@tauri-apps/api/app')
+    return await getVersion()
+  } catch (e) {
+    // A footer is not worth breaking the window over, and a wrong version is
+    // worse than an absent one.
+    console.error('quota-board: getVersion failed', e)
+    return null
+  }
+}
+
+/**
  * docs/design.md §5.5's retained body, for the settings window's debug panel.
  * `null` means nothing has been captured for this account yet — **do not
  * coerce it**; the panel renders the two differently.
