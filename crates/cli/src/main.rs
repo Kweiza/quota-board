@@ -15,16 +15,19 @@ use quota_core::auth::stored::{
 use quota_core::auth::token::{exchange_code, AnthropicAuthConfig, ReqwestHttp};
 use quota_core::paths::accounts_file;
 use quota_core::provider::{token_key, Provider};
-use quota_core::secrets::{keychain::KeychainStore, SecretStore, SERVICE};
+use quota_core::secrets::{open_os_keychain, SecretStore, SERVICE};
 use quota_core::usage::http::{
     fetch_usage_for_account_at, OPENAI_USAGE_URL, USAGE_URL,
 };
 
 fn open_store() -> Box<dyn SecretStore> {
-    match KeychainStore::probe(SERVICE) {
+    // Through `open_os_keychain`, never `KeychainStore::probe`: on macOS the GUI
+    // packs every token into one keychain entry, and a CLI that read the
+    // unpacked keys would report every account as missing.
+    match open_os_keychain(SERVICE) {
         Ok(s) => {
             eprintln!("store: {}", s.describe());
-            Box::new(s)
+            s
         }
         Err(e) => {
             eprintln!("keychain unavailable ({e}).");

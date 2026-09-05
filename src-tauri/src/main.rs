@@ -14,7 +14,7 @@ use quota_core::auth::stored::{load_tokens, AuthConfigs, RefreshLocks};
 use quota_core::auth::token::{AnthropicAuthConfig, ReqwestHttp};
 use quota_core::provider::Provider;
 use quota_core::scheduler::{register_accounts, Scheduler, SystemClock};
-use quota_core::secrets::{keychain::KeychainStore, timeout::TimeoutStore, SecretStore, SERVICE};
+use quota_core::secrets::{open_os_keychain, timeout::TimeoutStore, SecretStore, SERVICE};
 /// Named only inside the `QUOTA_FORCE_FALLBACK` block below, which is itself
 /// `debug_assertions`-only. Imported unconditionally it is an `unused_imports`
 /// warning in every release build — invisible to `cargo clippy --all-targets`,
@@ -168,7 +168,7 @@ fn main() {
                     std::time::Duration::from_secs(
                         quota_core::secrets::timeout::DEFAULT_TIMEOUT_SECS,
                     ),
-                    || KeychainStore::probe(SERVICE).map(|s| Box::new(s) as Box<dyn SecretStore>),
+                    || open_os_keychain(SERVICE),
                 )
             });
             // docs/design.md §9.2's real trigger — a Linux box with no Secret

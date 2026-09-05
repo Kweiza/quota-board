@@ -874,6 +874,52 @@ vanishes on reboot.
   the start (`openai:<id>:tokens`): the token store is the one place a bug
   means credential loss, so it carries no migration to get wrong. See
   `provider::token_key`.
+- **On macOS every one of those keys lives inside a single keychain entry**
+  (`secrets::packed`). The logical keys above do not change — `stored`,
+  `provider::token_key` and the `(provider, account_id)` rule are exactly as
+  written — but the *physical* store beneath them holds one entry containing a
+  base64 map of all of them.
+
+  The reason is the macOS access-control list, which is granted **per entry and
+  pinned to the binary that created it**. Nine accounts occupy fifteen entries,
+  so every new build of the app is a stranger to fifteen ACLs and the user
+  approves fifteen prompts on every install. Packing makes that one.
+
+  Two measurements decided this, and both refuted a cheaper idea:
+
+  1. **Signing with a stable identity does not help.** The ACL stores a snapshot
+     of the signed binary, not its designated requirement. Two probes signed
+     with the same self-signed certificate under the same identifier: the writer
+     read its own entry (`status=0`), the rebuilt one was refused (`-25293`)
+     with user interaction disabled.
+  2. **macOS takes at least 1 MiB in one generic-password item** — measured at
+     1, 4, 16, 64, 256 and 1024 KiB, each written and read back byte-for-byte.
+     The 2560-byte cap this project applied on every platform is Windows
+     Credential Manager's alone, and applying it to macOS is what had made
+     packing impossible. `keychain::ENTRY_LIMIT` is now per-platform, and
+     `cargo run -p quota-core --example probe` re-measures the packed path
+     end to end: fifteen logical keys came to one 32 KiB entry.
+
+  Packing is macOS-only. Windows cannot (the 2560-byte limit is real there) and
+  Linux gains nothing — the Secret Service unlocks a whole collection, not an
+  entry at a time.
+
+  **Migration is lazy and never destructive.** A read that misses the packed map
+  falls back to the original key, folds the value in, and deletes the original
+  only after the packed write succeeded. One upgrade still costs the old fifteen
+  prompts; every install after it costs one.
+
+  **Every write rewrites the whole entry, so the read-modify-write holds one
+  lock.** The scheduler refreshes accounts concurrently, and before packing each
+  key was an independent entry where that could not matter. Releasing the lock
+  between load and store loses one of two concurrent writes — an account
+  silently left without credentials.
+
+  **`open_os_keychain` is the only way to open the store.** §9.3 already warns
+  that the GUI and the CLI must agree on the service name; the layout is the
+  same kind of agreement, and a build that packed against one that did not would
+  see none of the other's tokens.
+
 - Anthropic's existing per-account JSON blob is frozen for compatibility:
   `{ access_token, refresh_token, expires_at, refresh_token_expires_at, scopes[], client_id }`
 

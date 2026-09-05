@@ -8,6 +8,9 @@
 pub mod encrypted_file;
 #[cfg(feature = "os-keychain")]
 pub mod keychain;
+// Unconditional for the same reason as `timeout`: it wraps any `SecretStore`
+// and touches no backend of its own.
+pub mod packed;
 // Unconditional: it wraps any `SecretStore` in a timeout and touches no backend
 // of its own. Its only mention of keyring is in a doc comment tracing a call
 // path.
@@ -50,6 +53,31 @@ pub trait SecretStore: Send + Sync {
     fn describe(&self) -> String;
 }
 
+/// **The one way to open the OS keychain.** Both binaries must call this rather
+/// than `KeychainStore::probe` directly.
+///
+/// docs/design.md §9.3 already warns that the GUI and the CLI must agree on
+/// [`SERVICE`], and that a mismatch is silent — every account classifies to
+/// `AUTH_DEAD` on the first tick. The storage *layout* is the same kind of
+/// agreement: a build that packs and a build that does not would look at the
+/// same keychain and see none of each other's tokens. Having one function
+/// decide is what keeps them from drifting.
+///
+/// On macOS the store is wrapped in [`packed::PackedStore`], which is where the
+/// reasoning for that lives. Elsewhere the keychain is returned as it is.
+#[cfg(feature = "os-keychain")]
+pub fn open_os_keychain(service: &str) -> Result<Box<dyn SecretStore>, SecretError> {
+    let store = keychain::KeychainStore::probe(service)?;
+    #[cfg(target_os = "macos")]
+    {
+        Ok(Box::new(packed::PackedStore::new(store)))
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        Ok(Box::new(store))
+    }
+}
+
 /// Test-only. Never used on a production path.
 #[derive(Default)]
 pub struct MemoryStore {
@@ -69,6 +97,51 @@ impl SecretStore for MemoryStore {
     }
     fn describe(&self) -> String {
         "memory (test only)".to_string()
+    }
+}
+
+impl MemoryStore {
+    /// Test-only. What actually reached the backend — `packed` asserts on this,
+    /// because the number of physical entries *is* the number of macOS approval
+    /// prompts.
+    pub fn keys(&self) -> Vec<String> {
+        let mut keys: Vec<String> = self.inner.lock().unwrap().keys().cloned().collect();
+        keys.sort();
+        keys
+    }
+}
+
+/// So a wrapper can be handed a shared backend without owning it. `AppState`
+/// already passes the store around as `Arc<dyn SecretStore>`; this makes that
+/// shape usable wherever a `SecretStore` is expected rather than only where a
+/// `&dyn` is.
+impl<T: SecretStore + ?Sized> SecretStore for &T {
+    fn put(&self, key: &str, value: &[u8]) -> Result<(), SecretError> {
+        (**self).put(key, value)
+    }
+    fn get(&self, key: &str) -> Result<Option<Vec<u8>>, SecretError> {
+        (**self).get(key)
+    }
+    fn delete(&self, key: &str) -> Result<bool, SecretError> {
+        (**self).delete(key)
+    }
+    fn describe(&self) -> String {
+        (**self).describe()
+    }
+}
+
+impl<T: SecretStore + ?Sized> SecretStore for std::sync::Arc<T> {
+    fn put(&self, key: &str, value: &[u8]) -> Result<(), SecretError> {
+        (**self).put(key, value)
+    }
+    fn get(&self, key: &str) -> Result<Option<Vec<u8>>, SecretError> {
+        (**self).get(key)
+    }
+    fn delete(&self, key: &str) -> Result<bool, SecretError> {
+        (**self).delete(key)
+    }
+    fn describe(&self) -> String {
+        (**self).describe()
     }
 }
 

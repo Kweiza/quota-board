@@ -5,6 +5,28 @@ use super::{SecretError, SecretStore};
 /// stored as several entries rather than one large blob.
 pub const WINDOWS_BLOB_LIMIT: usize = 2560;
 
+/// What **this** platform's keychain will actually take in one entry.
+///
+/// It was `WINDOWS_BLOB_LIMIT` everywhere, which is a portability rule applied
+/// as if it were a physical one — and it is what made `packed::PackedStore`
+/// impossible, because a packed blob is larger than any single token by
+/// construction.
+///
+/// The macOS figure is measured, not assumed: a signed probe wrote and read
+/// back generic-password items of 1, 4, 16, 64, 256 and 1024 KiB, every one
+/// byte-for-byte. 256 KiB is well inside that and still far above anything
+/// nine accounts produce, so an entry that somehow grew past it is a bug worth
+/// failing on rather than a limit worth raising.
+///
+/// Linux keeps the Windows number. The Secret Service imposes no such cap, but
+/// nothing there benefits from a larger one — packing exists for macOS's
+/// per-entry approval prompts — and the conservative value keeps a Linux
+/// installation writable by a Windows build of the same account file.
+#[cfg(target_os = "macos")]
+pub const ENTRY_LIMIT: usize = 256 * 1024;
+#[cfg(not(target_os = "macos"))]
+pub const ENTRY_LIMIT: usize = WINDOWS_BLOB_LIMIT;
+
 pub struct KeychainStore {
     service: String,
     vendor: String,
@@ -61,8 +83,8 @@ fn map_err(e: keyring::Error) -> SecretError {
 
 impl SecretStore for KeychainStore {
     fn put(&self, key: &str, value: &[u8]) -> Result<(), SecretError> {
-        if value.len() > WINDOWS_BLOB_LIMIT {
-            return Err(SecretError::TooLong { limit: WINDOWS_BLOB_LIMIT });
+        if value.len() > ENTRY_LIMIT {
+            return Err(SecretError::TooLong { limit: ENTRY_LIMIT });
         }
         self.entry(key)?.set_secret(value).map_err(map_err)
     }
