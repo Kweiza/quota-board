@@ -334,6 +334,7 @@ fn main() {
             commands::unlock_secrets,
             commands::get_settings,
             commands::set_settings,
+            commands::set_auto_sort,
             commands::last_response
         ])
         .build(tauri::generate_context!())
@@ -485,6 +486,7 @@ mod tests {
                 percent: 31.0,
                 resets_at: chrono::Utc::now() + chrono::TimeDelta::hours(1),
                 scope: None,
+                weekly: false,
             }],
             fetched_at: chrono::Utc::now(),
             token_fingerprint: fingerprint(access_token),

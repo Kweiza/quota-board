@@ -8,7 +8,9 @@
 # research logs. Never published. See AGENTS.md.
 /.local/
 
-# Agent session scratch
+# Agent session scratch. `.claude/` and `.flightdeck/` also hold git worktrees,
+# which must never be committed into the repository they are checked out from.
 /.superpowers/
 /.claude/
+/.flightdeck/
 /.playwright-mcp/

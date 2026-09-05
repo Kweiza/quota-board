@@ -1,4 +1,5 @@
 import { clearMocks, mockIPC, mockWindows } from '@tauri-apps/api/mocks'
+import type { LogicalSize } from '@tauri-apps/api/dpi'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
 /**
@@ -16,13 +17,13 @@ function listenedEvents(calls: IpcCall[]): unknown[] {
   return calls.filter((c) => c.cmd === 'plugin:event|listen').map((c) => c.args.event)
 }
 
-function mockBackend(): IpcCall[] {
+function mockBackend(accounts: unknown[] = []): IpcCall[] {
   const calls: IpcCall[] = []
   mockIPC((cmd, args) => {
     calls.push({ cmd, args: (args ?? {}) as Record<string, unknown> })
     switch (cmd) {
       case 'list_accounts':
-        return []
+        return accounts
       case 'get_settings':
         return {
           poll_interval_secs: 300,
@@ -30,6 +31,7 @@ function mockBackend(): IpcCall[] {
           max_interval_secs: 86400,
           warning: null,
           writable: true,
+          auto_sort: false,
         }
       case 'store_status':
         return { description: 'a token store', kind: 'keychain', fallback_file_exists: false }
@@ -39,6 +41,9 @@ function mockBackend(): IpcCall[] {
   })
   return calls
 }
+
+/** Every `ResizeObserver` callback `followContentHeight` registered. */
+let observed: Array<() => void> = []
 
 /** Routes the document to one of the two windows, the way tauri.conf.json does. */
 function route(which: 'widget' | 'settings'): HTMLElement {
@@ -54,10 +59,18 @@ beforeEach(() => {
   // jsdom implements neither, and `followContentHeight` observes the mount
   // target inside a Tauri webview. Stubbed rather than skipped so the widget
   // branch under test is the shipped one.
+  observed = []
   vi.stubGlobal(
     'ResizeObserver',
     class {
-      observe(): void {}
+      constructor(private readonly cb: () => void) {}
+      observe(): void {
+        // Captured rather than dropped: `followContentHeight` pushes the
+        // window's *width* back now, so the callback is the only place the
+        // two-column width is decided and a stub that swallowed it would leave
+        // that decision untested.
+        observed.push(this.cb)
+      }
       unobserve(): void {}
       disconnect(): void {}
     },
@@ -101,6 +114,90 @@ describe('main.ts widget branch', () => {
     expect(target.querySelector('.widget')).toBeTruthy()
     // §6.3's report is registered in this branch and only this branch.
     expect(calls.some((c) => c.cmd === 'set_widget_visible')).toBe(true)
+  })
+
+  /**
+   * docs/design.md §8.1. The width is no longer a constant, and the only place
+   * it is decided is this callback — so a widget that had grown a second
+   * provider's column while the window stayed 280px wide would show two
+   * columns squeezed to 130px each, every bar row wrapped, with nothing in the
+   * suite objecting.
+   */
+  describe('window sizing', () => {
+    const account = (provider: string) => ({
+      account_id: `${provider}-1`,
+      provider,
+      label: provider,
+      email: `${provider}@example.com`,
+      state: { kind: 'loading' },
+    })
+
+    /** jsdom lays nothing out, so the height has to come from somewhere. */
+    function stubHeight(px: number): void {
+      vi.spyOn(Element.prototype, 'getBoundingClientRect').mockReturnValue({
+        height: px,
+        width: 0,
+        top: 0,
+        left: 0,
+        right: 0,
+        bottom: 0,
+        x: 0,
+        y: 0,
+        toJSON: () => ({}),
+      })
+    }
+
+    /**
+     * `setSize` sends a `Size` wrapping the `LogicalSize` itself, and `mockIPC`
+     * hands over the live object rather than its serialized form — so the
+     * assertion reaches through `value.size` instead of matching a plain
+     * `{ width, height }`. `type` is asserted alongside: a `PhysicalSize` would
+     * satisfy the numbers and still be the wrong size on any display whose
+     * scale factor is not 1.
+     */
+    const sizes = (calls: IpcCall[]): unknown[] =>
+      calls
+        .filter((c) => c.cmd.endsWith('set_size'))
+        .map((c) => {
+          const size = (c.args.value as { size: LogicalSize }).size
+          return { type: size.type, width: size.width, height: size.height }
+        })
+
+    it('keeps the single-column width while only one provider has accounts', async () => {
+      const calls = mockBackend([account('anthropic')])
+      mockWindows('widget')
+      route('widget')
+      stubHeight(140)
+
+      await import('./main')
+      await vi.waitFor(() => expect(observed.length).toBeGreaterThan(0))
+      for (const fire of observed) fire()
+
+      expect(sizes(calls).length).toBeGreaterThan(0)
+      for (const size of sizes(calls)) {
+        expect(size).toEqual({ type: 'Logical', width: 280, height: 140 })
+      }
+    })
+
+    it('widens to the two-column width once both providers have accounts', async () => {
+      const calls = mockBackend([account('anthropic'), account('openai')])
+      mockWindows('widget')
+      route('widget')
+      stubHeight(180)
+
+      await import('./main')
+      // The list has to have landed first: the width is a function of it, and
+      // firing the observer before `list_accounts` resolves would measure the
+      // empty widget and prove nothing.
+      await vi.waitFor(() => {
+        expect(calls.some((c) => c.cmd === 'list_accounts')).toBe(true)
+        expect(observed.length).toBeGreaterThan(0)
+      })
+      for (const fire of observed) fire()
+
+      const last = sizes(calls).at(-1)
+      expect(last).toEqual({ type: 'Logical', width: 520, height: 180 })
+    })
   })
 
   it('leaves the loading state only after the first account reads complete', async () => {

@@ -7,6 +7,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 // would fail the whole file — which is the failure `npm run dev` in a plain
 // browser would otherwise hit.
 import {
+  appVersion,
   beginLogin,
   enableDrag,
   isSettingsWindow,
@@ -19,6 +20,7 @@ import {
   refreshAccount,
   renameAccount,
   reorderAccounts,
+  setAutoSort,
   setSettings,
 } from './ipc'
 import type { RawResponse, SettingsView } from './types'
@@ -247,12 +249,54 @@ describe('command wrappers', () => {
       max_interval_secs: 3600,
       warning: null,
       writable: true,
+      auto_sort: false,
     }
     const calls = recordArgs((cmd) => (cmd === 'set_settings' ? view : null))
 
     await expect(setSettings(300)).resolves.toEqual(view)
 
     expect(calls).toEqual([{ cmd: 'set_settings', args: { pollIntervalSecs: 300 } }])
+  })
+
+  /**
+   * docs/design.md §8.6. A command of its own, not a second argument to
+   * `set_settings`: the interval is clamped on the way in and applies on blur,
+   * this is taken verbatim and applies on change.
+   */
+  it('setAutoSort sends the toggle and answers with the stored settings', async () => {
+    const view: SettingsView = {
+      poll_interval_secs: 300,
+      min_interval_secs: 180,
+      max_interval_secs: 3600,
+      warning: null,
+      writable: true,
+      auto_sort: true,
+    }
+    const calls = recordArgs((cmd) => (cmd === 'set_auto_sort' ? view : null))
+
+    await expect(setAutoSort(true)).resolves.toEqual(view)
+
+    expect(calls).toEqual([{ cmd: 'set_auto_sort', args: { enabled: true } }])
+  })
+
+  it('appVersion reads the running version', async () => {
+    recordArgs((cmd) => (cmd === 'plugin:app|version' ? '1.2.3' : null))
+    await expect(appVersion()).resolves.toBe('1.2.3')
+  })
+
+  /**
+   * The settings footer prints whatever this answers. A thrown read must come
+   * back as "unknown", never as a string a bug report would carry as fact —
+   * and it must not take the settings window down with it, which is why it is
+   * caught here rather than at the call site.
+   */
+  it('appVersion answers null rather than rejecting when the read fails', async () => {
+    vi.spyOn(console, 'error').mockImplementation(() => {})
+    recordArgs((cmd) => {
+      if (cmd === 'plugin:app|version') return Promise.reject('no such command')
+      return null
+    })
+    await expect(appVersion()).resolves.toBeNull()
   })
 
   /**

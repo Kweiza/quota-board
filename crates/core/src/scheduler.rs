@@ -1146,6 +1146,7 @@ mod tests {
             percent: pct,
             resets_at: Utc::now() + TimeDelta::hours(1),
             scope: None,
+            weekly: false,
         }]
     }
 
@@ -1928,6 +1929,7 @@ mod tests {
                 percent: pct,
                 resets_at: c.now() + TimeDelta::seconds(resets_in_secs),
                 scope: None,
+                weekly: false,
             }],
             fetched_at: c.now(),
             token_fingerprint: fp.to_string(),
@@ -2014,6 +2016,7 @@ mod tests {
             percent: 41.0,
             resets_at: c.now() - TimeDelta::seconds(1),
             scope: None,
+            weekly: true,
         });
         s.seed_from_cache(Provider::Anthropic, "a", snap, "fp");
         match s.state(Provider::Anthropic, "a").unwrap() {

@@ -14,6 +14,30 @@ pub struct UsageWindow {
     pub resets_at: DateTime<Utc>,
     /// Display name of the model for per-model weekly windows. None otherwise.
     pub scope: Option<String>,
+    /// Whether this window covers **seven days**. Set by the parser that read
+    /// the response, which is the only place the fact is actually known, and
+    /// never re-derived from `window_id` or `label` downstream.
+    ///
+    /// Two things make the string tests it replaces wrong rather than merely
+    /// ugly. On the Anthropic side `weekly:<model>` and `seven_day` are weekly
+    /// by construction, but the label of the first is "weekly (Opus)", so a
+    /// test for "7d" misses it. On the Codex side the weekly window is
+    /// `secondary`, and `secondary` is **not** always seven days: the duration
+    /// comes from `limit_window_seconds`, and
+    /// `codex_free_plan_labels_the_secondary_window_from_its_own_duration`
+    /// pins a free account whose secondary window is not a week. A name-based
+    /// test would call that window weekly and sort the account by a reset it
+    /// does not have — the confidently-wrong display AGENTS.md forbids.
+    ///
+    /// `#[serde(default)]` because `snapshots::CachedSnapshot` writes these to
+    /// disk: without it, every cache written before this field existed fails
+    /// to parse, and `snapshots::load` turns that into an empty cache without
+    /// a word, so the first launch after an upgrade would lose every stale
+    /// value the cache exists to keep. False on such a window is the honest
+    /// reading — the fact was not recorded — and §8.6's auto sort already
+    /// places a window it cannot date last rather than guessing at one.
+    #[serde(default)]
+    pub weekly: bool,
 }
 
 /// The monthly credit spend, for an account that has a spending limit.
@@ -158,6 +182,48 @@ impl Severity {
     }
 }
 
+/// The soonest seven-day reset this account has, or `None` when it has none.
+///
+/// `None` is a real answer, not a zero: an account that is `LOADING`, throttled
+/// or unreadable has no seven-day reset to be ordered by, and neither does a
+/// Codex account whose plan reports no weekly window at all (§5.3 says the
+/// count is 0, 1 or N — never assumed). `by_weekly_reset` puts every such
+/// account after the ones it can date instead of inventing a timestamp for it.
+///
+/// `Stale` counts. The reading is old, but the *reset instant* it carries is a
+/// fact about the week, not about the fetch, so dropping a stale account to the
+/// bottom would reorder the widget on every transient network failure.
+pub fn weekly_reset(state: &AccountState) -> Option<DateTime<Utc>> {
+    let windows = match state {
+        AccountState::Ok { windows, .. } | AccountState::Stale { windows, .. } => windows.as_slice(),
+        _ => &[],
+    };
+    // `min`, not `first`: an Anthropic account reports one weekly window per
+    // model (§5.3), and the one that matters to "how long have I got" is
+    // whichever comes back soonest.
+    windows.iter().filter(|w| w.weekly).map(|w| w.resets_at).min()
+}
+
+/// docs/design.md §8.6's auto sort: soonest seven-day reset first, accounts
+/// with no datable weekly window last.
+///
+/// **Stable, and that is the whole reason it is `sort_by_key` rather than a
+/// comparison that ranks the undatable accounts among themselves.** Ties and
+/// unknowns keep the order they arrived in, which is the user's own
+/// `sort_order` — so turning the toggle off restores exactly the manual
+/// arrangement, and the accounts this function cannot rank do not shuffle on
+/// every poll.
+///
+/// The `is_none()` in the key is what puts them last: `Option`'s own ordering
+/// sorts `None` *before* `Some`, which would bury the account the user most
+/// needs to see under every account this function knows nothing about.
+pub fn by_weekly_reset<T>(items: &mut [T], state: impl Fn(&T) -> &AccountState) {
+    items.sort_by_key(|item| {
+        let reset = weekly_reset(state(item));
+        (reset.is_none(), reset)
+    });
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -177,6 +243,134 @@ mod tests {
     /// The serialized form is a contract with `src/lib/types.ts`. `tag = "kind"`
     /// plus snake_case on the outside, and an internally tagged `extra` whose own
     /// tag the TypeScript union switches on.
+    fn win(id: &str, weekly: bool, resets_at: &str) -> UsageWindow {
+        UsageWindow {
+            window_id: id.to_string(),
+            label: id.to_string(),
+            percent: 10.0,
+            resets_at: resets_at.parse().unwrap(),
+            scope: None,
+            weekly,
+        }
+    }
+
+    fn ok(windows: Vec<UsageWindow>) -> AccountState {
+        AccountState::Ok {
+            windows,
+            extra: None,
+            fetched_at: "2026-09-05T00:00:00Z".parse().unwrap(),
+        }
+    }
+
+    #[test]
+    fn weekly_reset_ignores_windows_that_are_not_weekly() {
+        // The 5h window resets far sooner. Reading it here is the whole defect
+        // the `weekly` flag exists to prevent: every account would then sort by
+        // a bar that turns over five times a day.
+        let state = ok(vec![
+            win("five_hour", false, "2026-09-05T01:00:00Z"),
+            win("seven_day", true, "2026-09-09T00:00:00Z"),
+        ]);
+        assert_eq!(weekly_reset(&state), Some("2026-09-09T00:00:00Z".parse().unwrap()));
+    }
+
+    #[test]
+    fn weekly_reset_takes_the_soonest_of_several_per_model_weeks() {
+        let state = ok(vec![
+            win("weekly:Opus", true, "2026-09-11T00:00:00Z"),
+            win("weekly:Sonnet", true, "2026-09-07T00:00:00Z"),
+            win("weekly:Fable", true, "2026-09-09T00:00:00Z"),
+        ]);
+        assert_eq!(weekly_reset(&state), Some("2026-09-07T00:00:00Z".parse().unwrap()));
+    }
+
+    #[test]
+    fn weekly_reset_is_none_when_no_window_is_weekly() {
+        // A Codex plan that reports only a short window. Not a zero, not the
+        // 5h reset standing in for one: there is no weekly reset to report.
+        assert_eq!(weekly_reset(&ok(vec![win("primary", false, "2026-09-05T01:00:00Z")])), None);
+        assert_eq!(weekly_reset(&ok(vec![])), None);
+    }
+
+    #[test]
+    fn weekly_reset_reads_a_stale_reading_but_not_a_stateless_one() {
+        let windows = vec![win("seven_day", true, "2026-09-09T00:00:00Z")];
+        let stale = AccountState::Stale {
+            windows: windows.clone(),
+            extra: None,
+            fetched_at: "2026-09-01T00:00:00Z".parse().unwrap(),
+        };
+        assert_eq!(weekly_reset(&stale), Some("2026-09-09T00:00:00Z".parse().unwrap()));
+        // Every state that carries no windows at all answers None rather than
+        // being ranked by something borrowed from elsewhere.
+        assert_eq!(weekly_reset(&AccountState::Loading), None);
+        assert_eq!(weekly_reset(&AccountState::AuthDead), None);
+        assert_eq!(
+            weekly_reset(&AccountState::Throttled {
+                until: "2026-09-05T02:00:00Z".parse().unwrap()
+            }),
+            None
+        );
+    }
+
+    #[test]
+    fn by_weekly_reset_orders_soonest_first_and_undatable_last() {
+        let mut items = vec![
+            ("far", ok(vec![win("seven_day", true, "2026-09-11T00:00:00Z")])),
+            ("unknown-a", AccountState::Loading),
+            ("near", ok(vec![win("seven_day", true, "2026-09-06T00:00:00Z")])),
+            ("unknown-b", ok(vec![win("primary", false, "2026-09-05T01:00:00Z")])),
+            ("mid", ok(vec![win("seven_day", true, "2026-09-08T00:00:00Z")])),
+        ];
+        by_weekly_reset(&mut items, |(_, state)| state);
+        assert_eq!(
+            items.iter().map(|(name, _)| *name).collect::<Vec<_>>(),
+            // "unknown-a" precedes "unknown-b" because it did before the sort:
+            // the two are unrankable, so the user's own order survives.
+            vec!["near", "mid", "far", "unknown-a", "unknown-b"]
+        );
+    }
+
+    /// **The shape of this input is what gives the test teeth, and both halves
+    /// of it are load-bearing.** Two earlier versions passed against
+    /// `sort_unstable_by_key`: three accounts, because Rust's unstable sort is
+    /// insertion sort below about twenty elements and incidentally stable
+    /// there; then forty accounts all sharing one reset, because pdqsort
+    /// recognises an all-equal slice and leaves it alone. Only a long list with
+    /// *several* groups actually partitions, and an unstable partition is what
+    /// shuffles the accounts inside each group.
+    #[test]
+    fn by_weekly_reset_keeps_the_manual_order_of_accounts_that_tie() {
+        let resets = ["2026-09-10T00:00:00Z", "2026-09-06T00:00:00Z", "2026-09-08T00:00:00Z"];
+        let names: Vec<String> = (0..60).map(|i| format!("account-{i:02}")).collect();
+        let mut items: Vec<(&str, AccountState)> = names
+            .iter()
+            .enumerate()
+            .map(|(i, name)| {
+                (name.as_str(), ok(vec![win("seven_day", true, resets[i % resets.len()])]))
+            })
+            .collect();
+        by_weekly_reset(&mut items, |(_, state)| state);
+
+        // Group by reset, soonest first, and inside each group the accounts
+        // must still be in the order the user arranged them.
+        let sorted: Vec<&str> = items.iter().map(|(name, _)| *name).collect();
+        let expected: Vec<&str> = [1usize, 2, 0]
+            .into_iter()
+            .flat_map(|group| {
+                names
+                    .iter()
+                    .enumerate()
+                    .filter(move |(i, _)| i % resets.len() == group)
+                    .map(|(_, name)| name.as_str())
+            })
+            .collect();
+        assert_eq!(
+            sorted, expected,
+            "a stable sort is what lets the toggle be turned off without losing the manual order"
+        );
+    }
+
     #[test]
     fn extra_line_serializes_as_the_typescript_union_expects() {
         let credit = ExtraLine::Credit(CreditSpend {

@@ -21,13 +21,25 @@ export default defineConfig({
     // **Spread the defaults, never replace them** — a bare `exclude` drops
     // `node_modules` and `dist` and the run slows to a crawl on vendored specs.
     //
-    // `.local/`, `.superpowers/` and `.claude/` are git-ignored working
-    // directories, so a clone does not have them and CI cannot run what they
-    // contain. Without
-    // this the local totals and the CI totals silently disagree: measured, a
-    // scratch probe in `.local/` added 4 tests and one file to every number
-    // this project quoted as a gate result, none of which any checkout could
-    // reproduce.
-    exclude: [...configDefaults.exclude, '.local/**', '.superpowers/**', '.claude/**'],
+    // `.local/`, `.superpowers/`, `.claude/` and `.flightdeck/` are git-ignored
+    // working directories, so a clone does not have them and CI cannot run what
+    // they contain. Without this the local totals and the CI totals silently
+    // disagree: measured, a scratch probe in `.local/` added 4 tests and one
+    // file to every number this project quoted as a gate result, none of which
+    // any checkout could reproduce.
+    //
+    // The last two hold **git worktrees**, which is worse than a scratch probe:
+    // a worktree is a whole checkout of another branch, so every spec in the
+    // repository has a second copy running against that branch's components.
+    // Measured — an older worktree's `AccountList.test.ts` failed eight
+    // assertions against this branch's rewritten component, in a run where
+    // every spec in `src/` had passed.
+    exclude: [
+      ...configDefaults.exclude,
+      '.local/**',
+      '.superpowers/**',
+      '.claude/**',
+      '.flightdeck/**',
+    ],
   },
 })

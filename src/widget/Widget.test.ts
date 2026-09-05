@@ -119,3 +119,82 @@ describe('Widget refresh', () => {
     expect(screen.getAllByRole('button', { name: /^Refresh (Claude|Codex) account/ })).toHaveLength(2)
   })
 })
+
+/**
+ * docs/design.md §8.1's columns. The badge that used to name the provider on
+ * every row is gone, so these headings are the only place the widget says which
+ * service a set of bars belongs to — and the grouping is the whole reason the
+ * card stopped growing straight down.
+ */
+describe('Widget columns', () => {
+  const claude = (id: string): AccountView => ({
+    account_id: id,
+    provider: 'anthropic',
+    label: id,
+    email: `${id}@example.com`,
+    state: { kind: 'loading' },
+  })
+  const codex = (id: string): AccountView => ({ ...claude(id), provider: 'openai' })
+
+  it('puts Claude in the first column and Codex in the second', () => {
+    const { container } = render(Widget, {
+      accounts: [codex('c1'), claude('a1'), codex('c2')],
+      warning: null,
+    })
+    const headings = Array.from(container.querySelectorAll('.col-head')).map((h) => h.textContent)
+    // Claude first even though a Codex account is first in the array: §8.1
+    // fixes the column order, and only the order *within* a column follows
+    // `list_accounts`.
+    expect(headings).toEqual(['Claude', 'Codex'])
+  })
+
+  /**
+   * The product name has to reach assistive technology, and with the row badge
+   * gone the column's accessible name is what carries it. `aria-labelledby` on
+   * the section pointing at its own heading is what makes each column a named
+   * region rather than an anonymous group of rows.
+   */
+  it('names each column for assistive technology', () => {
+    render(Widget, { accounts: [claude('a1'), codex('c1')], warning: null })
+    // `getByRole('region', { name })` is the assertion that matters: a
+    // `section` is only exposed as a region once it has an accessible name, so
+    // this fails both if the heading is missing and if `aria-labelledby` stops
+    // resolving to it.
+    expect(screen.getByRole('region', { name: 'Claude' })).toBeTruthy()
+    expect(screen.getByRole('region', { name: 'Codex' })).toBeTruthy()
+    expect(screen.getAllByRole('region')).toHaveLength(2)
+  })
+
+  it('renders one column, not an empty second one, when only one provider has accounts', () => {
+    const { container } = render(Widget, { accounts: [claude('a1'), claude('a2')], warning: null })
+    expect(Array.from(container.querySelectorAll('.col-head')).map((h) => h.textContent)).toEqual([
+      'Claude',
+    ])
+    // The width follows from the same fact (`src/lib/layout.ts`), so a column
+    // rendered empty here would also stretch the window to 520px for nothing.
+    expect(container.querySelector('.widget.split')).toBeNull()
+  })
+
+  it('marks the card split only when both columns are present', () => {
+    const single = render(Widget, { accounts: [claude('a1')], warning: null })
+    expect(single.container.querySelector('.widget.split')).toBeNull()
+    single.unmount()
+
+    const both = render(Widget, { accounts: [claude('a1'), codex('c1')], warning: null })
+    expect(both.container.querySelector('.widget.split')).toBeTruthy()
+  })
+
+  it('keeps the backend order inside a column', () => {
+    render(Widget, { accounts: [claude('second'), claude('first')], warning: null })
+    const names = screen
+      .getAllByRole('button', { name: /^Refresh Claude account/ })
+      .map((b) => b.getAttribute('aria-label'))
+    // Not alphabetical on purpose: `list_accounts` has already applied either
+    // the manual arrangement or §8.6's auto sort, and the widget must not have
+    // a second opinion about it.
+    expect(names).toEqual([
+      'Refresh Claude account second',
+      'Refresh Claude account first',
+    ])
+  })
+})
