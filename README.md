@@ -222,17 +222,31 @@ The widget is a small always-on-top card. It has no Dock icon and no menu bar of
 its own; **everything that is not a usage row lives in two places.**
 
 - **The gear on the widget** opens Settings — add and remove accounts, rename
-  them, set the polling interval, unlock the encrypted token store, and inspect
-  the last raw response.
+  them, reorder them, set the polling interval, unlock the encrypted token
+  store, and inspect the last raw response.
 - **The tray icon** shows or hides the widget, moves it back to the primary
   display if a monitor change strands it, and quits the app. `Ctrl+Alt+Q`
   toggles the widget too, where the OS allows it.
 
+**Accounts are grouped into one column per service, Claude on the left and
+Codex on the right**, so the two never interleave and the card stays about half
+as tall as one list of the same accounts. The widget is about 280px wide with a
+single service and about 520px with both; a column appears only when it has an
+account in it.
+
+**Ordering is yours.** Drag the handle at the left of a row in Settings to
+arrange the accounts within its column, or hold `Alt` and press the up or down
+arrow. Turning on **Sort accounts by soonest weekly reset** orders both windows
+by whichever 7-day window turns over first, with accounts that report no 7-day
+window last; your own arrangement is kept while it is on and comes back
+untouched when you turn it off.
+
 To add an account, choose the equally weighted **Claude** or **Codex** card in
 Settings. Claude opens its browser flow and retains a copy/paste fallback.
 Codex normally returns through a local browser callback and offers a device code
-when the registered callback ports are unavailable. The widget, account list,
-controls, and Debug selector always show the full provider name.
+when the registered callback ports are unavailable. The full provider name is
+always shown — as the heading of each account column, and inside the name of
+every control and Debug entry.
 
 ## Uninstalling
 
