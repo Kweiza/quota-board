@@ -29,6 +29,13 @@ serde_json.workspace = true
 chrono.workspace = true
 tokio.workspace = true
 
+# Only for `webview_config`: the WKWebViewConfiguration handed to Tauri has to
+# be the same objc2 types Tauri itself links, so these track its versions.
+[target.'cfg(target_os = "macos")'.dependencies]
+objc2 = "0.6"
+objc2-foundation = { version = "0.3", default-features = false, features = ["NSArray", "NSString"] }
+objc2-web-kit = { version = "0.3", default-features = false, features = ["WKWebViewConfiguration"] }
+
 [dev-dependencies]
 # The login completion path had no test at all until Task 23. `AppState.cfg`
 # carries the token URL, so a mock endpoint is the whole seam needed — the same

@@ -3281,6 +3281,9 @@ name = "quota-board"
 version = "0.5.1"
 dependencies = [
  "chrono",
+ "objc2",
+ "objc2-foundation",
+ "objc2-web-kit",
  "quota-core",
  "serde",
  "serde_json",
