@@ -16,6 +16,7 @@
     "windows": [
       {
         "label": "widget",
+        "create": false,
         "title": "Quota Board",
         "url": "index.html",
         "width": 280,
@@ -34,6 +35,7 @@
       },
       {
         "label": "settings",
+        "create": false,
         "title": "Quota Board Settings",
         "url": "index.html?window=settings",
         "width": 720,

@@ -6,6 +6,7 @@ use tauri_plugin_window_state::StateFlags;
 mod commands;
 mod state;
 mod tray;
+mod webview_config;
 mod window_recovery;
 
 use quota_core::accounts::AccountStore;
@@ -128,6 +129,10 @@ fn main() {
                 .build(),
         )
         .setup(|app| {
+            // Every window is `"create": false` in tauri.conf.json; see
+            // `webview_config` for why they are built here instead.
+            webview_config::create_windows(app)?;
+
             // §9.1 + user decision 1: the same file `quota-cli login` writes.
             // There is one derivation of this path and both binaries call it.
             // Infallible: a file that cannot be read yields an empty list and a
