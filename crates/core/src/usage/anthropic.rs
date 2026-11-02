@@ -40,9 +40,6 @@ fn is_present_non_null(root: &Value, key: &str) -> bool {
     root.get(key).is_some_and(|v| !v.is_null())
 }
 
-/// `weekly` is passed in rather than inferred from `key` or `label`: the two
-/// call sites read `five_hour` and `seven_day`, and which of those is a week is
-/// knowledge this function does not otherwise have. See `UsageWindow::weekly`.
 /// Whether a window object says nothing at all: a zero or null reading beside an
 /// explicitly null reset. It is not a 0% to draw, because no window is described,
 /// and not an unreadable field, because nothing failed to parse. Reported both on
@@ -61,6 +58,9 @@ fn is_unreadable_window(root: &Value, key: &str) -> bool {
     is_present_non_null(root, key) && !reports_nothing(&root[key], "utilization")
 }
 
+/// `weekly` is passed in rather than inferred from `key` or `label`: the two
+/// call sites read `five_hour` and `seven_day`, and which of those is a week is
+/// knowledge this function does not otherwise have. See `UsageWindow::weekly`.
 fn flat_window(
     root: &Value,
     key: &str,
