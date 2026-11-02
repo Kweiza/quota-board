@@ -300,6 +300,14 @@ fields observed: `seven_day_cowork`, `seven_day_omelette`, `spend{}`,
   when it carries any of `five_hour`, `seven_day`, or `limits`, because each
   window can be withdrawn independently: verified Ultra accounts lost the 5-hour
   limit on 2026-10-30.
+- A window whose reading is zero or null beside an explicitly null `resets_at`
+  **reports nothing**: it is neither a 0% to draw nor an unreadable field, and it
+  yields no window. Its meaning is not established. It has been reported on
+  unused accounts (elizaOS/eliza#16482) and on accounts with real weekly usage
+  (realiti4/claude-swap#306), so it must not be read as "idle".
+- An empty result does not replace a reading with a window that has not reset,
+  because that window was running. The reading stays, with its own age, until it
+  goes stale or its windows reset. Any other success replaces it.
 - **Never demote a missing or unparseable window to 0%.** Displaying a
   confidently wrong number is the worst failure mode.
 
@@ -1592,7 +1600,7 @@ strongest available short of it.
 
 | Target | Method |
 |---|---|
-| `usage` | Inject the endpoint URL and point it at a wiremock server on loopback (§4.3); verify parsing against stored response fixtures. **No real network calls.** Fixtures must include: both 5h and 7d present; `seven_day: null` with weekly_scoped; weekly entirely absent; many unknown fields; a completely alien shape (`UNKNOWN_SHAPE`) |
+| `usage` | Inject the endpoint URL and point it at a wiremock server on loopback (§4.3); verify parsing against stored response fixtures. **No real network calls.** Fixtures must include: both 5h and 7d present; `seven_day: null` with weekly_scoped; `five_hour: null` with both weekly sources (`no_five_hour.json`, reproduced from the capture published in alexey-pelykh/sessiometer#1592, not measured by this project); weekly entirely absent; many unknown fields; a completely alien shape (`UNKNOWN_SHAPE`) |
 | `scheduler` | Inject the clock to verify polling interval, stagger, freshness transitions, visibility gating, the fixed `Retry-After: 0` fallback, exact positive `Retry-After` countdowns and the one-hour cap, plus exponential backoff for transient non-429 failures without real waiting. **Not jitter** — §6.1 records that it is deliberately not implemented |
 | `auth` | Local mock servers for Claude browser/manual PKCE and Codex browser/device flows; fixed callback ports and state rejection; exact provider-specific exchange, refresh and revoke bodies; claim fallbacks; device timeout; terminal errors; redaction; serialized concurrent refresh and a one-request 401 race |
 | `secrets` | Contract tests against an in-memory implementation. Distinguish `NO_BACKEND`/`LOCKED`/`NOT_FOUND`; freeze the Claude blob; bound every Codex split entry; fault-inject each refresh write and verify refresh-first recovery. **Must test that the canary self-check detects a mock store** |

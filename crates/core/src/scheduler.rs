@@ -712,9 +712,19 @@ impl<C: Clock> Scheduler<C> {
         let now = self.clock.now();
         let policy_interval = self.policy.interval;
         if let Some(e) = self.entries.get_mut(&entry_key(provider, uuid)) {
-            e.last_windows = Some(windows);
-            e.last_extra = extra;
-            e.last_fetched_at = Some(now);
+            // A window that has not reset was running, so an empty body cannot
+            // mean it is over. Such a body has been seen on accounts with real
+            // usage, so keep the reading, with its own age, rather than erase it.
+            // docs/design.md §5.5.
+            let keep_reading = windows.is_empty()
+                && e.last_windows
+                    .as_ref()
+                    .is_some_and(|last| last.iter().any(|w| w.resets_at > now));
+            if !keep_reading {
+                e.last_windows = Some(windows);
+                e.last_extra = extra;
+                e.last_fetched_at = Some(now);
+            }
             e.last_failure = None;
             e.throttled_until = None;
             e.backoff_level = 0;
@@ -1359,6 +1369,98 @@ mod tests {
         }
         c.advance_secs(3600);
         assert_eq!(s.due().len(), 1);
+    }
+
+    fn win_until(pct: f64, resets_at: &str) -> Vec<UsageWindow> {
+        vec![UsageWindow {
+            window_id: "seven_day".into(),
+            label: "7d".into(),
+            percent: pct,
+            resets_at: resets_at.parse().unwrap(),
+            scope: None,
+            weekly: true,
+        }]
+    }
+
+    /// A window that has not reset was running, so it cannot be what an empty
+    /// body means by "nothing running". The body has been seen on accounts with
+    /// real weekly usage, and overwriting would erase the figure without a trace.
+    #[test]
+    fn an_empty_success_does_not_erase_a_window_that_has_not_reset() {
+        let (mut s, c) = sched();
+        s.add(Provider::Anthropic, "a");
+        s.record_success(Provider::Anthropic, "a", win_until(56.0, "2026-07-29T18:00:00Z"), None);
+        let before = c.now();
+        c.advance_secs(300);
+        s.record_success(Provider::Anthropic, "a", Vec::new(), None);
+        match s.state(Provider::Anthropic, "a").unwrap() {
+            AccountState::Ok { windows, fetched_at, .. } => {
+                assert_eq!(windows[0].percent, 56.0);
+                assert_eq!(fetched_at, before, "the age must stay the reading's own");
+            }
+            other => panic!("expected the kept reading, got {other:?}"),
+        }
+    }
+
+    /// Kept is not refreshed: it ages out into Stale like any other old reading,
+    /// and the empty body still counts as a poll that answered.
+    #[test]
+    fn a_kept_reading_goes_stale_and_the_account_keeps_its_normal_schedule() {
+        let (mut s, c) = sched();
+        s.add(Provider::Anthropic, "a");
+        s.record_success(Provider::Anthropic, "a", win_until(56.0, "2026-07-30T18:00:00Z"), None);
+        c.advance_secs(700);
+        s.record_success(Provider::Anthropic, "a", Vec::new(), None);
+        assert!(matches!(
+            s.state(Provider::Anthropic, "a").unwrap(),
+            AccountState::Stale { .. }
+        ));
+        assert!(s.due().is_empty(), "an answered poll is not due again at once");
+    }
+
+    /// Past its reset the old figure describes a window that is over, and a
+    /// lower bound on it says nothing about the current one.
+    #[test]
+    fn an_empty_success_replaces_a_reading_whose_windows_have_all_reset() {
+        let (mut s, c) = sched();
+        s.add(Provider::Anthropic, "a");
+        s.record_success(Provider::Anthropic, "a", win_until(56.0, "2026-07-29T12:01:00Z"), None);
+        c.advance_secs(120);
+        s.record_success(Provider::Anthropic, "a", Vec::new(), None);
+        match s.state(Provider::Anthropic, "a").unwrap() {
+            AccountState::Ok { windows, .. } => assert!(windows.is_empty()),
+            other => panic!("expected an empty Ok, got {other:?}"),
+        }
+    }
+
+    /// With nothing to keep there is nothing to protect.
+    #[test]
+    fn an_empty_first_success_is_an_empty_ok() {
+        let (mut s, _c) = sched();
+        s.add(Provider::Anthropic, "a");
+        s.record_success(Provider::Anthropic, "a", Vec::new(), None);
+        match s.state(Provider::Anthropic, "a").unwrap() {
+            AccountState::Ok { windows, .. } => assert!(windows.is_empty()),
+            other => panic!("expected an empty Ok, got {other:?}"),
+        }
+    }
+
+    /// Only an empty body keeps the old reading. A window that vanished while
+    /// another reports is the normal case, and how `five_hour` left Ultra.
+    #[test]
+    fn a_non_empty_success_still_replaces_a_live_reading() {
+        let (mut s, c) = sched();
+        s.add(Provider::Anthropic, "a");
+        s.record_success(Provider::Anthropic, "a", win_until(56.0, "2026-07-29T18:00:00Z"), None);
+        c.advance_secs(300);
+        s.record_success(Provider::Anthropic, "a", win_until(57.0, "2026-07-29T18:00:00Z"), None);
+        match s.state(Provider::Anthropic, "a").unwrap() {
+            AccountState::Ok { windows, fetched_at, .. } => {
+                assert_eq!(windows[0].percent, 57.0);
+                assert_eq!(fetched_at, c.now());
+            }
+            other => panic!("expected the new reading, got {other:?}"),
+        }
     }
 
     /// Spec §7.2: an automatic polling failure quietly keeps the last value.

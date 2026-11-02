@@ -43,6 +43,24 @@ fn is_present_non_null(root: &Value, key: &str) -> bool {
 /// `weekly` is passed in rather than inferred from `key` or `label`: the two
 /// call sites read `five_hour` and `seven_day`, and which of those is a week is
 /// knowledge this function does not otherwise have. See `UsageWindow::weekly`.
+/// Whether a window object says nothing at all: a zero or null reading beside an
+/// explicitly null reset. It is not a 0% to draw, because no window is described,
+/// and not an unreadable field, because nothing failed to parse. Reported both on
+/// unused accounts and on accounts with real weekly usage, so "idle" would be a
+/// guess. See docs/design.md §5.5.
+fn reports_nothing(window: &Value, reading_key: &str) -> bool {
+    let empty_reading = window
+        .get(reading_key)
+        .is_some_and(|r| r.is_null() || r.as_f64() == Some(0.0));
+    empty_reading && window.get("resets_at").is_some_and(Value::is_null)
+}
+
+/// A top-level window that was present, could not be read, and was not merely
+/// reporting nothing. Only meaningful when the window did not parse.
+fn is_unreadable_window(root: &Value, key: &str) -> bool {
+    is_present_non_null(root, key) && !reports_nothing(&root[key], "utilization")
+}
+
 fn flat_window(
     root: &Value,
     key: &str,
@@ -106,9 +124,12 @@ fn parse_weekly_entry(e: &Value) -> Option<UsageWindow> {
 struct WeeklyLimits {
     windows: Vec<UsageWindow>,
     /// If this is true but `windows` is empty, weekly entries were present but
-    /// none could be read; in that case we do not fall back to the flat
-    /// seven_day and treat the result as unreadable instead.
+    /// none yielded a window; in that case we do not fall back to the flat
+    /// seven_day.
     matched_any: bool,
+    /// Whether a weekly entry failed to parse rather than reporting nothing.
+    /// When `windows` is empty this makes the result unreadable.
+    any_unreadable: bool,
 }
 
 /// Extract the weekly windows from limits[]. The first-priority path of
@@ -118,10 +139,14 @@ fn scoped_weekly_windows(root: &Value) -> WeeklyLimits {
         return WeeklyLimits {
             windows: Vec::new(),
             matched_any: false,
+            any_unreadable: false,
         };
     };
     let matching: Vec<&Value> = limits.iter().filter(|e| is_weekly_entry(e)).collect();
     let matched_any = !matching.is_empty();
+    let any_unreadable = matching
+        .iter()
+        .any(|e| parse_weekly_entry(e).is_none() && !reports_nothing(e, "percent"));
     let mut windows: Vec<UsageWindow> =
         matching.into_iter().filter_map(parse_weekly_entry).collect();
 
@@ -137,6 +162,7 @@ fn scoped_weekly_windows(root: &Value) -> WeeklyLimits {
     WeeklyLimits {
         windows,
         matched_any,
+        any_unreadable,
     }
 }
 
@@ -158,24 +184,22 @@ pub fn parse_usage(raw: &Value) -> Result<Vec<UsageWindow>, ParseError> {
     let five_hour = flat_window(raw, "five_hour", "five_hour", "5h", false);
     // The five_hour key was present and non-null but failed to parse — that is
     // not "not reported".
-    let five_hour_unreadable = five_hour.is_none() && is_present_non_null(raw, "five_hour");
+    let five_hour_unreadable = five_hour.is_none() && is_unreadable_window(raw, "five_hour");
 
     let weekly_limits = scoped_weekly_windows(raw);
     let mut weekly_unreadable = false;
     let weekly = if weekly_limits.matched_any {
         // C1: if limits[] had weekly elements, do not fall back to the flat
         // seven_day — not even when none of them could be read. Mark the result
-        // unreadable instead.
-        if weekly_limits.windows.is_empty() {
-            weekly_unreadable = true;
-        }
+        // unreadable instead, unless they were only reporting nothing.
+        weekly_unreadable = weekly_limits.windows.is_empty() && weekly_limits.any_unreadable;
         weekly_limits.windows
     } else if let Some(w) = flat_window(raw, "seven_day", "seven_day", "7d", true) {
         vec![w]
     } else {
         // A non-array `limits` yields no weekly element, but it is still a
         // weekly source that was present and could not be read.
-        if is_present_non_null(raw, "seven_day")
+        if is_unreadable_window(raw, "seven_day")
             || (is_present_non_null(raw, "limits") && !raw["limits"].is_array())
         {
             weekly_unreadable = true;
@@ -306,6 +330,7 @@ mod tests {
             "credits_never_enabled" => {
                 include_str!("../../tests/fixtures/credits_never_enabled.json")
             }
+            "no_five_hour" => include_str!("../../tests/fixtures/no_five_hour.json"),
             "no_weekly" => include_str!("../../tests/fixtures/no_weekly.json"),
             "spike_observed" => include_str!("../../tests/fixtures/spike_observed.json"),
             "unknown_fields" => include_str!("../../tests/fixtures/unknown_fields.json"),
@@ -503,6 +528,76 @@ mod tests {
         ] {
             assert_eq!(parse_usage(&body), Err(ParseError::UnreadableSource), "body: {body}");
         }
+    }
+
+    /// `no_five_hour` is the body a verified Ultra account receives: the key is
+    /// present and null, and both weekly sources still report.
+    #[test]
+    fn a_null_five_hour_leaves_both_weekly_windows() {
+        let w = parse_usage(&fixture("no_five_hour")).unwrap();
+        let read: Vec<_> = w.iter().map(|w| (w.window_id.as_str(), w.percent)).collect();
+        assert_eq!(read, [("seven_day", 90.0), ("weekly:Fable", 12.0)]);
+    }
+
+    /// A window with a zero or null reading and an explicitly null reset reports
+    /// nothing: it is neither a 0% to draw nor a body to call unreadable. What it
+    /// means is not established. It has been reported both on unused accounts and
+    /// on accounts with real weekly usage, so "idle" would be a guess.
+    #[test]
+    fn a_window_that_reports_nothing_is_neither_zero_percent_nor_an_error() {
+        let empty = serde_json::json!({ "utilization": 0.0, "resets_at": null });
+        let null_reading = serde_json::json!({ "utilization": null, "resets_at": null });
+        let entry = serde_json::json!({ "group": "weekly", "percent": 0, "resets_at": null, "scope": null });
+        for body in [
+            serde_json::json!({ "five_hour": null, "seven_day": empty }),
+            serde_json::json!({ "seven_day": empty }),
+            serde_json::json!({ "five_hour": empty, "seven_day": empty, "limits": [] }),
+            serde_json::json!({ "five_hour": null_reading, "seven_day": null_reading }),
+            serde_json::json!({ "limits": [entry] }),
+            serde_json::json!({ "five_hour": empty, "seven_day": empty, "limits": [entry] }),
+        ] {
+            assert_eq!(parse_usage(&body), Ok(Vec::new()), "body: {body}");
+        }
+    }
+
+    /// The other side of that rule. Each of these carries something that was
+    /// meant to be read, so none may pass as a window that reports nothing.
+    #[test]
+    fn a_window_with_a_reading_or_a_bad_reset_is_still_unreadable() {
+        for window in [
+            serde_json::json!({ "utilization": 42.0, "resets_at": null }),
+            serde_json::json!({ "utilization": 0.0, "resets_at": "nonsense" }),
+            serde_json::json!({ "utilization": 0.0 }),
+            serde_json::json!({ "resets_at": null }),
+            serde_json::json!({ "utilization": "0", "resets_at": null }),
+        ] {
+            let body = serde_json::json!({ "five_hour": null, "seven_day": window });
+            assert_eq!(parse_usage(&body), Err(ParseError::UnreadableSource), "body: {body}");
+        }
+        let entry = serde_json::json!({ "group": "weekly", "percent": 42, "resets_at": null });
+        let body = serde_json::json!({ "limits": [entry] });
+        assert_eq!(parse_usage(&body), Err(ParseError::UnreadableSource));
+    }
+
+    /// C1 again, for the new case: limits[] answered for the week, so a flat
+    /// seven_day beside it is not consulted even when limits[] reports nothing.
+    #[test]
+    fn a_weekly_limit_that_reports_nothing_does_not_fall_back_to_flat_seven_day() {
+        let body = serde_json::json!({
+            "seven_day": { "utilization": 41, "resets_at": "2026-08-02T00:00:00Z" },
+            "limits": [{ "group": "weekly", "percent": 0, "resets_at": null }]
+        });
+        assert_eq!(parse_usage(&body), Ok(Vec::new()));
+    }
+
+    /// One entry reporting nothing must not excuse a sibling that failed to parse.
+    #[test]
+    fn an_unreadable_weekly_limit_beside_an_empty_one_is_still_unreadable() {
+        let body = serde_json::json!({ "limits": [
+            { "group": "weekly", "percent": 0, "resets_at": null },
+            { "group": "weekly", "percent": "oops", "resets_at": "2026-08-02T00:00:00Z" }
+        ]});
+        assert_eq!(parse_usage(&body), Err(ParseError::UnreadableSource));
     }
 
     /// Never fabricate a 0 percent from any input.
