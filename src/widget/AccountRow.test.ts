@@ -182,6 +182,17 @@ describe('AccountRow bars', () => {
     expect(screen.getByText('weekly not reported')).toBeTruthy()
   })
 
+  /**
+   * What the parser now returns for a recognized body with no windows. Vacuous
+   * truth is the trap: `windows.every(...)` is true on an empty list, and only
+   * that keeps this row from reading as "weekly not recorded" and saying nothing.
+   */
+  it('says so on a Claude row with no windows at all', () => {
+    render(AccountRow, { account: ok([]), now: NOW })
+    expect(screen.getByText('weekly not reported')).toBeTruthy()
+    expect(screen.queryByText('unknown')).toBeNull()
+  })
+
   it('does not say that when a weekly window is present', () => {
     render(AccountRow, { account: ok([win('weekly:Opus', 'weekly (Opus)', 55, true)]), now: NOW })
     expect(screen.queryByText('weekly not reported')).toBeNull()

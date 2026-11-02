@@ -296,7 +296,10 @@ fields observed: `seven_day_cowork`, `seven_day_omelette`, `spend{}`,
 
 - Parse with serde, **ignoring unknown fields**.
 - Retain the raw JSON so it can be inspected in a debug window.
-- Treat unrecognizable shapes as an `UNKNOWN_SHAPE` state.
+- Treat unrecognizable shapes as an `UNKNOWN_SHAPE` state. A body is recognized
+  when it carries any of `five_hour`, `seven_day`, or `limits`, because each
+  window can be withdrawn independently: verified Ultra accounts lost the 5-hour
+  limit on 2026-10-30.
 - **Never demote a missing or unparseable window to 0%.** Displaying a
   confidently wrong number is the worst failure mode.
 
