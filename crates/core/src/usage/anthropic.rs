@@ -140,6 +140,11 @@ fn scoped_weekly_windows(root: &Value) -> WeeklyLimits {
     }
 }
 
+/// The top-level keys that mark a body as a usage payload, null or not. Any one
+/// is enough: each window can be withdrawn independently, as `five_hour` was
+/// for verified Ultra accounts on 2026-10-30. See docs/design.md §5.5.
+const USAGE_PAYLOAD_KEYS: [&str; 3] = ["five_hour", "seven_day", "limits"];
+
 /// One response body to a normalized list of windows.
 ///
 /// The normative order from docs/design.md §5.3:
@@ -168,7 +173,11 @@ pub fn parse_usage(raw: &Value) -> Result<Vec<UsageWindow>, ParseError> {
     } else if let Some(w) = flat_window(raw, "seven_day", "seven_day", "7d", true) {
         vec![w]
     } else {
-        if is_present_non_null(raw, "seven_day") {
+        // A non-array `limits` yields no weekly element, but it is still a
+        // weekly source that was present and could not be read.
+        if is_present_non_null(raw, "seven_day")
+            || (is_present_non_null(raw, "limits") && !raw["limits"].is_array())
+        {
             weekly_unreadable = true;
         }
         Vec::new()
@@ -185,8 +194,7 @@ pub fn parse_usage(raw: &Value) -> Result<Vec<UsageWindow>, ParseError> {
         if five_hour_unreadable || weekly_unreadable {
             return Err(ParseError::UnreadableSource);
         }
-        // Without the five_hour key at all, this response is not a usage payload.
-        if raw.get("five_hour").is_none() {
+        if !USAGE_PAYLOAD_KEYS.iter().any(|key| raw.get(key).is_some()) {
             return Err(ParseError::UnknownShape);
         }
     }
@@ -409,6 +417,91 @@ mod tests {
         match parse_usage(&fixture("alien_shape")) {
             Err(ParseError::UnknownShape) => {}
             other => panic!("expected UnknownShape, got {other:?}"),
+        }
+    }
+
+    /// Verified Ultra accounts lost the 5-hour limit on 2026-10-30. Public reports
+    /// from other projects show those bodies carrying `"five_hour": null`, but
+    /// this repository has not measured one, and the service owes us no particular
+    /// spelling. Each way of saying "no 5-hour window" is therefore pinned against
+    /// both weekly sources. The `{0, null}` spelling is the measured shape from
+    /// `credits_limit_reached`. What it means is not established, so it must be
+    /// dropped rather than shown as a confident 0%.
+    #[test]
+    fn weekly_windows_survive_every_spelling_of_no_five_hour_window() {
+        let limits = serde_json::json!([
+            { "kind": "weekly_all", "group": "weekly", "percent": 37,
+              "resets_at": "2026-11-03T15:00:00Z", "scope": null },
+            { "kind": "weekly_scoped", "group": "weekly", "percent": 53,
+              "resets_at": "2026-11-03T15:00:00Z",
+              "scope": { "model": { "display_name": "Fable" } } }
+        ]);
+        let flat = serde_json::json!({ "utilization": 37, "resets_at": "2026-11-03T15:00:00Z" });
+        let weekly_sources = [
+            ("limits[]", serde_json::json!({ "limits": limits }), vec!["seven_day", "weekly:Fable"]),
+            ("flat seven_day", serde_json::json!({ "seven_day": flat }), vec!["seven_day"]),
+        ];
+        let five_hour_spellings = [
+            ("absent", None),
+            ("null", Some(serde_json::Value::Null)),
+            ("idle", Some(serde_json::json!({ "utilization": 0.0, "resets_at": null }))),
+        ];
+
+        for (source, weekly, expected) in &weekly_sources {
+            for (spelling, five_hour) in &five_hour_spellings {
+                let mut body = weekly.clone();
+                if let Some(value) = five_hour {
+                    body["five_hour"] = value.clone();
+                }
+                let windows = parse_usage(&body)
+                    .unwrap_or_else(|e| panic!("{spelling} 5h with {source}: {e:?}"));
+                let ids: Vec<_> = windows.iter().map(|w| w.window_id.as_str()).collect();
+                assert_eq!(&ids, expected, "{spelling} 5h with {source}");
+            }
+        }
+    }
+
+    /// `five_hour` used to be the only key that identified a usage payload, so
+    /// an account with neither that key nor a weekly window rendered as
+    /// `unknown` when §5.3 calls for "weekly not reported".
+    #[test]
+    fn a_recognized_body_with_no_windows_is_an_empty_success() {
+        for body in [
+            serde_json::json!({ "seven_day": null, "limits": [] }),
+            serde_json::json!({ "limits": [] }),
+            serde_json::json!({ "seven_day": null }),
+            serde_json::json!({ "five_hour": null }),
+        ] {
+            assert_eq!(parse_usage(&body), Ok(Vec::new()), "body: {body}");
+        }
+    }
+
+    /// The other side of widening recognition: a body with none of the three
+    /// keys must stay an error. Near-miss siblings do not count, because
+    /// `seven_day_opus` and `spend` say nothing about the windows this parser
+    /// reads, and an empty success here would blank the row silently.
+    #[test]
+    fn a_body_with_none_of_the_usage_keys_is_still_unknown_shape() {
+        for body in [
+            serde_json::json!({}),
+            serde_json::json!([]),
+            serde_json::json!({ "seven_day_opus": null, "spend": {} }),
+        ] {
+            assert_eq!(parse_usage(&body), Err(ParseError::UnknownShape), "body: {body}");
+        }
+    }
+
+    /// `limits` now identifies a payload, so without this rule a malformed one
+    /// would be recognized, yield no windows, and pass as "nothing to report".
+    /// I1 keeps present-but-unreadable distinct from that.
+    #[test]
+    fn limits_that_is_not_an_array_is_unreadable_not_an_empty_success() {
+        for body in [
+            serde_json::json!({ "limits": "oops" }),
+            serde_json::json!({ "limits": { "group": "weekly" } }),
+            serde_json::json!({ "five_hour": null, "limits": 7 }),
+        ] {
+            assert_eq!(parse_usage(&body), Err(ParseError::UnreadableSource), "body: {body}");
         }
     }
 
