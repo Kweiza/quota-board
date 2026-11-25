@@ -166,9 +166,20 @@ if (isSettingsWindow()) {
   }
 
   if (inTauri()) {
-    void pull()
-    void pullLayout()
-    void onSettingsChanged(() => void pullLayout())
+    // Subscribe, then read the layout, then the list — in that order, each
+    // awaited. Subscribing first means a layout changed while the first read
+    // is in flight still arrives as an event; reading the layout before the
+    // list means a stacked user never gets one side-by-side, 520px frame at
+    // launch while the default stands in for a setting not yet read.
+    void (async () => {
+      try {
+        await onSettingsChanged(() => void pullLayout())
+      } catch (e) {
+        console.error('quota-board: listening for settings://changed failed', e)
+      }
+      await pullLayout()
+      await pull()
+    })()
     void onUsageUpdated(() => void pull())
     // The path that does not go through the poll gate. `usage://updated` only
     // arrives from a poll, and `due()` returns nothing while the widget is

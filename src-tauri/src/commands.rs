@@ -1488,9 +1488,8 @@ mod tests {
         );
     }
 
-    /// `SettingsView` is what the settings window renders the toggle from, so
-    /// a stored value that never reached the view would show the toggle off
-    /// while the list was being sorted.
+    /// The widget draws from this view, so a stored layout that never reached
+    /// it would leave the widget side by side whatever the user picked.
     #[tokio::test]
     async fn the_settings_view_reports_the_stored_layout() {
         let state = app_state(Arc::new(MemoryStore::default()));
@@ -1499,6 +1498,9 @@ mod tests {
         assert_eq!(settings_view(&state).await.layout, WidgetLayout::Vertical);
     }
 
+    /// `SettingsView` is what the settings window renders the toggle from, so
+    /// a stored value that never reached the view would show the toggle off
+    /// while the list was being sorted.
     #[tokio::test]
     async fn the_settings_view_reports_the_stored_auto_sort() {
         let state = app_state(Arc::new(MemoryStore::default()));

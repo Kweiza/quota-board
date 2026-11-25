@@ -791,6 +791,7 @@
       intervalSavedTimer = setTimeout(() => (intervalSaved = false), 2000)
     } catch (e) {
       error = String(e)
+      intervalSaved = false
       // A refused value must not stay on screen looking applied.
       intervalSecs = view.poll_interval_secs
     }
@@ -880,7 +881,9 @@
             {providerName(p)}
             <!-- Hidden from the accessible name: the region is "Claude", not
                  "Claude 2", and the list below already says how many. -->
-            {#if accountsLoaded}<span class="count" aria-hidden="true">{forProvider.length}</span>{/if}
+            <!-- Not while the account file is unreadable: the list is empty
+                 because it could not be read, and "0" would claim otherwise. -->
+            {#if accountsLoaded && !accountsProblem}<span class="count" aria-hidden="true">{forProvider.length}</span>{/if}
           </h3>
           <AccountList
             accounts={forProvider}
@@ -1090,6 +1093,7 @@
           step="30"
           disabled={!view.writable}
           bind:value={intervalSecs}
+          on:input={() => (intervalSaved = false)}
           on:change={applyInterval}
         />
         {#if intervalPhrase(intervalSecs)}
@@ -1270,7 +1274,9 @@
      which is exactly what src/app.css's own comment forbids. */
   /* The accent is a blue that the §8.2 severity ramp (green, teal, yellow,
      red) does not use, and it marks only controls — the primary buttons, the
-     switches and the selected layout — never a provider or a quota. */
+     switches and the selected layout — never a provider or a quota. Dark
+     enough for white 13px text at 5.3:1 (AA asks 4.5:1); the lighter #5b8def
+     it replaced came to 3.2:1. */
   .settings {
     --bg: #111116;
     --card: #1a1a21;
@@ -1278,8 +1284,9 @@
     --line-strong: rgba(148, 163, 184, .35);
     --text: #e5e7eb;
     --muted: #9ca3af;
-    --accent: #5b8def;
-    --accent-soft: rgba(91, 141, 239, .14);
+    --accent: #3466d0;
+    --accent-text: #7ea5f2;
+    --accent-soft: rgba(52, 102, 208, .18);
     --field: #0d0d12;
     font: 13px/1.5 system-ui, sans-serif;
     color: var(--text);
@@ -1362,7 +1369,7 @@
      macOS build ships in. */
   .switch { -webkit-appearance: none; appearance: none; flex: none; margin: 0;
             position: relative; width: 34px; height: 20px; border-radius: 999px;
-            background: rgba(148, 163, 184, .35); cursor: pointer;
+            background: #646d7e; cursor: pointer;
             transition: background-color .15s; }
   .switch::after { content: ''; position: absolute; top: 2px; left: 2px;
                    width: 16px; height: 16px; border-radius: 50%; background: #fff;
@@ -1388,7 +1395,7 @@
   .choice-group:disabled .choice { cursor: default; opacity: .5; }
   .interval-row { display: flex; align-items: center; gap: .75em; }
   .interval-phrase { color: var(--muted); }
-  .saved { font-size: 12px; color: var(--accent); }
+  .saved { font-size: 12px; color: var(--accent-text); }
   .inline-form { display: flex; align-items: center; gap: .5em; margin: 0; }
   .provider-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr));
                    gap: .75em; margin-top: .6em; }

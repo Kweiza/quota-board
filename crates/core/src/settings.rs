@@ -49,7 +49,7 @@ pub enum SettingsError {
 /// `#[serde(default)]` on the container, not per field: a settings file written
 /// by an older build is missing every field a newer build adds, and without it
 /// the whole file fails to parse and every setting silently reverts.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 struct SettingsFile {
     /// Defaults to [`FORMAT_VERSION`], so a file this build wrote (and a
@@ -65,10 +65,9 @@ struct SettingsFile {
     /// meaning of an *existing* field changes; `#[serde(default)]` on the
     /// container already fills this in for a file written before it existed.
     auto_sort: bool,
-    /// docs/design.md §8.1's arrangement of the provider sections. Lenient on
-    /// read, for the reason [`lenient_layout`] gives.
-    #[serde(deserialize_with = "lenient_layout")]
-    layout: WidgetLayout,
+    /// docs/design.md §8.1's arrangement of the provider sections. Kept
+    /// verbatim when this build does not know the value — see [`StoredLayout`].
+    layout: StoredLayout,
     /// Every key this build does not know, kept so that saving one setting
     /// does not delete another build's. Without it, an older build that only
     /// knows `poll_interval_secs` silently drops `launch_at_login` and
@@ -84,7 +83,7 @@ impl Default for SettingsFile {
             version: FORMAT_VERSION,
             poll_interval_secs: default_poll_interval_secs(),
             auto_sort: false,
-            layout: WidgetLayout::default(),
+            layout: StoredLayout::Known(WidgetLayout::default()),
             extra: serde_json::Map::new(),
         }
     }
@@ -104,19 +103,33 @@ pub enum WidgetLayout {
     Vertical,
 }
 
-/// A layout name this build does not know reads as the default instead of
-/// failing the whole file.
+/// The layout as the file holds it.
 ///
-/// Without this, a value added by a later build (or a typo in a hand edit)
-/// would fail `serde_json::from_str` for the entire struct, and `read` would
-/// then throw away the polling interval and the sort toggle along with it — one
-/// cosmetic field taking two real settings down with it.
-fn lenient_layout<'de, D>(deserializer: D) -> Result<WidgetLayout, D::Error>
-where
-    D: serde::Deserializer<'de>,
-{
-    let value = serde_json::Value::deserialize(deserializer)?;
-    Ok(serde_json::from_value(value).unwrap_or_default())
+/// **An unknown value is kept, not replaced.** A plain `WidgetLayout` field
+/// gave two bad choices: fail the whole parse on a value a later build added
+/// (and lose the interval and the sort toggle with it), or read it as the
+/// default and then write `"horizontal"` over it on the next save of any other
+/// setting — the loss `extra` exists to prevent, arriving through a key this
+/// build does know. Untagged, so the value round-trips byte-for-byte; the
+/// widget draws the default meanwhile, and `read` says so in the warning.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(untagged)]
+enum StoredLayout {
+    Known(WidgetLayout),
+    Unknown(serde_json::Value),
+}
+
+/// The standing reason the layout on screen is not the one in the file. Not a
+/// one-off like the interval clamp: it stays true until the user picks a
+/// layout, so `write` recomputes it rather than clearing it.
+fn layout_warning(file: &SettingsFile) -> Option<String> {
+    match &file.layout {
+        StoredLayout::Known(_) => None,
+        StoredLayout::Unknown(v) => Some(format!(
+            "the stored widget layout {v} is not one this build knows; side by side is in \
+             use until a layout is chosen here"
+        )),
+    }
 }
 
 /// The default polling interval, read from [`PollPolicy::default`] rather than
@@ -192,7 +205,12 @@ fn read(path: &Path) -> (SettingsFile, Option<String>, Option<u32>) {
             parsed.poll_interval_secs
         )
     });
-    (SettingsFile { poll_interval_secs: clamped, ..parsed }, warning, None)
+    let file = SettingsFile { poll_interval_secs: clamped, ..parsed };
+    let warning = match (warning, layout_warning(&file)) {
+        (Some(a), Some(b)) => Some(format!("{a}; {b}")),
+        (a, b) => a.or(b),
+    };
+    (file, warning, None)
 }
 
 /// A single-owner handle to one settings file.
@@ -257,12 +275,15 @@ impl SettingsStore {
 
     /// docs/design.md §8.1: how the widget arranges its provider sections.
     pub fn layout(&self) -> WidgetLayout {
-        self.file.layout
+        match self.file.layout {
+            StoredLayout::Known(layout) => layout,
+            StoredLayout::Unknown(_) => WidgetLayout::default(),
+        }
     }
 
     /// Writes, and rolls back in memory if the write fails.
     pub fn set_layout(&mut self, layout: WidgetLayout) -> Result<WidgetLayout, SettingsError> {
-        self.write(|file| file.layout = layout)?;
+        self.write(|file| file.layout = StoredLayout::Known(layout))?;
         Ok(layout)
     }
 
@@ -293,7 +314,10 @@ impl SettingsStore {
         change(&mut self.file);
         match self.flush() {
             Ok(()) => {
-                self.warning = None;
+                // A successful write retires the one-off reasons (a clamped
+                // interval, an unreadable file), but not an unknown layout:
+                // that one is still in the file after a save of anything else.
+                self.warning = layout_warning(&self.file);
                 Ok(())
             }
             Err(e) => {
@@ -585,10 +609,11 @@ mod tests {
     }
 
     /// A layout this build has no name for — a later build's, or a hand-edit
-    /// typo — must cost only the layout. Failing the whole parse would reset
-    /// the interval and the sort toggle to their defaults too.
+    /// typo — must cost only the layout, must say so, and must survive a save
+    /// of another setting. Failing the whole parse would reset the interval
+    /// and the sort toggle; overwriting it would lose the later build's choice.
     #[test]
-    fn an_unknown_layout_reads_as_the_default_without_losing_the_other_settings() {
+    fn an_unknown_layout_reads_as_the_default_without_losing_anything() {
         let path = tmp();
         std::fs::write(
             &path,
@@ -599,7 +624,16 @@ mod tests {
         assert_eq!(s.layout(), WidgetLayout::Horizontal);
         assert_eq!(s.poll_interval_secs(), 900, "an unknown layout discarded the interval");
         assert!(s.auto_sort(), "an unknown layout discarded the sort toggle");
-        assert!(s.warning().is_none());
+        assert!(s.warning().is_some_and(|w| w.contains("grid")), "{:?}", s.warning());
+
+        let mut s = s;
+        s.set_poll_interval_secs(600).unwrap();
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(text.contains(r#""layout": "grid""#), "the unknown layout was overwritten: {text}");
+        assert!(s.warning().is_some(), "the warning went away while the value is still unknown");
+
+        s.set_layout(WidgetLayout::Vertical).unwrap();
+        assert!(s.warning().is_none(), "choosing a layout must retire the warning");
         std::fs::remove_file(&path).ok();
     }
 

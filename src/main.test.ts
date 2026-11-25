@@ -108,7 +108,30 @@ describe('main.ts widget branch', () => {
       'usage://updated',
       'accounts://changed',
     ])
-    expect(calls.some((c) => c.cmd === 'list_accounts')).toBe(true)
+    // Waited for: the list is read after the layout, not at import time.
+    await vi.waitFor(() => expect(calls.some((c) => c.cmd === 'list_accounts')).toBe(true))
+  })
+
+  /**
+   * The layout is read before the list, so a stacked user never gets one
+   * side-by-side frame at launch; and the subscription comes before both, so a
+   * change made during the first read is not missed.
+   */
+  it('subscribes to settings changes, then reads the layout, then the list', async () => {
+    const calls = mockBackend()
+    mockWindows('widget')
+    route('widget')
+
+    await import('./main')
+    await vi.waitFor(() => expect(calls.some((c) => c.cmd === 'list_accounts')).toBe(true))
+
+    const at = (pred: (c: IpcCall) => boolean) => calls.findIndex(pred)
+    const listen = at((c) => c.cmd === 'plugin:event|listen' && c.args.event === 'settings://changed')
+    const settingsRead = at((c) => c.cmd === 'get_settings')
+    const listRead = at((c) => c.cmd === 'list_accounts')
+    expect(listen).toBeGreaterThanOrEqual(0)
+    expect(listen).toBeLessThan(settingsRead)
+    expect(settingsRead).toBeLessThan(listRead)
   })
 
   it('mounts the widget, not the settings window', async () => {

@@ -1670,3 +1670,47 @@ describe('Settings error banner', () => {
   })
 })
 
+
+describe('Settings account counts', () => {
+  /**
+   * An unreadable account file yields an empty list plus a warning. The count
+   * is a claim about how many accounts there are, and "0" would make it.
+   */
+  it('shows no count while the account file cannot be read', async () => {
+    const calls = mockBackend({ accountsWarning: 'accounts.json could not be parsed' })
+    const { container } = render(Settings)
+    await whenSubscribed(calls)
+
+    expect(await screen.findByText(/accounts\.json could not be parsed/)).toBeTruthy()
+    expect(container.querySelector('.count')).toBeNull()
+  })
+
+  it('counts each provider once the list has been read', async () => {
+    const calls = mockBackend({ accounts: two })
+    const { container } = render(Settings)
+    await whenSubscribed(calls)
+
+    await waitFor(() =>
+      expect(Array.from(container.querySelectorAll('.count')).map((c) => c.textContent)).toEqual([
+        '2',
+        '0',
+      ]),
+    )
+  })
+})
+
+describe('Settings interval confirmation', () => {
+  it('says Saved after the interval applies, and stops saying it once the field is edited', async () => {
+    const calls = mockBackend({ settings: settings(300), applied: settings(600) })
+    render(Settings)
+    await whenSubscribed(calls)
+
+    const field = (await screen.findByLabelText('Polling interval (seconds)')) as HTMLInputElement
+    await fireEvent.input(field, { target: { value: '600' } })
+    await fireEvent.change(field)
+    expect(await screen.findByText('Saved')).toBeTruthy()
+
+    await fireEvent.input(field, { target: { value: '900' } })
+    await waitFor(() => expect(screen.queryByText('Saved')).toBeNull())
+  })
+})
