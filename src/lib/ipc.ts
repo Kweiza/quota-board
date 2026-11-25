@@ -14,6 +14,7 @@ import type {
   RawResponse,
   SettingsView,
   StoreStatus,
+  WidgetLayout,
 } from './types'
 
 /**
@@ -146,6 +147,20 @@ export const setSettings = (pollIntervalSecs: number): Promise<SettingsView> =>
  */
 export const setAutoSort = (enabled: boolean): Promise<SettingsView> =>
   invoke('set_auto_sort', { enabled })
+
+/**
+ * docs/design.md §8.1's layout. Emits `settings://changed`, which the widget
+ * listens for to redraw itself — see `onSettingsChanged`.
+ */
+export const setLayout = (layout: WidgetLayout): Promise<SettingsView> =>
+  invoke('set_layout', { layout })
+
+/**
+ * A setting the widget draws from has changed. Only `set_layout` emits it
+ * today; the widget answers by re-reading `get_settings`.
+ */
+export const onSettingsChanged = (fn: () => void): Promise<UnlistenFn> =>
+  listen('settings://changed', fn)
 
 /**
  * The running app's version, for the settings window's footer.

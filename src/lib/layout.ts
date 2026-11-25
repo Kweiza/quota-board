@@ -1,5 +1,5 @@
 import { hasBothProviders } from './provider'
-import type { AccountView } from './types'
+import type { AccountView, WidgetLayout } from './types'
 
 /**
  * docs/design.md §8.1's widget widths.
@@ -24,12 +24,26 @@ export const WIDGET_WIDTH_SINGLE = 280
 export const WIDGET_WIDTH_SPLIT = 520
 
 /**
- * How wide the widget window should be for this account list.
+ * Whether the widget draws its provider sections side by side.
+ *
+ * **The one answer both the window size and the document read.** `Widget.svelte`
+ * decides its grid from this and `widgetWidth` decides the window from it, so
+ * a vertical layout can never be laid out at 280px inside a 520px window, or
+ * the reverse.
+ */
+export function isSplit(accounts: AccountView[], layout: WidgetLayout): boolean {
+  return layout === 'horizontal' && hasBothProviders(accounts)
+}
+
+/**
+ * How wide the widget window should be for this account list and layout.
  *
  * A function of the accounts rather than a constant because a user with only
  * Claude accounts would otherwise get a 520px window with half of it empty —
- * and that is also every widget that existed before columns did.
+ * and that is also every widget that existed before columns did. A vertical
+ * layout stacks the sections, so it keeps the single-column width however many
+ * providers there are.
  */
-export function widgetWidth(accounts: AccountView[]): number {
-  return hasBothProviders(accounts) ? WIDGET_WIDTH_SPLIT : WIDGET_WIDTH_SINGLE
+export function widgetWidth(accounts: AccountView[], layout: WidgetLayout): number {
+  return isSplit(accounts, layout) ? WIDGET_WIDTH_SPLIT : WIDGET_WIDTH_SINGLE
 }

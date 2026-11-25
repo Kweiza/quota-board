@@ -183,7 +183,19 @@ export interface SettingsView {
    * settings, cannot disagree with this window about it.
    */
   auto_sort: boolean
+  /**
+   * docs/design.md §8.1: Claude and Codex side by side, or stacked. Unlike
+   * `auto_sort` this one *is* read by the widget, because it changes how the
+   * list is drawn rather than what `list_accounts` answers.
+   */
+  layout: WidgetLayout
 }
+
+/** Mirrors `WidgetLayout` in `crates/core/src/settings.rs`. */
+export type WidgetLayout = 'horizontal' | 'vertical'
+
+/** What the widget draws before `get_settings` has answered, and what it keeps on a failed read. */
+export const DEFAULT_LAYOUT: WidgetLayout = 'horizontal'
 
 /**
  * Mirrors `RawResponse` in `crates/core/src/usage/raw.rs`, which derives

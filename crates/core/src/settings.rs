@@ -5,10 +5,11 @@
 //! from this deliberately Tauri-unaware crate, so the degrade-to-default rule
 //! below could not be tested headlessly.
 //!
-//! **The only setting today is the polling interval**, and it exists because
-//! §6.1 says the interval is "Configurable, with a floor of 180 seconds".
-//! Before this module the interval was a literal in `src-tauri/src/main.rs`,
-//! so the floor had nothing to defend against.
+//! The polling interval was the first setting, and it exists because §6.1 says
+//! the interval is "Configurable, with a floor of 180 seconds". Before this
+//! module the interval was a literal in `src-tauri/src/main.rs`, so the floor
+//! had nothing to defend against. §8.6's sort toggle and §8.1's widget layout
+//! joined it later, all through the same `write`.
 //!
 //! **A settings file that cannot be understood degrades to the documented
 //! default, never to a nonsense value, and never silently.** That is AGENTS.md's
@@ -64,6 +65,10 @@ struct SettingsFile {
     /// meaning of an *existing* field changes; `#[serde(default)]` on the
     /// container already fills this in for a file written before it existed.
     auto_sort: bool,
+    /// docs/design.md §8.1's arrangement of the provider sections. Lenient on
+    /// read, for the reason [`lenient_layout`] gives.
+    #[serde(deserialize_with = "lenient_layout")]
+    layout: WidgetLayout,
     /// Every key this build does not know, kept so that saving one setting
     /// does not delete another build's. Without it, an older build that only
     /// knows `poll_interval_secs` silently drops `launch_at_login` and
@@ -79,9 +84,39 @@ impl Default for SettingsFile {
             version: FORMAT_VERSION,
             poll_interval_secs: default_poll_interval_secs(),
             auto_sort: false,
+            layout: WidgetLayout::default(),
             extra: serde_json::Map::new(),
         }
     }
+}
+
+/// docs/design.md §8.1: how the widget arranges its provider sections once
+/// both providers have an account. With one provider there is only one section
+/// and the two values look the same.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WidgetLayout {
+    /// Claude left, Codex right — the layout every widget had before this
+    /// setting existed, and therefore the default.
+    #[default]
+    Horizontal,
+    /// Claude above Codex, at the single-column width.
+    Vertical,
+}
+
+/// A layout name this build does not know reads as the default instead of
+/// failing the whole file.
+///
+/// Without this, a value added by a later build (or a typo in a hand edit)
+/// would fail `serde_json::from_str` for the entire struct, and `read` would
+/// then throw away the polling interval and the sort toggle along with it — one
+/// cosmetic field taking two real settings down with it.
+fn lenient_layout<'de, D>(deserializer: D) -> Result<WidgetLayout, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let value = serde_json::Value::deserialize(deserializer)?;
+    Ok(serde_json::from_value(value).unwrap_or_default())
 }
 
 /// The default polling interval, read from [`PollPolicy::default`] rather than
@@ -215,28 +250,20 @@ impl SettingsStore {
     }
 
     /// Writes, and rolls back in memory if the write fails.
-    ///
-    /// The `unknown_version` refusal and the rollback are here for the same
-    /// reasons `set_poll_interval_secs` carries them, and this method must not
-    /// be simplified to drop either: rewriting an unreadable file would delete
-    /// a newer build's settings, and keeping a value the file does not carry
-    /// would leave the toggle showing a state the next launch does not restore.
     pub fn set_auto_sort(&mut self, enabled: bool) -> Result<bool, SettingsError> {
-        if let Some(found) = self.unknown_version {
-            return Err(SettingsError::UnknownVersion { found, understood: FORMAT_VERSION });
-        }
-        let previous = self.file.auto_sort;
-        self.file.auto_sort = enabled;
-        match self.flush() {
-            Ok(()) => {
-                self.warning = None;
-                Ok(enabled)
-            }
-            Err(e) => {
-                self.file.auto_sort = previous;
-                Err(e)
-            }
-        }
+        self.write(|file| file.auto_sort = enabled)?;
+        Ok(enabled)
+    }
+
+    /// docs/design.md §8.1: how the widget arranges its provider sections.
+    pub fn layout(&self) -> WidgetLayout {
+        self.file.layout
+    }
+
+    /// Writes, and rolls back in memory if the write fails.
+    pub fn set_layout(&mut self, layout: WidgetLayout) -> Result<WidgetLayout, SettingsError> {
+        self.write(|file| file.layout = layout)?;
+        Ok(layout)
     }
 
     /// Clamps, writes, and returns the value that actually took effect.
@@ -244,24 +271,33 @@ impl SettingsStore {
     /// On a write failure the in-memory value is rolled back, so this type
     /// never reports an interval the file does not carry.
     pub fn set_poll_interval_secs(&mut self, secs: i64) -> Result<i64, SettingsError> {
-        // Before the clamp, not after: refusing to interpret the file has to
-        // mean refusing to rewrite it. `flush` serialises the whole struct, and
-        // for an unknown version that struct is the defaults with an empty
-        // `extra` — so writing would delete the newer build's settings rather
-        // than preserve them.
+        let clamped = clamp_interval(secs);
+        self.write(|file| file.poll_interval_secs = clamped)?;
+        Ok(clamped)
+    }
+
+    /// **The one write path** every setter goes through: refuse, change, flush,
+    /// and roll the whole file back in memory if the flush fails.
+    ///
+    /// Neither half may be dropped. The `unknown_version` refusal comes first
+    /// because `flush` serialises the whole struct, and for an unknown version
+    /// that struct is this build's defaults with an empty `extra` — writing it
+    /// would delete the newer build's settings rather than preserve them. The
+    /// rollback exists because keeping a value the file does not carry would
+    /// leave a control showing a state the next launch does not restore.
+    fn write(&mut self, change: impl FnOnce(&mut SettingsFile)) -> Result<(), SettingsError> {
         if let Some(found) = self.unknown_version {
             return Err(SettingsError::UnknownVersion { found, understood: FORMAT_VERSION });
         }
-        let clamped = clamp_interval(secs);
-        let previous = self.file.poll_interval_secs;
-        self.file.poll_interval_secs = clamped;
+        let previous = self.file.clone();
+        change(&mut self.file);
         match self.flush() {
             Ok(()) => {
                 self.warning = None;
-                Ok(clamped)
+                Ok(())
             }
             Err(e) => {
-                self.file.poll_interval_secs = previous;
+                self.file = previous;
                 Err(e)
             }
         }
@@ -522,6 +558,78 @@ mod tests {
         );
         assert!(!s.auto_sort(), "a refused write must not stick in memory either");
         std::fs::remove_file(&path).ok();
+    }
+
+    /// §8.1's side-by-side columns are what every widget had before this
+    /// setting existed, so an upgrade must not rearrange anyone's widget.
+    #[test]
+    fn layout_is_horizontal_by_default_and_survives_a_reload() {
+        let path = tmp();
+        let mut s = SettingsStore::load(&path);
+        assert_eq!(s.layout(), WidgetLayout::Horizontal);
+
+        assert_eq!(s.set_layout(WidgetLayout::Vertical).unwrap(), WidgetLayout::Vertical);
+        assert_eq!(SettingsStore::load(&path).layout(), WidgetLayout::Vertical);
+        // The webview sends and reads this exact spelling (`types.ts`).
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(text.contains(r#""layout": "vertical""#), "unexpected spelling: {text}");
+
+        // The other two settings share the file and its whole-struct flush.
+        s.set_poll_interval_secs(900).unwrap();
+        s.set_auto_sort(true).unwrap();
+        let reloaded = SettingsStore::load(&path);
+        assert_eq!(reloaded.layout(), WidgetLayout::Vertical, "another save reverted the layout");
+        assert_eq!(reloaded.poll_interval_secs(), 900);
+        assert!(reloaded.auto_sort());
+        std::fs::remove_file(&path).ok();
+    }
+
+    /// A layout this build has no name for — a later build's, or a hand-edit
+    /// typo — must cost only the layout. Failing the whole parse would reset
+    /// the interval and the sort toggle to their defaults too.
+    #[test]
+    fn an_unknown_layout_reads_as_the_default_without_losing_the_other_settings() {
+        let path = tmp();
+        std::fs::write(
+            &path,
+            br#"{"version": 1, "poll_interval_secs": 900, "auto_sort": true, "layout": "grid"}"#,
+        )
+        .unwrap();
+        let s = SettingsStore::load(&path);
+        assert_eq!(s.layout(), WidgetLayout::Horizontal);
+        assert_eq!(s.poll_interval_secs(), 900, "an unknown layout discarded the interval");
+        assert!(s.auto_sort(), "an unknown layout discarded the sort toggle");
+        assert!(s.warning().is_none());
+        std::fs::remove_file(&path).ok();
+    }
+
+    /// The same refusal every setter makes, through the one `write`.
+    #[test]
+    fn layout_cannot_overwrite_a_file_from_an_unknown_format_version() {
+        let path = tmp();
+        let original = format!(r#"{{"version": {}, "layout": "vertical"}}"#, FORMAT_VERSION + 1);
+        std::fs::write(&path, &original).unwrap();
+
+        let mut s = SettingsStore::load(&path);
+        assert!(matches!(
+            s.set_layout(WidgetLayout::Vertical).unwrap_err(),
+            SettingsError::UnknownVersion { .. }
+        ));
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), original);
+        assert_eq!(s.layout(), WidgetLayout::Horizontal, "a refused write stuck in memory");
+        std::fs::remove_file(&path).ok();
+    }
+
+    /// A write that fails rolls back in memory. Pointed at a directory, the
+    /// final rename cannot succeed.
+    #[test]
+    fn a_failed_layout_write_is_rolled_back() {
+        let dir = tmp();
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut s = SettingsStore::load(&dir);
+        assert!(s.set_layout(WidgetLayout::Vertical).is_err());
+        assert_eq!(s.layout(), WidgetLayout::Horizontal);
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     /// The saved file carries the version this build writes, so a later build

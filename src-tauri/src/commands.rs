@@ -11,6 +11,7 @@ use quota_core::auth::token::{exchange_code as exchange_anthropic_code, AuthErro
 use quota_core::model::AccountState;
 use quota_core::provider::Provider;
 use quota_core::scheduler::PollPolicy;
+use quota_core::settings::WidgetLayout;
 use quota_core::secrets::{encrypted_file::EncryptedFileStore, timeout::TimeoutStore, SecretStore};
 use quota_core::usage::raw::RawResponse;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -1234,6 +1235,9 @@ pub struct SettingsView {
     /// docs/design.md §8.6. When true, `list_accounts` orders both windows by
     /// each account's soonest seven-day reset instead of by `sort_order`.
     pub auto_sort: bool,
+    /// docs/design.md §8.1: side by side or stacked. Serialized as
+    /// `"horizontal"` / `"vertical"`.
+    pub layout: WidgetLayout,
 }
 
 /// The two locks are taken sequentially, never nested — see
@@ -1241,9 +1245,14 @@ pub struct SettingsView {
 /// so it is dropped at the end of that statement.
 async fn settings_view(state: &AppState) -> SettingsView {
     let poll_interval_secs = state.scheduler.lock().await.policy().interval().num_seconds();
-    let (warning, writable, auto_sort) = {
+    let (warning, writable, auto_sort, layout) = {
         let settings = state.settings.lock().await;
-        (settings.warning().map(str::to_string), settings.is_writable(), settings.auto_sort())
+        (
+            settings.warning().map(str::to_string),
+            settings.is_writable(),
+            settings.auto_sort(),
+            settings.layout(),
+        )
     };
     SettingsView {
         poll_interval_secs,
@@ -1252,6 +1261,7 @@ async fn settings_view(state: &AppState) -> SettingsView {
         warning,
         writable,
         auto_sort,
+        layout,
     }
 }
 
@@ -1310,6 +1320,33 @@ pub(crate) async fn set_auto_sort_for(state: &AppState, enabled: bool) -> Result
     // Taken alone and released here: `settings` sits outside the
     // scheduler/accounts lock order (see `AppState`).
     state.settings.lock().await.set_auto_sort(enabled).map_err(|e| e.to_string())
+}
+
+/// docs/design.md §8.1's layout choice.
+///
+/// **Emits `settings://changed`, not `accounts://changed`.** The layout is the
+/// one setting the widget has to read for itself — it changes how the list is
+/// drawn, not what `list_accounts` answers — so the widget listens for this and
+/// re-reads `get_settings`. Reusing the account event would make every rename
+/// and reorder trigger a settings read, and every layout flip a list read.
+#[tauri::command]
+pub async fn set_layout(
+    app: tauri::AppHandle,
+    layout: WidgetLayout,
+) -> Result<SettingsView, String> {
+    let state = app.state::<AppState>();
+    set_layout_for(&state, layout).await?;
+    let _ = app.emit("settings://changed", ());
+    Ok(settings_view(&state).await)
+}
+
+/// The whole of `set_layout` except the event, so it can be tested without an
+/// `AppHandle`.
+pub(crate) async fn set_layout_for(
+    state: &AppState,
+    layout: WidgetLayout,
+) -> Result<WidgetLayout, String> {
+    state.settings.lock().await.set_layout(layout).map_err(|e| e.to_string())
 }
 
 /// docs/design.md §8.4's "Debug: view the last raw JSON response (§5.5)".
@@ -1454,6 +1491,14 @@ mod tests {
     /// `SettingsView` is what the settings window renders the toggle from, so
     /// a stored value that never reached the view would show the toggle off
     /// while the list was being sorted.
+    #[tokio::test]
+    async fn the_settings_view_reports_the_stored_layout() {
+        let state = app_state(Arc::new(MemoryStore::default()));
+        assert_eq!(settings_view(&state).await.layout, WidgetLayout::Horizontal);
+        set_layout_for(&state, WidgetLayout::Vertical).await.unwrap();
+        assert_eq!(settings_view(&state).await.layout, WidgetLayout::Vertical);
+    }
+
     #[tokio::test]
     async fn the_settings_view_reports_the_stored_auto_sort() {
         let state = app_state(Arc::new(MemoryStore::default()));

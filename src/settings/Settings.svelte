@@ -3,9 +3,9 @@
   import type { UnlistenFn } from '@tauri-apps/api/event'
   import { openUrl } from '@tauri-apps/plugin-opener'
   import AccountList from './AccountList.svelte'
-  import { queriesPerDay, untilHhMm } from '../lib/format'
+  import { intervalPhrase, queriesPerDay, untilHhMm } from '../lib/format'
   import { PROVIDER_ORDER, accountsOf, providerName } from '../lib/provider'
-  import { accountKey } from '../lib/types'
+  import { DEFAULT_LAYOUT, accountKey } from '../lib/types'
   import {
     accountsWarning,
     appVersion,
@@ -24,6 +24,7 @@
     reorderAccounts,
     setAutoSort,
     setAutostart,
+    setLayout,
     setSettings,
     storeStatus,
     submitManualCode,
@@ -40,6 +41,7 @@
     RawResponse,
     SettingsView,
     StoreStatus,
+    WidgetLayout,
   } from '../lib/types'
 
   /**
@@ -134,6 +136,26 @@
    * `AccountList`. This is assigned from the command's answer instead.
    */
   let autoSortChecked = false
+  /**
+   * §8.1's layout, the radio group's own state. Same rule as `autoSortChecked`:
+   * assigned from the command's answer, so a refused write does not stay on
+   * screen looking applied.
+   */
+  let layoutChoice: WidgetLayout = DEFAULT_LAYOUT
+
+  const LAYOUT_CHOICES: { value: WidgetLayout; title: string; detail: string }[] = [
+    { value: 'horizontal', title: 'Side by side', detail: 'Claude left, Codex right. Wider.' },
+    { value: 'vertical', title: 'Stacked', detail: 'Claude above Codex. Narrow and taller.' },
+  ]
+
+  /**
+   * Shown for a moment after the interval is applied. The field applies on
+   * blur or Enter with no button, so without this nothing says the value was
+   * taken — and the clamp writing a different number back reads as the field
+   * misbehaving rather than as the floor being enforced.
+   */
+  let intervalSaved = false
+  let intervalSavedTimer: ReturnType<typeof setTimeout> | undefined
   /** `null` until read, and outside Tauri. The footer renders nothing then. */
   let version: string | null = null
 
@@ -432,6 +454,7 @@
         view = await getSettings()
         intervalSecs = view.poll_interval_secs
         autoSortChecked = view.auto_sort
+        layoutChoice = view.layout
       } catch (e) {
         error = String(e)
       }
@@ -521,6 +544,7 @@
     // hide, not a destroy, so anything left armed outlives every visit.
     Object.values(expiryTimers).forEach(clearTimeout)
     expiryTimers = {}
+    clearTimeout(intervalSavedTimer)
   })
 
   async function addAccount(provider: Provider): Promise<void> {
@@ -710,6 +734,25 @@
     await pullAccounts()
   }
 
+  /**
+   * docs/design.md §8.1. The value is read off the radio that fired rather
+   * than off `layoutChoice`, so the order in which the binding and this
+   * handler run does not matter. The widget redraws from the
+   * `settings://changed` the command emits; this window only shows the choice.
+   */
+  async function chooseLayout(event: Event): Promise<void> {
+    const wanted = (event.currentTarget as HTMLInputElement).value as WidgetLayout
+    try {
+      view = await setLayout(wanted)
+      error = null
+    } catch (e) {
+      error = String(e)
+    }
+    // Written back on both paths. On a refusal this differs from what the
+    // click put into the binding, so Svelte re-checks the stored radio.
+    layoutChoice = view?.layout ?? DEFAULT_LAYOUT
+  }
+
   function refresh(uuid: string, provider: Provider): Promise<void> {
     const key = accountKey(uuid, provider)
     // `refresh_account` emits `usage://updated`, which only the widget listens
@@ -743,6 +786,9 @@
       view = await setSettings(intervalSecs)
       intervalSecs = view.poll_interval_secs
       error = null
+      intervalSaved = true
+      clearTimeout(intervalSavedTimer)
+      intervalSavedTimer = setTimeout(() => (intervalSaved = false), 2000)
     } catch (e) {
       error = String(e)
       // A refused value must not stay on screen looking applied.
@@ -792,21 +838,33 @@
 </script>
 
 <main class="settings">
-  <h1>Quota Board</h1>
+  <header class="page-head">
+    <h1>Quota Board</h1>
+    <p class="subtitle">Settings</p>
+  </header>
   {#if error}
-    <p class="warn" role="alert">{error}</p>
+    <!-- Dismissable: the banner otherwise stays until the next successful
+         command, and a stale failure sitting above a working window reads as
+         a problem that is still happening. -->
+    <div class="banner warn" role="alert">
+      <p>{error}</p>
+      <button type="button" class="banner-close" aria-label="Dismiss" title="Dismiss"
+        on:click={() => (error = null)}>✕</button>
+    </div>
   {/if}
   <!-- Above the account list on purpose: the list below it is empty, and
-       without this line that emptiness reads as "you have no accounts". -->
+       without this line that emptiness reads as "you have no accounts". Not
+       dismissable, unlike the banner above: it is a standing condition the
+       user has to fix on disk, not a failed action. -->
   {#if accountsProblem}
-    <p class="warn" role="alert">
+    <p class="banner warn" role="alert">
       {accountsProblem}. Nothing will be written to that file until it is
       repaired or removed, so your accounts are not lost — but they cannot be
       shown, and adding one now would fail.
     </p>
   {/if}
 
-  <section>
+  <section class="card">
     <h2>Accounts</h2>
     <!-- docs/design.md §8.4: one column per provider, in §8.1's order, so this
          window groups the accounts the same way the widget does. Both columns
@@ -818,7 +876,12 @@
       {#each PROVIDER_ORDER as p (p)}
         {@const forProvider = accountsOf(accounts, p)}
         <section class="account-column" aria-labelledby={`accounts-${p}`}>
-          <h3 id={`accounts-${p}`}>{providerName(p)}</h3>
+          <h3 id={`accounts-${p}`}>
+            {providerName(p)}
+            <!-- Hidden from the accessible name: the region is "Claude", not
+                 "Claude 2", and the list below already says how many. -->
+            {#if accountsLoaded}<span class="count" aria-hidden="true">{forProvider.length}</span>{/if}
+          </h3>
           <AccountList
             accounts={forProvider}
             provider={p}
@@ -836,7 +899,7 @@
                A problem reading the file is explained by the alert above, and
                an empty invitation beside it would contradict that. -->
           {#if accountsLoaded && !accountsProblem && forProvider.length === 0}
-            <p class="hint">No {providerName(p)} accounts yet.</p>
+            <p class="hint empty-column">No {providerName(p)} accounts yet.</p>
           {/if}
         </section>
       {/each}
@@ -849,26 +912,29 @@
          polling interval: it changes what this list is showing, and the
          disabled drag handles above are the other half of the same fact. -->
     {#if view}
-      <div class="auto-sort">
+      <div class="setting-row">
+        <div class="setting-text">
+          <label for="auto-sort">Sort accounts by soonest weekly reset</label>
+          <p class="hint">
+            {#if autoSortChecked}
+              Both windows list the account whose 7-day window resets first at the
+              top. Accounts that report no 7-day window come last. Turn this off to
+              drag them back into your own order — it is kept while this is on.
+            {:else}
+              Drag the {'⠿'} handle to arrange the accounts, or hold Alt and press the up
+              or down arrow.
+            {/if}
+          </p>
+        </div>
         <input
           id="auto-sort"
+          class="switch"
           type="checkbox"
           checked={autoSortChecked}
           disabled={!view.writable}
           on:change={toggleAutoSort}
         />
-        <label for="auto-sort">Sort accounts by soonest weekly reset</label>
       </div>
-      <p class="hint">
-        {#if autoSortChecked}
-          Both windows list the account whose 7-day window resets first at the
-          top. Accounts that report no 7-day window come last. Turn this off to
-          drag them back into your own order — it is kept while this is on.
-        {:else}
-          Drag the {'⠿'} handle to arrange the accounts, or hold Alt and press the up
-          or down arrow.
-        {/if}
-      </p>
       {#if !view.writable}
         <p class="warn">
           The settings file cannot be written by this build, so this cannot be
@@ -877,12 +943,14 @@
       {/if}
     {/if}
 
+    <h3 class="subhead">Add an account</h3>
     <div class="provider-grid" role="group" aria-label="Add account">
       <div class="provider-card" role="group" aria-labelledby="add-claude-title">
         <h3 id="add-claude-title">Claude</h3>
         <p>Connect a Claude account and monitor the limits it reports.</p>
         <button
           type="button"
+          class="primary"
           disabled={!loginListenersReady}
           on:click={() => addAccount('anthropic')}>Add Claude account</button>
         <!-- Reworded from the note on `pkce::begin` in
@@ -902,6 +970,7 @@
         </p>
         <button
           type="button"
+          class="primary"
           disabled={!loginListenersReady}
           on:click={() => addAccount('openai')}>Add Codex account</button>
         <p class="provider-note">
@@ -931,15 +1000,20 @@
         <p class="url">{fb.url}</p>
         <button type="button" on:click={reopenClaude}>Open in browser</button>
         <label for="manual-code">Code from the page</label>
-        <input
-          id="manual-code"
-          placeholder="code#state"
-          bind:value={pasted}
-          disabled={submitting}
-        />
-        <button type="button" on:click={submitCode} disabled={submitting || pasted.trim() === ''}>
-          Submit
-        </button>
+        <!-- A form so Enter submits: pasting and pressing Enter is how this
+             field is used, and reaching for the button after a paste is the
+             one step the flow does not need. -->
+        <form class="inline-form" on:submit|preventDefault={submitCode}>
+          <input
+            id="manual-code"
+            placeholder="code#state"
+            bind:value={pasted}
+            disabled={submitting}
+          />
+          <button type="submit" class="primary" disabled={submitting || pasted.trim() === ''}>
+            Submit
+          </button>
+        </form>
       </div>
     {/if}
 
@@ -969,25 +1043,67 @@
     {/if}
   </section>
 
-  <section>
+  <!-- docs/design.md §8.1's layout. A radio group rather than a checkbox:
+       "vertical: on" says nothing about what off looks like, and each choice
+       carries a line describing the widget it produces. -->
+  <section class="card">
+    <h2>Widget</h2>
+    {#if view}
+      <fieldset class="choice-group" disabled={!view.writable}>
+        <legend>Layout</legend>
+        <div class="choices">
+          {#each LAYOUT_CHOICES as choice (choice.value)}
+            <label class="choice" class:selected={layoutChoice === choice.value}>
+              <input
+                type="radio"
+                name="layout"
+                value={choice.value}
+                bind:group={layoutChoice}
+                on:change={chooseLayout}
+              />
+              <span class="choice-title">{choice.title}</span>
+              <span class="choice-detail">{choice.detail}</span>
+            </label>
+          {/each}
+        </div>
+        <p class="hint">Only matters once both Claude and Codex have an account.</p>
+      </fieldset>
+      {#if !view.writable}
+        <p class="warn">
+          The settings file cannot be written by this build, so the layout cannot
+          be changed here.
+        </p>
+      {/if}
+    {/if}
+  </section>
+
+  <section class="card">
     <h2>Polling interval</h2>
     {#if view}
       <label for="poll-interval">Polling interval (seconds)</label>
-      <input
-        id="poll-interval"
-        type="number"
-        min={view.min_interval_secs}
-        max={view.max_interval_secs}
-        step="30"
-        disabled={!view.writable}
-        bind:value={intervalSecs}
-        on:change={applyInterval}
-      />
+      <div class="interval-row">
+        <input
+          id="poll-interval"
+          type="number"
+          min={view.min_interval_secs}
+          max={view.max_interval_secs}
+          step="30"
+          disabled={!view.writable}
+          bind:value={intervalSecs}
+          on:change={applyInterval}
+        />
+        {#if intervalPhrase(intervalSecs)}
+          <span class="interval-phrase">{intervalPhrase(intervalSecs)}</span>
+        {/if}
+        <!-- `aria-live` rather than `role="status"`: the account list's
+             loading line is this window's one status region. -->
+        <span class="saved" aria-live="polite">{intervalSaved ? 'Saved' : ''}</span>
+      </div>
       <!-- The bounds come from `SettingsView`, never from a number written
            here: a literal would drift from `PollPolicy::MIN_INTERVAL_SECS`. -->
-      <span class="hint">
+      <p class="hint">
         roughly {dailyCalls} queries per day (minimum {view.min_interval_secs} s)
-      </span>
+      </p>
       {#if view.warning}<p class="warn">{view.warning}</p>{/if}
       {#if !view.writable}
         <p class="warn">
@@ -1000,17 +1116,22 @@
 
   <!-- docs/design.md §11.3. LaunchAgent on macOS, XDG autostart on Linux, and
        a per-user HKCU Run entry on Windows — never HKLM, so no elevation. -->
-  <section>
+  <section class="card">
     <h2>Start at login</h2>
     {#if autostart}
-      <label for="autostart">Launch Quota Board when I log in</label>
-      <input
-        id="autostart"
-        type="checkbox"
-        checked={autostart.enabled}
-        disabled={!autostart.writable}
-        on:change={toggleAutostart}
-      />
+      <div class="setting-row">
+        <div class="setting-text">
+          <label for="autostart">Launch Quota Board when I log in</label>
+        </div>
+        <input
+          id="autostart"
+          class="switch"
+          type="checkbox"
+          checked={autostart.enabled}
+          disabled={!autostart.writable}
+          on:change={toggleAutostart}
+        />
+      </div>
       {#if !autostart.writable}
         <p class="warn">
           This is a development build, so this cannot be changed here — it would
@@ -1020,7 +1141,7 @@
     {/if}
   </section>
 
-  <section>
+  <section class="card">
     <h2>Token store</h2>
     {#if status}
       <p class="note">{status.description}</p>
@@ -1051,8 +1172,10 @@
           strand the accounts already saved in this one.
         </p>
         <label for="passphrase">Passphrase</label>
-        <input id="passphrase" type="password" bind:value={passphrase} disabled={busy} />
-        <button on:click={unlock} disabled={busy || passphrase === ''}>Unlock</button>
+        <form class="inline-form" on:submit|preventDefault={unlock}>
+          <input id="passphrase" type="password" bind:value={passphrase} disabled={busy} />
+          <button type="submit" class="primary" disabled={busy || passphrase === ''}>Unlock</button>
+        </form>
       {:else if status.kind === 'no_backend'}
         <p class="warn">
           Values will not update until the passphrase is entered after each boot.
@@ -1065,10 +1188,12 @@
           </p>
         {/if}
         <label for="passphrase">Passphrase</label>
-        <input id="passphrase" type="password" bind:value={passphrase} disabled={busy} />
-        <button on:click={unlock} disabled={busy || passphrase === ''}>
-          {status.fallback_file_exists ? 'Unlock' : 'Set a passphrase'}
-        </button>
+        <form class="inline-form" on:submit|preventDefault={unlock}>
+          <input id="passphrase" type="password" bind:value={passphrase} disabled={busy} />
+          <button type="submit" class="primary" disabled={busy || passphrase === ''}>
+            {status.fallback_file_exists ? 'Unlock' : 'Set a passphrase'}
+          </button>
+        </form>
       {:else}
         <!-- A `StoreKind` variant added on the Rust side must not render an
              empty section here: silence in this panel reads as "the token store
@@ -1083,7 +1208,7 @@
     {/if}
   </section>
 
-  <section>
+  <section class="card">
     <h2>Debug</h2>
     <p class="hint">
       The body is reparsed and reserialized, so key order is normalized. Values
@@ -1093,14 +1218,16 @@
       what the capture time below is for.
     </p>
     <label for="debug-account">Account</label>
-    <select id="debug-account" bind:value={selected}>
-      <option value="">—</option>
-      {#each accounts as a (accountKey(a.account_id, a.provider))}
-        <option value={accountKey(a.account_id, a.provider)}
-          >{providerName(a.provider)} — {a.label} ({a.email})</option>
-      {/each}
-    </select>
-    <button on:click={reloadRaw}>Reload</button>
+    <div class="inline-form">
+      <select id="debug-account" bind:value={selected}>
+        <option value="">—</option>
+        {#each accounts as a (accountKey(a.account_id, a.provider))}
+          <option value={accountKey(a.account_id, a.provider)}
+            >{providerName(a.provider)} — {a.label} ({a.email})</option>
+        {/each}
+      </select>
+      <button type="button" on:click={reloadRaw}>Reload</button>
+    </div>
 
     <!-- Account availability precedes the four capture branches. The standing
          warning already explains an unreadable list, so that branch says
@@ -1141,87 +1268,164 @@
      component ever mounts, so a `:global(body)`, `:global(html)` or
      `:global(:root)` rule here would paint the transparent widget window —
      which is exactly what src/app.css's own comment forbids. */
+  /* The accent is a blue that the §8.2 severity ramp (green, teal, yellow,
+     red) does not use, and it marks only controls — the primary buttons, the
+     switches and the selected layout — never a provider or a quota. */
   .settings {
+    --bg: #111116;
+    --card: #1a1a21;
+    --line: rgba(148, 163, 184, .18);
+    --line-strong: rgba(148, 163, 184, .35);
+    --text: #e5e7eb;
+    --muted: #9ca3af;
+    --accent: #5b8def;
+    --accent-soft: rgba(91, 141, 239, .14);
+    --field: #0d0d12;
     font: 13px/1.5 system-ui, sans-serif;
-    color: #e5e7eb;
-    background: #14141a;
+    color: var(--text);
+    background: var(--bg);
     min-height: 100vh;
-    padding: 1em 1.25em 2em;
+    padding: 1.25em 1.25em 2em;
     box-sizing: border-box;
   }
-  .settings h1 { font-size: 15px; margin: 0 0 1em; }
-  .settings h2 { font-size: 12px; text-transform: uppercase; letter-spacing: .06em;
-                 opacity: .7; margin: 0 0 .5em; }
-  .settings section { margin-bottom: 1.75em; }
-  .settings label { display: block; font-size: 11px; opacity: .8; margin-bottom: .25em; }
+  .page-head { display: flex; align-items: baseline; gap: .6em; margin: 0 0 1em; }
+  .settings h1 { font-size: 17px; font-weight: 650; margin: 0; }
+  .subtitle { margin: 0; color: var(--muted); font-size: 13px; }
+  .card { background: var(--card); border: 1px solid var(--line); border-radius: 10px;
+          padding: 1em 1.1em 1.1em; margin-bottom: 1em; }
+  .settings h2 { font-size: 11px; font-weight: 700; text-transform: uppercase;
+                 letter-spacing: .07em; color: var(--muted); margin: 0 0 .75em; }
+  .settings .subhead { font-size: 12px; font-weight: 600; margin: 1.4em 0 0; }
+  .settings label { display: block; font-size: 12px; color: var(--text);
+                    margin: .75em 0 .3em; }
   .settings input, .settings select, .settings button { font: inherit; }
-  .settings input[type='number'] { width: 7em; padding: .25em .35em; }
-  .settings input[type='password'] { width: 16em; padding: .25em .35em; }
-  .settings button { padding: .3em .7em; cursor: pointer; }
+  .settings input:not([type='checkbox']):not([type='radio']),
+  .settings select {
+    color: var(--text); background: var(--field);
+    border: 1px solid var(--line-strong); border-radius: 6px;
+    padding: .35em .55em; box-sizing: border-box;
+  }
+  .settings input:disabled, .settings select:disabled { opacity: .5; }
+  .settings input[type='number'] { width: 7.5em; }
+  .settings input[type='password'] { width: 16em; }
+  .settings select { min-width: 0; flex: 1 1 auto; max-width: 28em; }
+  .settings button {
+    padding: .35em .85em; cursor: pointer; color: var(--text);
+    background: rgba(255, 255, 255, .06); border: 1px solid var(--line-strong);
+    border-radius: 6px;
+  }
+  .settings button:hover:not(:disabled) { background: rgba(255, 255, 255, .11); }
+  .settings button.primary { background: var(--accent); border-color: var(--accent);
+                             color: #fff; font-weight: 600; }
+  .settings button.primary:hover:not(:disabled) { filter: brightness(1.1);
+                                                   background: var(--accent); }
   .settings button:disabled { cursor: default; opacity: .5; }
   .settings :global(button:focus-visible),
   .settings :global(input:focus-visible),
   .settings :global(select:focus-visible) {
-    outline: 2px solid currentColor;
+    outline: 2px solid var(--accent);
     outline-offset: 2px;
   }
-  .hint { font-size: 11px; opacity: .7; margin: .5em 0 0; }
-  .note { font-size: 11px; opacity: .85; margin: .5em 0 0; }
-  .warn { font-size: 11px; color: #fbbf24; margin: .5em 0 0; }
+  .hint { font-size: 11.5px; color: var(--muted); margin: .4em 0 0; }
+  .note { font-size: 12px; opacity: .9; margin: .4em 0 0; }
+  .warn { font-size: 12px; color: #fbbf24; margin: .5em 0 0; }
+  .banner { display: flex; align-items: flex-start; gap: .75em; margin: 0 0 1em;
+            padding: .6em .8em; border-radius: 8px;
+            border: 1px solid rgba(251, 191, 36, .4); background: rgba(251, 191, 36, .08); }
+  .banner p { margin: 0; flex: 1; }
+  .settings .banner-close { padding: 0 .35em; background: none; border: none;
+                            color: inherit; opacity: .8; }
   /* §8.4's two account columns, in §8.1's order. `minmax(0, 1fr)` for the same
      reason the widget's columns use it: an `auto` track minimum refuses to
      shrink below its content, so one long email would widen its own column and
      push the other off the window. The `auto-fit` minimum lets the pair fall
      back to one column when the window is dragged near its 520px floor. */
-  .account-columns { display: grid; gap: 0 1.25em;
+  .account-columns { display: grid; gap: 1em 1.5em;
                      grid-template-columns: repeat(auto-fit, minmax(15em, 1fr)); }
   .account-column { min-width: 0; }
-  .settings .account-column h3 { margin: 0 0 .35em; font-size: 11px;
-                                 font-weight: 700; letter-spacing: .04em;
-                                 text-transform: uppercase; opacity: .6; }
-  /* The label sits after the box, so `display: block` from the shared `label`
-     rule would drop it onto its own line. */
-  .auto-sort { display: flex; align-items: center; gap: .5em; margin-top: 1em; }
-  .settings .auto-sort label { display: inline; margin: 0; font-size: 12px;
-                               opacity: 1; }
+  .settings .account-column h3 { display: flex; align-items: center; gap: .45em;
+                                 margin: 0 0 .2em; font-size: 12px; font-weight: 700; }
+  .count { font-size: 10.5px; font-weight: 600; color: var(--muted);
+           padding: 0 .45em; border: 1px solid var(--line-strong); border-radius: 999px; }
+  .empty-column { padding: .6em 0; }
+  /* A label-and-description block on the left, the control on the right: the
+     common settings-row shape, and the whole label stays the click target. */
+  .setting-row { display: flex; align-items: center; justify-content: space-between;
+                 gap: 1.25em; margin-top: 1em; padding-top: .9em;
+                 border-top: 1px solid var(--line); }
+  .card > .setting-row:first-of-type { margin-top: 0; padding-top: 0; border-top: none; }
+  .setting-text { min-width: 0; }
+  .settings .setting-text label { margin: 0; font-weight: 500; cursor: pointer; }
+  .setting-text .hint { margin-top: .2em; }
+  /* Still a checkbox to the accessibility tree and to every test; only the
+     drawing changes. `-webkit-appearance` because WebKit is the engine the
+     macOS build ships in. */
+  .switch { -webkit-appearance: none; appearance: none; flex: none; margin: 0;
+            position: relative; width: 34px; height: 20px; border-radius: 999px;
+            background: rgba(148, 163, 184, .35); cursor: pointer;
+            transition: background-color .15s; }
+  .switch::after { content: ''; position: absolute; top: 2px; left: 2px;
+                   width: 16px; height: 16px; border-radius: 50%; background: #fff;
+                   transition: transform .15s; }
+  .switch:checked { background: var(--accent); }
+  .switch:checked::after { transform: translateX(14px); }
+  .switch:disabled { cursor: default; opacity: .45; }
+  @media (prefers-reduced-motion: reduce) {
+    .switch, .switch::after { transition: none; }
+  }
+  .choice-group { border: none; margin: 0; padding: 0; min-width: 0; }
+  .choice-group legend { font-size: 12px; padding: 0; margin-bottom: .45em; }
+  .choices { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: .6em; }
+  .settings .choice { display: grid; grid-template-columns: auto 1fr; column-gap: .5em;
+                      align-items: center; margin: 0; padding: .65em .75em;
+                      border: 1px solid var(--line-strong); border-radius: 8px;
+                      cursor: pointer; }
+  .settings .choice:hover { background: rgba(255, 255, 255, .03); }
+  .settings .choice.selected { border-color: var(--accent); background: var(--accent-soft); }
+  .choice input { margin: 0; accent-color: var(--accent); }
+  .choice-title { font-weight: 600; }
+  .choice-detail { grid-column: 2; font-size: 11.5px; color: var(--muted); }
+  .choice-group:disabled .choice { cursor: default; opacity: .5; }
+  .interval-row { display: flex; align-items: center; gap: .75em; }
+  .interval-phrase { color: var(--muted); }
+  .saved { font-size: 12px; color: var(--accent); }
+  .inline-form { display: flex; align-items: center; gap: .5em; margin: 0; }
   .provider-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr));
-                   gap: .75em; margin-top: .85em; }
+                   gap: .75em; margin-top: .6em; }
   .provider-card { display: flex; flex-direction: column; align-items: flex-start;
-                   min-width: 0; padding: .75em; border-radius: 6px;
-                   border: 1px solid rgba(229, 231, 235, .25);
-                   background: rgba(255, 255, 255, .035); }
+                   min-width: 0; padding: .85em; border-radius: 8px;
+                   border: 1px solid var(--line); background: rgba(255, 255, 255, .025); }
   /* Product identity is text and shape only. Colour remains reserved for the
      quota severity ramp and actual warnings. */
-  .provider-card h3 { margin: 0; padding: .05em .4em; border: 1px solid currentColor;
-                      border-radius: 3px; font-size: 11px; letter-spacing: .03em; }
-  .provider-card > p { margin: .55em 0 0; font-size: 11px; }
-  .provider-card > button { margin-top: .65em; }
-  .provider-card .provider-note { margin-top: .75em; opacity: .7; }
-  .fallback { margin-top: .75em; padding: .6em .7em; border-radius: 6px;
-              background: rgba(255, 255, 255, .04); }
-  .fallback h3 { margin: 0 0 .4em; font-size: 12px; }
+  .provider-card h3 { margin: 0; font-size: 13px; font-weight: 700; }
+  .provider-card > p { margin: .4em 0 0; font-size: 12px; }
+  .provider-card > button { margin-top: .75em; }
+  .provider-card .provider-note { margin-top: .75em; font-size: 11px; color: var(--muted); }
+  .fallback { margin-top: .9em; padding: .8em .9em; border-radius: 8px;
+              border: 1px solid var(--line-strong); background: rgba(255, 255, 255, .03); }
+  .fallback h3 { margin: 0 0 .4em; font-size: 13px; }
+  .fallback > button { margin-top: .2em; }
   /* `user-select: text` is load-bearing, not cosmetic — see the note above the
      element. `break-all` because an authorize URL is one long unbreakable run
      and would otherwise push this panel wider than the window. */
   .settings .url { user-select: text; font-size: 11px; margin: .5em 0;
                    font-family: ui-monospace, monospace; word-break: break-all;
-                   background: rgba(0, 0, 0, .35); padding: .4em; border-radius: 4px; }
+                   background: var(--field); padding: .45em .55em; border-radius: 6px; }
   .device-code { display: block; user-select: text; margin: .65em 0;
                  padding: .35em .55em; border: 1px solid currentColor;
-                 border-radius: 4px; font: 700 16px/1.3 ui-monospace, monospace;
+                 border-radius: 6px; font: 700 16px/1.3 ui-monospace, monospace;
                  letter-spacing: .08em; }
-  .settings .fallback input { width: 100%; box-sizing: border-box; padding: .25em .35em;
-                              margin-bottom: .5em; }
+  .settings .fallback .inline-form input { flex: 1; min-width: 0; }
   /* Selectable on purpose: copying this into an issue is the panel's reason to
      exist, which is also why the masking behind it is more aggressive than
      anywhere else in the app. */
   .settings pre {
-    max-height: 18em; overflow: auto; user-select: text;
-    background: rgba(0, 0, 0, .35); padding: .5em; font-size: 11px;
+    max-height: 18em; overflow: auto; user-select: text; margin: .5em 0 0;
+    background: var(--field); padding: .6em; font-size: 11px; border-radius: 6px;
     white-space: pre-wrap; word-break: break-all;
   }
   /* Selectable on purpose, like `pre` above: the version is the first thing a
      bug report needs, and it is here so it can be copied. */
-  .version { user-select: text; font-size: 11px; opacity: .55;
-             padding-top: 1em; border-top: 1px solid rgba(148, 163, 184, .25); }
+  .version { user-select: text; font-size: 11px; color: var(--muted);
+             text-align: center; padding-top: .5em; }
 </style>

@@ -10,8 +10,10 @@ import {
   accountsWarning,
   inTauri,
   isSettingsWindow,
+  getSettings,
   listAccounts,
   onAccountsChanged,
+  onSettingsChanged,
   onUsageUpdated,
   openSettings,
   refreshAccount,
@@ -36,7 +38,8 @@ const VISIBILITY_HEARTBEAT_MS = 30_000
  *
  * **The width is pushed back too, and it is not a constant any more** —
  * docs/design.md §8.1 widens the card to two columns once both providers have
- * an account. It is read from `widgetProps.accounts` rather than passed in,
+ * an account and the layout is horizontal. It is read from `widgetProps`
+ * rather than passed in,
  * because this observer outlives every account-list read: the same reactive
  * object the widget renders from is the one that decides how wide it must be,
  * so the two cannot answer differently.
@@ -59,7 +62,9 @@ function followContentHeight(root: HTMLElement): void {
   new ResizeObserver(() => {
     const height = Math.ceil(root.getBoundingClientRect().height)
     if (height > 0) {
-      void appWindow.setSize(new LogicalSize(widgetWidth(widgetProps.accounts), height))
+      void appWindow.setSize(
+        new LogicalSize(widgetWidth(widgetProps.accounts, widgetProps.layout), height),
+      )
     }
   }).observe(root)
 }
@@ -143,8 +148,27 @@ if (isSettingsWindow()) {
     }
   }
 
+  /**
+   * §8.1's layout, the one setting the widget draws from. A failed read keeps
+   * whatever is on screen — the layout is cosmetic, and flipping the widget
+   * over a failed read would be worse than drawing it the previous way.
+   */
+  async function pullLayout(): Promise<void> {
+    try {
+      const { layout } = await getSettings()
+      // Checked rather than trusted: an answer without a layout this build
+      // can draw (an older backend, a mismatched mock) keeps the current one
+      // instead of becoming `undefined`, which `isSplit` would read as stacked.
+      if (layout === 'horizontal' || layout === 'vertical') widgetProps.layout = layout
+    } catch (e) {
+      console.error('quota-board: get_settings failed', e)
+    }
+  }
+
   if (inTauri()) {
     void pull()
+    void pullLayout()
+    void onSettingsChanged(() => void pullLayout())
     void onUsageUpdated(() => void pull())
     // The path that does not go through the poll gate. `usage://updated` only
     // arrives from a poll, and `due()` returns nothing while the widget is

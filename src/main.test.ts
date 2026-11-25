@@ -17,7 +17,7 @@ function listenedEvents(calls: IpcCall[]): unknown[] {
   return calls.filter((c) => c.cmd === 'plugin:event|listen').map((c) => c.args.event)
 }
 
-function mockBackend(accounts: unknown[] = []): IpcCall[] {
+function mockBackend(accounts: unknown[] = [], layout: string = 'horizontal'): IpcCall[] {
   const calls: IpcCall[] = []
   mockIPC((cmd, args) => {
     calls.push({ cmd, args: (args ?? {}) as Record<string, unknown> })
@@ -32,6 +32,7 @@ function mockBackend(accounts: unknown[] = []): IpcCall[] {
           warning: null,
           writable: true,
           auto_sort: false,
+          layout,
         }
       case 'store_status':
         return { description: 'a token store', kind: 'keychain', fallback_file_exists: false }
@@ -100,7 +101,13 @@ describe('main.ts widget branch', () => {
 
     await import('./main')
 
-    expect(listenedEvents(calls)).toEqual(['usage://updated', 'accounts://changed'])
+    // `settings://changed` is the layout's: the one setting the widget draws
+    // from (docs/design.md §8.1).
+    expect(listenedEvents(calls)).toEqual([
+      'settings://changed',
+      'usage://updated',
+      'accounts://changed',
+    ])
     expect(calls.some((c) => c.cmd === 'list_accounts')).toBe(true)
   })
 
@@ -197,6 +204,30 @@ describe('main.ts widget branch', () => {
 
       const last = sizes(calls).at(-1)
       expect(last).toEqual({ type: 'Logical', width: 520, height: 180 })
+    })
+
+    /**
+     * §8.1's vertical layout stacks the sections, so both providers fit the
+     * single-column width. The layout arrives from `get_settings`, a separate
+     * read from the list, so both have to have landed before the observer
+     * fires.
+     */
+    it('stays at the single-column width with both providers when the layout is vertical', async () => {
+      const calls = mockBackend([account('anthropic'), account('openai')], 'vertical')
+      mockWindows('widget')
+      route('widget')
+      stubHeight(260)
+
+      await import('./main')
+      await vi.waitFor(() => {
+        expect(calls.some((c) => c.cmd === 'list_accounts')).toBe(true)
+        expect(calls.some((c) => c.cmd === 'get_settings')).toBe(true)
+        expect(observed.length).toBeGreaterThan(0)
+      })
+      await new Promise((r) => setTimeout(r, 0))
+      for (const fire of observed) fire()
+
+      expect(sizes(calls).at(-1)).toEqual({ type: 'Logical', width: 280, height: 260 })
     })
   })
 

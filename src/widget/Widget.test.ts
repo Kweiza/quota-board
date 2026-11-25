@@ -184,6 +184,35 @@ describe('Widget columns', () => {
     expect(both.container.querySelector('.widget.split')).toBeTruthy()
   })
 
+  /**
+   * §8.1's vertical layout. Both sections stay, in the same order and with the
+   * same accessible names — only the card stops being split, and that one flag
+   * is also what keeps the window at the single-column width.
+   */
+  it('stacks both sections, Claude first, when the layout is vertical', () => {
+    const { container } = render(Widget, {
+      accounts: [codex('c1'), claude('a1')],
+      warning: null,
+      layout: 'vertical',
+    })
+    expect(container.querySelector('.widget.split')).toBeNull()
+    expect(container.querySelector('.widget.stacked')).toBeTruthy()
+    expect(Array.from(container.querySelectorAll('.col-head')).map((h) => h.textContent)).toEqual([
+      'Claude',
+      'Codex',
+    ])
+    expect(screen.getAllByRole('region')).toHaveLength(2)
+  })
+
+  it('does not mark a single section as stacked', () => {
+    const { container } = render(Widget, {
+      accounts: [claude('a1')],
+      warning: null,
+      layout: 'vertical',
+    })
+    expect(container.querySelector('.widget.stacked')).toBeNull()
+  })
+
   it('keeps the backend order inside a column', () => {
     render(Widget, { accounts: [claude('second'), claude('first')], warning: null })
     const names = screen

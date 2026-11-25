@@ -647,7 +647,16 @@ constraint of this layout** (§5.3), and the columns do not change it: the two
 are independent, so a Claude account with three bars does not push a Codex row
 down.
 
-**Width follows the account list, not a constant.** About 520px with both
+**Settings can stack the two sections instead** (Widget → Layout: *Side by
+side* or *Stacked*; side by side is the default, and is what every widget had
+before the choice existed). Stacked puts Claude above Codex at the
+single-column width. It is the one setting the widget reads for itself: it
+changes how the list is drawn, not what `list_accounts` answers, so
+`set_layout` emits `settings://changed` and the widget re-reads
+`get_settings`. `isSplit` in `src/lib/layout.ts` is the single answer both the
+grid and the window width come from.
+
+**Width follows the account list and the layout, not a constant.** About 520px with both
 columns, about 280px with one — a user of a single service keeps the narrow
 card, rather than a window half of which is empty. `src/lib/layout.ts` owns
 both numbers, because the view measures itself and pushes its size back
@@ -724,8 +733,11 @@ A separate, ordinary (decorated) window, entered via the widget's gear icon.
 - **Add account**: equal Claude and Codex cards. Claude uses browser OAuth with
   its manual-paste fallback; Codex uses its browser callback with device code
   as the port-unavailable fallback. No limit on account count
+- **Widget layout**: §8.1's side-by-side or stacked choice, as two radio cards
+  each describing the widget it produces
 - **Polling interval** (floor 180 seconds) plus a "roughly N queries per day"
-  readout
+  readout and the interval in minutes. Applied on blur or Enter, and a brief
+  "Saved" confirms it, since there is no button
 - **Launch at login** toggle
 - **Store status**: whether the current tokens live in the OS keychain or in
   the encrypted file (§9.2)

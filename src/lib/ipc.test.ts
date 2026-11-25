@@ -21,6 +21,7 @@ import {
   renameAccount,
   reorderAccounts,
   setAutoSort,
+  setLayout,
   setSettings,
 } from './ipc'
 import type { RawResponse, SettingsView } from './types'
@@ -250,6 +251,7 @@ describe('command wrappers', () => {
       warning: null,
       writable: true,
       auto_sort: false,
+      layout: 'horizontal',
     }
     const calls = recordArgs((cmd) => (cmd === 'set_settings' ? view : null))
 
@@ -271,12 +273,34 @@ describe('command wrappers', () => {
       warning: null,
       writable: true,
       auto_sort: true,
+      layout: 'horizontal',
     }
     const calls = recordArgs((cmd) => (cmd === 'set_auto_sort' ? view : null))
 
     await expect(setAutoSort(true)).resolves.toEqual(view)
 
     expect(calls).toEqual([{ cmd: 'set_auto_sort', args: { enabled: true } }])
+  })
+
+  /**
+   * docs/design.md §8.1. The value travels as the snake_case name the Rust
+   * enum deserializes from; anything else is a deserialization error there.
+   */
+  it('setLayout sends the layout by its serialized name', async () => {
+    const view: SettingsView = {
+      poll_interval_secs: 300,
+      min_interval_secs: 180,
+      max_interval_secs: 3600,
+      warning: null,
+      writable: true,
+      auto_sort: false,
+      layout: 'vertical',
+    }
+    const calls = recordArgs((cmd) => (cmd === 'set_layout' ? view : null))
+
+    await expect(setLayout('vertical')).resolves.toEqual(view)
+
+    expect(calls).toEqual([{ cmd: 'set_layout', args: { layout: 'vertical' } }])
   })
 
   it('appVersion reads the running version', async () => {

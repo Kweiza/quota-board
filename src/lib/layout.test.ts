@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest'
-import { WIDGET_WIDTH_SINGLE, WIDGET_WIDTH_SPLIT, widgetWidth } from './layout'
+import { WIDGET_WIDTH_SINGLE, WIDGET_WIDTH_SPLIT, isSplit, widgetWidth } from './layout'
 import type { AccountView, Provider } from './types'
 
 const account = (provider: Provider): AccountView => ({
@@ -15,14 +15,28 @@ describe('widgetWidth', () => {
     // Including the empty list: the widget starts empty on every launch, and a
     // 520px window holding one "Loading accounts…" line would be the first
     // thing every user saw.
-    expect(widgetWidth([])).toBe(WIDGET_WIDTH_SINGLE)
-    expect(widgetWidth([account('anthropic')])).toBe(WIDGET_WIDTH_SINGLE)
-    expect(widgetWidth([account('openai')])).toBe(WIDGET_WIDTH_SINGLE)
-    expect(widgetWidth([account('anthropic'), account('anthropic')])).toBe(WIDGET_WIDTH_SINGLE)
+    expect(widgetWidth([], 'horizontal')).toBe(WIDGET_WIDTH_SINGLE)
+    expect(widgetWidth([account('anthropic')], 'horizontal')).toBe(WIDGET_WIDTH_SINGLE)
+    expect(widgetWidth([account('openai')], 'horizontal')).toBe(WIDGET_WIDTH_SINGLE)
+    expect(widgetWidth([account('anthropic'), account('anthropic')], 'horizontal')).toBe(WIDGET_WIDTH_SINGLE)
   })
 
   it('widens to two columns once both providers have an account', () => {
-    expect(widgetWidth([account('anthropic'), account('openai')])).toBe(WIDGET_WIDTH_SPLIT)
+    expect(widgetWidth([account('anthropic'), account('openai')], 'horizontal')).toBe(WIDGET_WIDTH_SPLIT)
+  })
+
+  /**
+   * §8.1's vertical layout stacks the sections, so the window stays narrow even
+   * with both providers. Checked through `isSplit` as well as `widgetWidth`:
+   * `Widget.svelte` draws its grid from the first and `src/main.ts` sizes the
+   * window from the second, and the two disagreeing is the squeezed-layout
+   * height defect `WIDGET_WIDTH_SPLIT`'s comment describes.
+   */
+  it('keeps the single-column width when the layout is vertical', () => {
+    const both = [account('anthropic'), account('openai')]
+    expect(widgetWidth(both, 'vertical')).toBe(WIDGET_WIDTH_SINGLE)
+    expect(isSplit(both, 'vertical')).toBe(false)
+    expect(isSplit(both, 'horizontal')).toBe(true)
   })
 
   /**

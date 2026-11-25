@@ -3,6 +3,7 @@ import {
   barWidth,
   formatMoney,
   formatReset,
+  intervalPhrase,
   queriesPerDay,
   relativeAge,
   severityOf,
@@ -167,5 +168,23 @@ describe('formatMoney', () => {
 
   it('keeps a zero amount distinguishable from a missing one', () => {
     expect(formatMoney(0, 'USD', 2)).toBe('$0.00')
+  })
+})
+
+describe('intervalPhrase', () => {
+  it('reads the interval in hours, minutes and seconds', () => {
+    expect(intervalPhrase(300)).toBe('every 5 min')
+    expect(intervalPhrase(180)).toBe('every 3 min')
+    expect(intervalPhrase(210)).toBe('every 3 min 30 s')
+    expect(intervalPhrase(5400)).toBe('every 1 h 30 min')
+    expect(intervalPhrase(86400)).toBe('every 24 h')
+  })
+
+  // An emptied number field binds to `null`; saying "every 0 s" about a value
+  // that will not be applied would be a claim with nothing behind it.
+  it('says nothing for an empty or non-positive field', () => {
+    expect(intervalPhrase(null)).toBeNull()
+    expect(intervalPhrase(0)).toBeNull()
+    expect(intervalPhrase(-60)).toBeNull()
   })
 })

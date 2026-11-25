@@ -350,9 +350,19 @@
   .handle:active:not(:disabled) { cursor: grabbing; }
   .handle:disabled { cursor: default; opacity: .25; }
   .ident { display: flex; flex-direction: column; gap: .2em; min-width: 0; }
+  /* Reads as the account's name until it is pointed at or focused, then as
+     the field it is. The browser's white default box was the one light
+     element in a dark window, and it made every name look like an empty form
+     waiting to be filled in. */
   .label { font: inherit; font-weight: 600; padding: .2em .35em; width: 100%;
-           box-sizing: border-box; }
-  .meta { display: flex; align-items: baseline; gap: .45em; min-width: 0; }
+           box-sizing: border-box; color: inherit; background: transparent;
+           border: 1px solid transparent; border-radius: 6px; }
+  .label:hover { border-color: rgba(148, 163, 184, .35); }
+  .label:focus { background: #0d0d12; border-color: rgba(148, 163, 184, .5); }
+  /* Indented by the name field's padding and border, so the email lines up
+     under the name now that the field draws no box around it at rest. */
+  .meta { display: flex; align-items: baseline; gap: .45em; min-width: 0;
+          padding-left: calc(.35em + 1px); }
   .email { font-size: 11px; opacity: .7; overflow: hidden; text-overflow: ellipsis;
            white-space: nowrap; }
   /* Deliberately not `.warn`'s amber: a throttle is expected behaviour, not a

@@ -57,6 +57,8 @@ interface Backend {
   autoSortApplied?: SettingsView
   /** Rejects `set_auto_sort` with this message, as an unwritable file does. */
   autoSortError?: string
+  /** Rejects `set_layout` with this message, as an unwritable file does. */
+  layoutError?: string
   /** What `getVersion()` answers with. `undefined` leaves the footer absent. */
   version?: string
 }
@@ -81,6 +83,7 @@ const settings = (secs: number, writable = true, autoSort = false): SettingsView
   warning: null,
   writable,
   auto_sort: autoSort,
+  layout: 'horizontal',
 })
 
 const store = (kind: StoreStatus['kind'], exists: boolean): StoreStatus => ({
@@ -156,6 +159,12 @@ function mockBackend(b: Backend = {}): IpcCall[] {
           b.autoSortApplied ??
           settings(300, true, (args as { enabled?: boolean } | undefined)?.enabled ?? false)
         )
+      case 'set_layout':
+        if (b.layoutError !== undefined) return Promise.reject(b.layoutError)
+        return {
+          ...settings(300),
+          layout: (args as { layout?: SettingsView['layout'] } | undefined)?.layout ?? 'horizontal',
+        }
       case 'plugin:app|version':
         return b.version ?? null
       case 'last_response':
@@ -1601,3 +1610,63 @@ describe('Settings version', () => {
     expect(screen.queryByText(/^Quota Board /)).toBeNull()
   })
 })
+
+/** docs/design.md §8.1's layout choice. */
+describe('Settings widget layout', () => {
+  it('shows the stored layout on open', async () => {
+    const calls = mockBackend({ settings: { ...settings(300), layout: 'vertical' } })
+    render(Settings)
+    await whenSubscribed(calls)
+
+    const stacked = (await screen.findByRole('radio', { name: /Stacked/ })) as HTMLInputElement
+    await waitFor(() => expect(stacked.checked).toBe(true))
+    expect((screen.getByRole('radio', { name: /Side by side/ }) as HTMLInputElement).checked).toBe(
+      false,
+    )
+  })
+
+  it('sends the chosen layout', async () => {
+    const calls = mockBackend()
+    render(Settings)
+    await whenSubscribed(calls)
+
+    await fireEvent.click(await screen.findByRole('radio', { name: /Stacked/ }))
+
+    await waitFor(() => expect(calls.some((c) => c.cmd === 'set_layout')).toBe(true))
+    expect(calls.find((c) => c.cmd === 'set_layout')!.args).toEqual({ layout: 'vertical' })
+  })
+
+  /**
+   * The click has already checked the new radio, so the stored value has to
+   * be put back over it — the same rule the auto-sort checkbox follows.
+   */
+  it('puts the stored layout back when the write is refused', async () => {
+    const calls = mockBackend({ layoutError: 'the settings file is read-only' })
+    render(Settings)
+    await whenSubscribed(calls)
+
+    const stacked = (await screen.findByRole('radio', { name: /Stacked/ })) as HTMLInputElement
+    await fireEvent.click(stacked)
+
+    expect(await screen.findByText(/read-only/)).toBeTruthy()
+    await waitFor(() => expect(stacked.checked).toBe(false))
+    expect((screen.getByRole('radio', { name: /Side by side/ }) as HTMLInputElement).checked).toBe(
+      true,
+    )
+  })
+})
+
+describe('Settings error banner', () => {
+  it('can be dismissed', async () => {
+    const calls = mockBackend({ layoutError: 'the settings file is read-only' })
+    render(Settings)
+    await whenSubscribed(calls)
+
+    await fireEvent.click(await screen.findByRole('radio', { name: /Stacked/ }))
+    expect(await screen.findByText(/read-only/)).toBeTruthy()
+
+    await fireEvent.click(screen.getByRole('button', { name: 'Dismiss' }))
+    await waitFor(() => expect(screen.queryByText(/read-only/)).toBeNull())
+  })
+})
+

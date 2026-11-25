@@ -1,4 +1,5 @@
-import type { AccountView, Provider } from './types'
+import { DEFAULT_LAYOUT } from './types'
+import type { AccountView, Provider, WidgetLayout } from './types'
 
 export interface WidgetProps {
   accounts: AccountView[]
@@ -10,6 +11,8 @@ export interface WidgetProps {
    * statement to someone who has accounts the app failed to load.
    */
   warning: string | null
+  /** docs/design.md §8.1. Read from `get_settings`, re-read on `settings://changed`. */
+  layout: WidgetLayout
   onOpenSettings: () => void
   onRelogin: (uuid: string) => void
   onUnlock: (uuid: string) => void
@@ -48,6 +51,7 @@ export const widgetProps = $state<WidgetProps>({
   accounts: [],
   accountsLoaded: false,
   warning: null,
+  layout: DEFAULT_LAYOUT,
   onOpenSettings: () => {},
   onRelogin: () => {},
   onUnlock: () => {},

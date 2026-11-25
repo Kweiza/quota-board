@@ -340,6 +340,7 @@ fn main() {
             commands::get_settings,
             commands::set_settings,
             commands::set_auto_sort,
+            commands::set_layout,
             commands::last_response
         ])
         .build(tauri::generate_context!())

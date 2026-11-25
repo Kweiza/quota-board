@@ -2,15 +2,17 @@
   import { onDestroy } from 'svelte'
   import AccountRow from './AccountRow.svelte'
   import { enableDrag } from '../lib/ipc'
-  import { WIDGET_WIDTH_SPLIT } from '../lib/layout'
+  import { WIDGET_WIDTH_SPLIT, isSplit } from '../lib/layout'
   import { PROVIDER_ORDER, accountsOf, providerName } from '../lib/provider'
-  import { accountKey } from '../lib/types'
-  import type { AccountView, Provider } from '../lib/types'
+  import { DEFAULT_LAYOUT, accountKey } from '../lib/types'
+  import type { AccountView, Provider, WidgetLayout } from '../lib/types'
 
   export let accounts: AccountView[] = []
   /** False only until the first complete account-list read. */
   export let accountsLoaded = false
   export let warning: string | null = null
+  /** docs/design.md §8.1: side by side, or stacked at the single-column width. */
+  export let layout: WidgetLayout = DEFAULT_LAYOUT
   export let onOpenSettings: () => void = () => {}
   // §7.1 makes clicking these the only remedy AUTH_DEAD and SECRETS_LOCKED
   // have, so the row's callbacks must reach the mount site rather than stop
@@ -36,8 +38,9 @@
   onDestroy(() => clearInterval(tick))
 
   /**
-   * §8.1's columns: Claude on the left, Codex on the right, each carrying the
-   * product name once at its head instead of once per row.
+   * §8.1's sections: Claude on the left and Codex on the right, or Claude above
+   * Codex when the layout is vertical, each carrying the product name once at
+   * its head instead of once per row.
    *
    * A provider with no accounts is dropped rather than rendered as an empty
    * box, so a user of one service keeps the single narrow column the widget
@@ -52,7 +55,8 @@
     provider,
     accounts: accountsOf(accounts, provider),
   })).filter((c) => c.accounts.length > 0)
-  $: split = columns.length > 1
+  // From `isSplit`, the same answer `src/main.ts` sizes the window with.
+  $: split = isSplit(accounts, layout)
 </script>
 
 <!-- The whole card is the drag handle, not just the titlebar: at 19px tall and
@@ -60,7 +64,7 @@
      that is meant to be nudged out of the way. `enableDrag`'s
      `closest('button, a, input')` guard is what keeps the gear and the row
      remedies clickable inside it. docs/design.md §8.3. -->
-<div class="widget" class:split style:--split-width={`${WIDGET_WIDTH_SPLIT}px`} use:enableDrag>
+<div class="widget" class:split class:stacked={!split && columns.length > 1} style:--split-width={`${WIDGET_WIDTH_SPLIT}px`} use:enableDrag>
   <div class="titlebar">
     <button class="gear" type="button" aria-label="Settings" title="Settings" on:click={onOpenSettings}>⚙</button>
   </div>
@@ -130,6 +134,10 @@
   .columns { display: grid; grid-template-columns: minmax(0, 1fr); gap: 0 1em; }
   .widget.split .columns { grid-template-columns: repeat(2, minmax(0, 1fr)); }
   .column { min-width: 0; }
+  /* Stacked sections need the separation the column gap gives side by side,
+     or the second heading reads as one more row of the first section. */
+  .widget.stacked .column + .column { margin-top: .45em; padding-top: .2em;
+                                      border-top: 1px solid rgba(148, 163, 184, .18); }
   /* Deliberately quiet: this names the column, it is not a row of data. Same
      neutral treatment the row badge had — §8.2 keeps colour for severity, so
      product identity stays text. */

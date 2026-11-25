@@ -56,6 +56,24 @@ export function queriesPerDay(intervalSecs: number | null, accountCount: number)
 }
 
 /**
+ * The polling interval in the units people think in, beside the seconds field:
+ * "every 5 min", "every 1 h 30 min", "every 3 min 30 s".
+ *
+ * `null` for the same field states `queriesPerDay` guards against — an emptied
+ * or non-positive field — so the window shows nothing rather than "every 0 s"
+ * for a value that is not going to be applied.
+ */
+export function intervalPhrase(intervalSecs: number | null): string | null {
+  const total = Number(intervalSecs)
+  if (!(total > 0) || !Number.isFinite(total)) return null
+  const h = Math.floor(total / 3600)
+  const m = Math.floor((total % 3600) / 60)
+  const s = Math.round(total % 60)
+  const parts = [h ? `${h} h` : '', m ? `${m} min` : '', s ? `${s} s` : ''].filter(Boolean)
+  return `every ${parts.join(' ')}`
+}
+
+/**
  * docs/design.md §7.1 fixes this as "throttled, after HH:MM" — a locale string
  * is wrong.
  *
